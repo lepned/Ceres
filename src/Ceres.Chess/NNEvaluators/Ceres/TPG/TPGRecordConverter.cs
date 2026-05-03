@@ -342,9 +342,21 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
       }
       else
       {
+        // For value-only records (Source == ActionHeadDummyMove): the policy
+        // target was intentionally left empty (epv = default in the puzzle
+        // generator's TryBuildValueOnly path) so policy loss should be zero
+        // on these records. If we apply the legal-move floor here, every
+        // legal move gets ~0.0005, target.greater(0) becomes True everywhere,
+        // and policy CE on these records fits a uniform-over-legal-moves
+        // distribution -- catastrophically polluting the policy head with
+        // ~uniform targets on opp-to-move positions. Pass 0 as floor so the
+        // policy values stay genuinely zero.
+        float effectiveMinProb = targetInfo.Source == TPGTrainingTargetNonPolicyInfo.TargetSourceInfo.ActionHeadDummyMove
+                                   ? 0f
+                                   : minLegalMoveProbability;
         // Note that ConvertToTPGRecordPolicies is called first.
         // This will initialize the tpgRecord.Policy which is then referenced in WriteMoves below.
-        ConvertToTPGRecordPolicies(in trainingPos, minLegalMoveProbability, ref tpgRecord);
+        ConvertToTPGRecordPolicies(in trainingPos, effectiveMinProb, ref tpgRecord);
 
 #if MOVES
         if (emitMoves)

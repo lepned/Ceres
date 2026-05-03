@@ -189,6 +189,11 @@ public class NNEvaluatorTensorRT : NNEvaluator
   // Warmup tracking (static lock ensures only one Warmup runs at a time across all instances)
   private bool haveWarmedUp;
 
+  // Debug-instrumentation: dump first batch's first position's 64*137 bytes once
+  // when CERES_DUMP_TPG_BYTES env var is set. Used to diagnose train/inference
+  // input-encoding discrepancies.
+  private bool _dumpedTpgBytes;
+
   /// <inheritdoc/>
   public override bool IsWDL => isWDL;
 
@@ -1440,6 +1445,41 @@ public class NNEvaluatorTensorRT : NNEvaluator
       {
         ReadOnlySpan<byte> lastMovePlies = batch.LastMovePlies.IsEmpty ? default : batch.LastMovePlies.Span.Slice(0, numPos * 64);
         ApplyPlySinceLastMoveTransformationToTPGBuffer(byteBuffer.Span, numPos, ceresOptions.PlySinceLastMoveMode, lastMovePlies);
+      }
+
+      // DEBUG instrumentation: dump position's 64*137 bytes when env var set, matching
+      // CERES_DUMP_TPG_TARGET_FEN's piece layout (first 6 FEN board fields). Match the
+      // FIRST instance only (i.e. the position appearing earliest in the batch).
+      string dumpPath = Environment.GetEnvironmentVariable("CERES_DUMP_TPG_BYTES");
+      string targetFen = Environment.GetEnvironmentVariable("CERES_DUMP_TPG_TARGET_FEN");
+      if (!string.IsNullOrEmpty(dumpPath) && !_dumpedTpgBytes)
+      {
+        try
+        {
+          string targetBoard = string.IsNullOrEmpty(targetFen) ? null : targetFen.Split(' ')[0];
+          var positions = batch.Positions.ToArray();
+          for (int posIdx = 0; posIdx < numPos; posIdx++)
+          {
+            string thisFen = positions[posIdx].ToPosition.FEN;
+            string thisBoard = thisFen.Split(' ')[0];
+            // If a target FEN is set, only dump when board layout matches.
+            // Otherwise, dump the very first batch's first position.
+            if (targetBoard == null || thisBoard == targetBoard)
+            {
+              _dumpedTpgBytes = true;
+              int posOffsetBytes = posIdx * 64 * TPGRecord.BYTES_PER_SQUARE_RECORD;
+              int sliceBytes = 64 * TPGRecord.BYTES_PER_SQUARE_RECORD;
+              byte[] copy = byteBuffer.Span.Slice(posOffsetBytes, sliceBytes).ToArray();
+              System.IO.File.WriteAllBytes(dumpPath, copy);
+              Console.WriteLine($"[CERES_DUMP_TPG_BYTES] wrote {sliceBytes} bytes to {dumpPath} for posIdx={posIdx} fen={thisFen}");
+              break;
+            }
+          }
+        }
+        catch (Exception ex)
+        {
+          Console.WriteLine($"[CERES_DUMP_TPG_BYTES] failed: {ex.Message}");
+        }
       }
     }
 
