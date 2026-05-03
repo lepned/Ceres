@@ -135,7 +135,9 @@ public partial class MCGSBackup
             }
             else
             {
-              if (false && strategy.Engine.Manager.ParamsSearch.TestFlag)
+              // TODO: enable this fix after more testing, likely appropriate (but testing was not clearly positive).
+              const bool BUGFIX_INITIAL_BACKUP = false; 
+              if (BUGFIX_INITIAL_BACKUP)
               {
                 // Passing initialBackupValue.V (=0) as newQChild on a rep-draw would clobber
                 // edge.QChild and make edge.Q = 0 until the next non-rep visit, spuriously

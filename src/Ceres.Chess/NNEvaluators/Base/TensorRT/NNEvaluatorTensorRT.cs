@@ -14,6 +14,7 @@
 #region Using directives
 
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -1546,6 +1547,9 @@ public class NNEvaluatorTensorRT : NNEvaluator
 
         if (hasNaN)
         {
+          // Identify which head(s) contain the NaN before we substitute zeros.
+          string nanHeads = IdentifyNaNHeads(rawSpan, positionCount, engineBatchSize);
+
           // Substitute NaN with 0 in the converted float buffer so downstream
           // consumers see sane values, then emit a rate-limited warning.
           Span<float> usedFloats = threadLocalOutputFloatBuffer.AsSpan(0, usedOutputElements);
@@ -1557,7 +1561,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
             }
           }
 
-          ReportNaNOccurrence(positionCount, usedOutputElements);
+          ReportNaNOccurrence(positionCount, usedOutputElements, nanHeads);
         }
       }
 
@@ -1657,7 +1661,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
   /// rate-limited to once every NAN_LOG_MIN_INTERVAL_SECONDS. Cumulative count
   /// since process start is included in each emitted warning.
   /// </summary>
-  private static void ReportNaNOccurrence(int positionCount, int elementCount)
+  private static void ReportNaNOccurrence(int positionCount, int elementCount, string headDescription)
   {
     long total = System.Threading.Interlocked.Increment(ref nanOccurrenceCount);
 
@@ -1682,13 +1686,55 @@ public class NNEvaluatorTensorRT : NNEvaluator
       {
         Console.ForegroundColor = ConsoleColor.Red;
         Console.WriteLine($"WARNING: NaN detected in TensorRT output (batch {positionCount} positions, "
-                        + $"{elementCount} elements); substituting 0. Cumulative occurrences: {total}.");
+                        + $"{elementCount} elements, {headDescription}); substituting 0. Cumulative occurrences: {total}.");
       }
       finally
       {
         Console.ForegroundColor = prev;
       }
     }
+  }
+
+
+  /// <summary>
+  /// Scans the raw output buffer tensor-by-tensor to identify which head(s) contain NaN values.
+  /// Returns a descriptor suitable for embedding in the NaN warning message,
+  /// e.g. "MLH head", "value, policy heads", or "unknown head" if none matched.
+  /// </summary>
+  private string IdentifyNaNHeads(ReadOnlySpan<Half> rawSpan, int positionCount, int engineBatchSize)
+  {
+    List<string> heads = null;
+
+    int currentOffset = 0;
+    for (int t = 0; t < outputInfos.Length; t++)
+    {
+      int sizePerPos = (int)(outputInfos[t].Size / largestEngineBatchSize);
+      int tensorSize = engineBatchSize * sizePerPos;
+      int usedSize = positionCount * sizePerPos;
+
+      if (usedSize > 0 && currentOffset + usedSize <= rawSpan.Length)
+      {
+        if (MathUtils.ContainsNaN(rawSpan.Slice(currentOffset, usedSize)))
+        {
+          string name = outputInfos[t].Name;
+          if (name.StartsWith("/output/"))
+          {
+            name = name["/output/".Length..];
+          }
+          (heads ??= new List<string>()).Add(name);
+        }
+      }
+
+      // Align to 128-element boundary (must match ComputeTensorOffsets).
+      const int ALIGN = 128;
+      currentOffset += (tensorSize + ALIGN - 1) / ALIGN * ALIGN;
+    }
+
+    if (heads == null)
+    {
+      return "unknown head";
+    }
+    return heads.Count == 1 ? heads[0] + " head" : string.Join(", ", heads) + " heads";
   }
 
 
