@@ -326,6 +326,7 @@ static bool HasNormName(const char* layerName)
     || name.find("/ln2/") != std::string::npos
     || name.find("qkvLN") != std::string::npos
     || name.find("embedding_norm") != std::string::npos
+    || name.find("trunk_end_norm") != std::string::npos
     || name.find("LayerNorm") != std::string::npos
     || name.find("layer_norm") != std::string::npos
     || name.find("rmsnorm") != std::string::npos;
@@ -3087,6 +3088,239 @@ extern "C"
     }
 
     config->setProfilingVerbosity(nvinfer1::ProfilingVerbosity::kDETAILED);
+
+    // -------- STRUCTURAL FP32 norm marker (auto-applied) --------
+    // PyTorch ≥2.4 opset-18 export gives RMSNorm compute layers generic names
+    // (node_pow_*, node_mean, node_sqrt, node_div) that the name-based
+    // HasNormName() matcher can NEVER hit. The only stable handle is the scale
+    // constant (e.g. inner.transformer_layer.0.ln1.scale). Walk forward from
+    // each *.scale const → its Mul consumer (= final RMSNorm step), then BFS
+    // back over Pow/ReduceMean/Add/Sqrt/Div compute layers and mark them FP32.
+    // This protects pre-norm trunks (including trunk_end_norm) where the
+    // residual stream is unnormalized between blocks and FP16 Pow(x,2)
+    // overflows for |x| > 256.
+    //
+    // Skipped under BF16: BF16 has the same 8-bit exponent as FP32, so the
+    // overflow path doesn't exist — forcing FP32 there is pure conversion
+    // overhead with no accuracy gain.
+    if (!opts->useBF16)
+    {
+      int totalAuto = network->getNbLayers();
+      std::unordered_map<std::string, int32_t> autoProducer;
+      std::unordered_map<std::string, std::vector<int32_t>> autoConsumers;
+      for (int32_t i = 0; i < totalAuto; ++i)
+      {
+        auto* L = network->getLayer(i);
+        for (int32_t j = 0; j < L->getNbOutputs(); ++j)
+        {
+          auto* t = L->getOutput(j);
+          if (t && t->getName()) autoProducer[t->getName()] = i;
+        }
+        for (int32_t j = 0; j < L->getNbInputs(); ++j)
+        {
+          auto* t = L->getInput(j);
+          if (t && t->getName()) autoConsumers[t->getName()].push_back(i);
+        }
+      }
+
+      auto isNormScaleConst = [](const std::string& nm) -> bool
+      {
+        if (nm.find(".scale") == std::string::npos) return false;
+        return nm.find("ln1") != std::string::npos
+            || nm.find("ln2") != std::string::npos
+            || nm.find("rms_norm") != std::string::npos
+            || nm.find("rmsnorm") != std::string::npos
+            || nm.find("embedding_norm") != std::string::npos
+            || nm.find("trunk_end_norm") != std::string::npos
+            || nm.find("qkvLN") != std::string::npos
+            || nm.find("LayerNorm") != std::string::npos
+            || nm.find("layer_norm") != std::string::npos;
+      };
+
+      auto isComputeKind = [](nvinfer1::LayerType t) -> bool
+      {
+        return t == nvinfer1::LayerType::kELEMENTWISE
+            || t == nvinfer1::LayerType::kREDUCE
+            || t == nvinfer1::LayerType::kUNARY
+            || t == nvinfer1::LayerType::kNORMALIZATION;
+      };
+
+      std::unordered_set<int32_t> autoMark;
+      int chainCount = 0;
+      for (int32_t i = 0; i < totalAuto; ++i)
+      {
+        auto* L = network->getLayer(i);
+        std::string nm(L->getName());
+        if (!isNormScaleConst(nm)) continue;
+
+        // Walk forward to find the kELEMENTWISE Mul that this scale feeds.
+        int32_t cur = i;
+        int32_t mulIdx = -1;
+        for (int hop = 0; hop < 6; ++hop)
+        {
+          auto* Lc = network->getLayer(cur);
+          if (Lc->getType() == nvinfer1::LayerType::kELEMENTWISE && cur != i)
+          {
+            mulIdx = cur; break;
+          }
+          auto* outT = Lc->getOutput(0);
+          if (!outT || !outT->getName()) break;
+          auto cit = autoConsumers.find(outT->getName());
+          if (cit == autoConsumers.end() || cit->second.empty()) break;
+          cur = cit->second[0];
+        }
+        if (mulIdx < 0) continue;
+
+        // BFS back from the Mul up to depth 6, marking only compute kinds.
+        autoMark.insert(mulIdx);
+        std::vector<int32_t> frontier; frontier.push_back(mulIdx);
+        std::unordered_set<int32_t> seen; seen.insert(mulIdx);
+        for (int depth = 0; depth < 6 && !frontier.empty(); ++depth)
+        {
+          std::vector<int32_t> next;
+          for (int32_t wIdx : frontier)
+          {
+            auto* wL = network->getLayer(wIdx);
+            for (int32_t ii = 0; ii < wL->getNbInputs(); ++ii)
+            {
+              auto* iT = wL->getInput(ii);
+              if (!iT || !iT->getName()) continue;
+              auto pit = autoProducer.find(iT->getName());
+              if (pit == autoProducer.end()) continue;
+              int32_t pIdx = pit->second;
+              if (pIdx == wIdx) continue;
+              if (seen.count(pIdx)) continue;
+              seen.insert(pIdx);
+              auto* pL = network->getLayer(pIdx);
+              if (isComputeKind(pL->getType()))
+              {
+                autoMark.insert(pIdx);
+                next.push_back(pIdx);
+              }
+            }
+          }
+          frontier = next;
+        }
+        chainCount++;
+      }
+
+      if (!autoMark.empty())
+      {
+        config->setFlag(nvinfer1::BuilderFlag::kOBEY_PRECISION_CONSTRAINTS);
+        int marked = 0;
+        for (int32_t idx : autoMark)
+        {
+          auto* L = network->getLayer(idx);
+          L->setPrecision(nvinfer1::DataType::kFLOAT);
+          for (int32_t j = 0; j < L->getNbOutputs(); ++j)
+          {
+            L->setOutputType(j, nvinfer1::DataType::kFLOAT);
+          }
+          marked++;
+        }
+        fprintf(stderr, "[TensorRT] Auto-marked %d compute layers FP32 across %d norm chains (structural detection by scale-constant)\n",
+                marked, chainCount);
+      }
+      else
+      {
+        fprintf(stderr, "[TensorRT] Auto FP32 norm marker: found 0 chains\n");
+      }
+    }
+    // ------ end STRUCTURAL FP32 norm marker -----
+
+    // DEBUG: enumerate norm-scale constants and trace forward to the Mul that
+    // consumes them — that Mul is the tail of a RMSNorm compute chain. Then
+    // walk back through its producers to enumerate Pow/ReduceMean/Add/Sqrt/Div.
+    if (getenv("TRT_DUMP_LAYER_NAMES"))
+    {
+      int total = network->getNbLayers();
+      fprintf(stderr, "[TRT-DUMP] Total TRT layers: %d\n", total);
+
+      // Build tensor -> producer-layer index map AND tensor -> consumer-layers map
+      std::unordered_map<std::string, int32_t> producer;
+      std::unordered_map<std::string, std::vector<int32_t>> consumers;
+      for (int32_t i = 0; i < total; ++i)
+      {
+        auto* l = network->getLayer(i);
+        for (int32_t j = 0; j < l->getNbOutputs(); ++j)
+        {
+          auto* t = l->getOutput(j);
+          if (t && t->getName()) producer[t->getName()] = i;
+        }
+        for (int32_t j = 0; j < l->getNbInputs(); ++j)
+        {
+          auto* t = l->getInput(j);
+          if (t && t->getName()) consumers[t->getName()].push_back(i);
+        }
+      }
+
+      // For each *.scale constant, find the Mul that consumes it and walk back.
+      auto layerLine = [&](int32_t idx)
+      {
+        auto* L = network->getLayer(idx);
+        fprintf(stderr, "[TRT-DUMP] L%05d type=%d name=%s\n", idx, (int)L->getType(), L->getName());
+      };
+
+      // Walk forward from scale-constant → broadcast → Mul (final RMSNorm step),
+      // then back from Mul to expose the Pow/ReduceMean/Add/Sqrt/Div chain.
+      auto walkForward = [&](int32_t startIdx, int maxHops) -> int32_t
+      {
+        int32_t cur = startIdx;
+        for (int h = 0; h < maxHops; ++h)
+        {
+          auto* L = network->getLayer(cur);
+          if (L->getType() == nvinfer1::LayerType::kELEMENTWISE) return cur;
+          auto* outT = L->getOutput(0);
+          if (!outT || !outT->getName()) return -1;
+          auto cit = consumers.find(outT->getName());
+          if (cit == consumers.end() || cit->second.empty()) return -1;
+          cur = cit->second[0];
+        }
+        return cur;
+      };
+
+      int shownChains = 0;
+      for (int32_t i = 0; i < total; ++i)
+      {
+        auto* l = network->getLayer(i);
+        std::string nm(l->getName());
+        if (nm.find(".scale") == std::string::npos) continue;
+        if (nm.find("norm") == std::string::npos && nm.find("ln1") == std::string::npos
+            && nm.find("ln2") == std::string::npos) continue;
+        fprintf(stderr, "[TRT-DUMP] === scale=%s ===\n", nm.c_str());
+        int32_t mulIdx = walkForward(i, 6);
+        fprintf(stderr, "[TRT-DUMP] forward-walk hit (or last) idx=%d\n", mulIdx);
+        if (mulIdx < 0) continue;
+        // BFS backward up to depth 8, dumping all reached layers
+        std::vector<int32_t> walk; walk.push_back(mulIdx);
+        std::unordered_set<int32_t> seen; seen.insert(mulIdx);
+        for (int depth = 0; depth < 8 && !walk.empty(); ++depth)
+        {
+          std::vector<int32_t> next;
+          for (int32_t wIdx : walk)
+          {
+            auto* wL = network->getLayer(wIdx);
+            for (int32_t ii = 0; ii < wL->getNbInputs(); ++ii)
+            {
+              auto* iT = wL->getInput(ii);
+              if (!iT || !iT->getName()) continue;
+              auto pit = producer.find(iT->getName());
+              if (pit == producer.end()) continue;
+              int32_t pIdx = pit->second;
+              if (pIdx == wIdx) continue;
+              if (seen.count(pIdx)) continue;
+              seen.insert(pIdx);
+              fprintf(stderr, "[TRT-DUMP]   d%d:\n", depth);
+              layerLine(pIdx);
+              next.push_back(pIdx);
+            }
+          }
+          walk = next;
+          if (walk.size() > 8) walk.resize(8); // cap fanout
+        }
+        if (++shownChains >= 2) { fprintf(stderr, "[TRT-DUMP] (stopping after 2 chains)\n"); break; }
+      }
+    }
 
     // Force FP32 precision for normalization layers to prevent FP16 overflow.
     if (opts->fp32PostAttentionNorm || opts->fp32PostAttentionNormStrict || opts->fp32SmolgenNorm)
