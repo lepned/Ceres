@@ -159,7 +159,6 @@ public class MCGSSelect
 
     ParamsSearch paramsSearch = iterator.Engine.Manager.ParamsSearch;
     bool graphEnabled = paramsSearch.EnableGraph;
-    bool useRPO = graphEnabled && iterator.Engine.Manager.ParamsSelect.RPOSelectLambda > 0;
     bool enablePUCSuboptimalityThreshold = paramsSearch.VisitSuboptimalityRejectThreshold.HasValue;
     bool parallelEnabled = paramsSearch.Execution.SelectOperationParallelThresholdNumVisits < int.MaxValue;
     float cpuctMultiplier = iterator.CPUCTMultiplier;
@@ -290,6 +289,31 @@ public class MCGSSelect
                                            Engine.Manager.RootMovesPruningStatus,
                                            out childVisitCounts, out scores);
 
+      // CB-GPUCT graph-aware absorption: ScoreCalc may have refused to allocate
+      // some (or all) of the requested visits when every child was already at or
+      // over its pi_bar visit target. The unallocated visits are absorbed at the
+      // parent here - increment N, keep Q stable (delta_W = parent.Q * deltaN so
+      // the visit-weighted Q is unchanged; in V_bar mode the value gets recomputed
+      // from current child stats and is also unchanged since children weren't touched).
+      int numAbsorbedAtParent = numAttemptedVisits - childStats.NumVisitsAccepted;
+      if (numAbsorbedAtParent > 0
+          && Engine.Manager.ParamsSelect.CBGPUCTSelectActive
+          && Engine.Manager.ParamsSelect.CBGPUCT_GraphAwareDeficit)
+      {
+        strategy.BackupToNode(parentNode, numAbsorbedAtParent,
+                              parentNode.Q * numAbsorbedAtParent,
+                              parentNode.D * numAbsorbedAtParent);
+        if (MCGSParamsFixed.DEBUG_CBGPUCT)
+        {
+          Console.WriteLine($"[CBGPUCT] absorb at parent node=#{parentNode.Index.Index} "
+                          + $"absorbed={numAbsorbedAtParent} (of {numAttemptedVisits}) "
+                          + $"newN={parentNode.N} Q={parentNode.Q:+0.0000;-0.0000}");
+        }
+        // Reduce numAttemptedVisits so downstream assertions and processing reflect
+        // only the visits that actually went to children.
+        numAttemptedVisits = childStats.NumVisitsAccepted;
+      }
+
 #if DEBUG // Temporarily using conditional compilation due to TensorPrimives versioning issue
       Debug.Assert(enablePUCSuboptimalityThreshold || TensorPrimitives.Sum(childVisitCounts) == numAttemptedVisits);
 #endif
@@ -314,12 +338,31 @@ public class MCGSSelect
       //   - we can ask SelectChildren to refresh edges above, safe in the knowledge that these updates will 
       //     be applied to the parent node here (maintaining correctness of the pure Q).
 
-      Debug.Assert(parentNode.N == childStats.SumN);
+      Debug.Assert(parentNode.N == childStats.SumN 
+                || (Engine.Manager.ParamsSelect.CBGPUCTSelectActive && Engine.Manager.ParamsSelect.CBGPUCT_GraphAwareDeficit));
 
-      if (MCGSParamsFixed.RESET_Q_DURING_SELECT_PHASE_FROM_ALL_CHILDREN
-       && Engine.Manager.ParamsSelect.RPOBackupLambda == 0)
+      if (MCGSParamsFixed.RESET_Q_DURING_SELECT_PHASE_FROM_ALL_CHILDREN)
       {
-        parentNode.ResetQUsingSumWChildrenAndSelf(childStats.SumW, refreshSibling);
+        if (Engine.Manager.ParamsSelect.CBGPUCTBackupActive)
+        {
+          // Don't use vanilla weighted-N average since we are using CBGPUCT for backup.
+#if NOT
+          // Refresh
+          for (int i=0;i<parentNode.NumEdgesExpanded;i++)
+          {
+            GNode childNode = parentNode.ChildEdgeAtIndex(i).ChildNode;
+            if (Engine.Manager.ParamsSelect.CBGPUCT_GraphAwareDeficit)
+            {
+              parentNode.ChildEdgeAtIndex(i).N = childNode.N;
+            }
+            parentNode.ChildEdgeAtIndex(i).QChild = childNode.Q;
+          }
+#endif
+        }
+        else
+        {
+          parentNode.ResetQUsingSumWChildrenAndSelf(childStats.SumW, refreshSibling);
+        }
       }
 
       // TODO: update D?
@@ -345,10 +388,6 @@ public class MCGSSelect
     // This will likely allow JIT to elide span bounds checks in the loop
     childVisitCounts = childVisitCounts[..numChildrenToConsider];
     scores = ALSO_COMPUTE_CHILD_SCORES ? scores[..numChildrenToConsider] : default;
-    if (useRPO)
-    {
-      ApplyRPO(numAttemptedVisits, parentNode, childVisitCounts, numChildrenToConsider);
-    }
 
     // Loop thru child slots and process any with nonzero visits.
     // Note that we must process visits to any not yet expanded children first,
@@ -858,6 +897,23 @@ public class MCGSSelect
                                             out bool wasCreated, out GNode standaloneTranspositionNode,
                                             true);
 
+    // CB-GPUCT graph-aware mode: edge.N is a (slightly stale) snapshot of the destination
+    // node's total visit count. Initialize from the existing child.N at edge creation so
+    // transposition links to already-visited nodes start with the correct cross-parent
+    // baseline rather than 0. For freshly-created nodes child.N is 0, so this is a no-op.
+    // Also seed edge.QChild from child.Q: in graph-aware mode the N==0 check (used elsewhere
+    // to suppress reading edge.Q) doesn't fire when N is initialized from a transposition
+    // target's prior visits, so without this seed edge.Q would be 0 (struct default) and
+    // produce an invalid -edge.Q=0 in ScoreCalc and ComputeVBar until the first BackupToEdge.
+    // Terminal edges have no destination node, so we skip them.
+    ParamsSelect ps = iterator.Engine.Manager.ParamsSelect;
+    if (ps.CBGPUCTSelectActive && ps.CBGPUCT_GraphAwareDeficit && !wasCollision
+        && childEdge.Type == GEdgeStruct.EdgeType.ChildEdge)
+    {
+      childEdge.N = childEdge.ChildNode.NodeRef.N;
+      childEdge.QChild = childEdge.ChildNode.Q;
+    }
+
 
     if (childPosInfo.isDrawByRepetitionInCoalesceMode)
     {
@@ -1248,46 +1304,6 @@ public class MCGSSelect
   }
 
 
-
-  /// <summary>
-  /// Adjusts child visit counts using Rational Policy Optimization (RPO) to better align
-  /// visit allocation with optimal policy distribution across expanded children.
-  /// </summary>
-  private void ApplyRPO(int numAttemptedVisits, GNode parentNode, Span<short> childVisitCounts, int numChildrenToConsider)
-  {
-    bool wasNewChild = childVisitCounts.Length > parentNode.NumEdgesExpanded
-                    && childVisitCounts[parentNode.NumEdgesExpanded] > 0;
-
-    if (parentNode.NumEdgesExpanded > 1 && (RPO_CHOOSES_NEW_CHILDREN || !wasNewChild))
-    {
-      double qWhenNoChildren = QWhenNoChildren(parentNode, Engine.Manager.ParamsSelect);
-
-      throw new NotImplementedException("Disabled next line to avoid reference to TestFlag, possibly ok");
-      RPOResult rpo = default;
-#if NOT
-      RPOResult rpo = RPOTests.BestMoveInfo(parentNode, (float)qWhenNoChildren, numChildrenToConsider,
-                                            Engine.Manager.ParamsSelect.RPOSelectLambda,
-                                            Engine.Manager.ParamsSelect.RPOLambdaPower,
-                                            MCGSParamsFixed.RPO_USE_WEIGHTING,
-                                            Engine.Manager.ParamsSearch.TestFlag);
-#endif
-      if (rpo.optimalP != null)
-      {
-        Span<int> newVisitCounts = VisitAllocator.AllocateVisits(numAttemptedVisits, rpo.empiricalN, rpo.optimalP, parentNode.NumEdgesExpanded);
-        //COUNT++;
-        //COR += PearsonCorrelation(newVisitCounts, childVisitCounts[..newVisitCounts.Length]);
-
-        childVisitCounts.Clear();
-        int allocated = 0;
-        for (int i = 0; i < newVisitCounts.Length; i++)
-        {
-          childVisitCounts[i] = (short)newVisitCounts[i];
-          allocated += newVisitCounts[i];
-        }
-        Debug.Assert(numAttemptedVisits == allocated);
-      }
-    }
-  }
 
 
   private static int ApplyPUCTSuboptimalityThreshold(MCGSPath path,

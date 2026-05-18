@@ -158,10 +158,17 @@ public static class PUCTSelector
       Span<double> wSpan = stats.W.Span;
       for (int i = 0; i < Math.Min(node.NumEdgesExpanded, numToProcess); i++)
       {
-        const double VALUE_UNCERTAINTY_WEIGHT = 1.0f;
-        double n = Math.Max(1, nSpan[i]);
-        double adjust = (VALUE_UNCERTAINTY_WEIGHT * uncertaintyValueSpan[i]) / Math.Sqrt(n + 1);
-        wSpan[i] -= adjust * nSpan[i];
+        if (!double.IsNaN(uncertaintyValueSpan[i]))
+        {
+          const double VALUE_UNCERTAINTY_WEIGHT = 0.3f;
+          double n = Math.Max(1, nSpan[i]);
+          if (n == 1)
+          {
+            double adjust = (VALUE_UNCERTAINTY_WEIGHT * uncertaintyValueSpan[i]) / Math.Sqrt(n);
+            //adjust *= -1;
+            wSpan[i] -= adjust * nSpan[i];
+          }
+        }
       }
     }
 
@@ -262,7 +269,8 @@ public static class PUCTSelector
                                                               qWhenNoChildrenComposite,
                                                               numToProcess, numTargetVisits,
                                                               scores, childVisitCounts, cpuctMultiplier,
-                                                              thresholdPUCTSuboptimalityReject);
+                                                              thresholdPUCTSuboptimalityReject,
+                                                              parentNode: node);
 
       // In action head mode the selected children may want to fall out of order.
       if (numTargetVisits > 0  && paramsSelect.FPUMode == ParamsSelect.FPUType.ActionHead)
