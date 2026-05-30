@@ -86,6 +86,21 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
     internal const int NUM_PLY_BIN_PER_SQUARE = USE_V2_TPG_RECORD ? 64 : 0;
 
     /// <summary>
+    /// V3 layout adds 3 per-square augmented-input-feature bytes appended
+    /// to TPGSquareRecord (see PerSquareAttacks):
+    ///   [0] = our_attackers * 100 / 8           in [0, 100] -> float [0, 1]
+    ///   [1] = opp_attackers * 100 / 8           in [0, 100] -> float [0, 1]
+    ///   [2] = (our - opp + 8) * 100 / 16        in [0, 100] -> float [0, 1] (shifted-positive)
+    /// Bumps BYTES_PER_SQUARE_RECORD 137 -> 140. Computed at TAR->TPG conversion
+    /// time so training has zero per-batch CPU cost. Networks trained on V3 data
+    /// have a 140-channel input embedding; V2 nets (137-channel) cannot consume
+    /// V3 files without slicing the trailing 3 bytes per square in the loader.
+    /// Toggling this flag requires regenerating the TPG corpus from TAR.
+    /// </summary>
+    public const bool USE_V3_TPG_RECORD = true;
+    internal const int NUM_AUG_FEATURE_BYTES_PER_SQUARE = USE_V3_TPG_RECORD ? 3 : 0;
+
+    /// <summary>
     /// Currently hardcoded value for the per-square dimension of the prior state information, 
     /// if the network has a state output. Linked to TPGRecord.SIZE_STATE_PER_SQUARE.NNEvaluator
     /// </summary>
@@ -112,10 +127,12 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
     /// </summary>
     public const int MAX_MOVES = 92;
 
-    // *** WARNING **** value hardcoded in ONNXRuntimeExecutor.TPG_BYTES_PER_SQUARE_RECORD currently, fix 
-    public const int BYTES_PER_SQUARE_RECORD = 137;
+    // *** WARNING **** value hardcoded in ONNXRuntimeExecutor.TPG_BYTES_PER_SQUARE_RECORD currently, fix
+    public const int BYTES_PER_SQUARE_RECORD = 137 + NUM_AUG_FEATURE_BYTES_PER_SQUARE;
 
-    public const int TOTAL_BYTES = 9250 + (USE_V2_TPG_RECORD ? (2 * 64) : 0);
+    public const int TOTAL_BYTES = 9250
+                                  + (USE_V2_TPG_RECORD ? (2 * 64) : 0)
+                                  + (USE_V3_TPG_RECORD ? (NUM_AUG_FEATURE_BYTES_PER_SQUARE * 64) : 0);
 
     #endregion
 

@@ -18,6 +18,8 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 using Ceres.Base.DataType;
+using Ceres.Chess.MoveGen;
+using Ceres.Chess.PositionDataInfo;
 
 #endregion
 
@@ -196,7 +198,23 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
     /// </summary>
     fixed byte fileEncoding[8];
 
+    /// <summary>
+    /// V3 layout: augmented input features baked at TAR->TPG conversion time.
+    ///   [0] = our_attackers count * 100 / 8           (byte 0..100, float 0..1)
+    ///   [1] = opp_attackers count * 100 / 8           (byte 0..100, float 0..1)
+    ///   [2] = (our - opp + 8) * 100 / 16              (byte 0..100, float 0..1, shifted-positive)
+    /// Computed via Ceres.Chess.PositionDataInfo.PerSquareAttacks. Zero per-batch
+    /// CPU cost at training time (just disk read).
+    /// </summary>
+    fixed byte augFeatureBytes[TPGRecord.NUM_AUG_FEATURE_BYTES_PER_SQUARE];
+
     #endregion
+
+    public Span<byte> AugFeatureBytesSetter
+      => MemoryMarshal.CreateSpan(ref augFeatureBytes[0], TPGRecord.NUM_AUG_FEATURE_BYTES_PER_SQUARE);
+
+    public ReadOnlySpan<byte> AugFeatureBytesReadOnly
+      => MemoryMarshal.CreateReadOnlySpan(ref augFeatureBytes[0], TPGRecord.NUM_AUG_FEATURE_BYTES_PER_SQUARE);
 
     public ReadOnlySpan<ByteScaled> PieceTypeHistory(int historyPosIndex)
     {
@@ -226,7 +244,7 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
 
     static bool haveWarned = false;
 
-    static internal unsafe void WritePosPieces(in Position pos,
+    public static unsafe void WritePosPieces(in Position pos,
                                                in Position historyPos1,
                                                in Position historyPos2,
                                                in Position historyPos3,
@@ -244,6 +262,20 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
 
       // N.B. Assumed that the squareRecords start out cleared (verified below in debug mode).
       bool weAreWhite = pos.MiscInfo.SideToMove == SideType.White;
+
+      // V3 layout: compute per-square attacker counts ONCE on the real position
+      // (real-board WHITE / BLACK), then write the appropriate "our"/"opp"-mapped
+      // bytes into each square's slot inside the loop below. This covers BOTH
+      // offline TPG generation (TAR->TPG conversion) and live inference (where
+      // TPGConvertersToFlat goes through this same WritePosPieces call), so
+      // aug features are bit-identical end-to-end with zero per-batch training cost.
+      Span<byte> whiteAttackers = stackalloc byte[TPGRecord.USE_V3_TPG_RECORD ? 64 : 0];
+      Span<byte> blackAttackers = stackalloc byte[TPGRecord.USE_V3_TPG_RECORD ? 64 : 0];
+      if (TPGRecord.USE_V3_TPG_RECORD)
+      {
+        MGPosition mgPos = MGPosition.FromPosition(in pos);
+        PerSquareAttacks.Compute(in mgPos, whiteAttackers, blackAttackers);
+      }
 
       byte canOO, canOOO, opponentCanOO, opponentCanOOO;
 
@@ -341,6 +373,21 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
         bool needsReversal = pos.SideToMove == SideType.Black;
         Square squareInTPG = needsReversal ? squareFromPos.Reversed : squareFromPos;
         TPGRecordUtils.WriteSquareEncoding(squareInTPG, pieceRecord.RankEncodingSetter, pieceRecord.FileEncodingSetter);
+
+        // V3 layout: append the 3 aug feature bytes for this square.
+        // The per-color (white/black) attack counts were computed once at the top
+        // of this method on the real position. Map "our" / "opp" by side-to-move.
+        // Encoding matches Python aug_features.py exactly (byte * 100 / 8 etc.)
+        // for bit-identical training-vs-inference features.
+        if (TPGRecord.USE_V3_TPG_RECORD)
+        {
+          int ourCount = weAreWhite ? whiteAttackers[squareNum] : blackAttackers[squareNum];
+          int oppCount = weAreWhite ? blackAttackers[squareNum] : whiteAttackers[squareNum];
+          Span<byte> aug = pieceRecord.AugFeatureBytesSetter;
+          aug[0] = (byte)(ourCount * 100 / 8);
+          aug[1] = (byte)(oppCount * 100 / 8);
+          aug[2] = (byte)((ourCount - oppCount + 8) * 100 / 16);
+        }
 
         if (pos.SideToMove == SideType.White)
         {

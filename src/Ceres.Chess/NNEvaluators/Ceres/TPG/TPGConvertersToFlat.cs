@@ -277,13 +277,32 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
       byte[] moveBytesAll;
 
       NNEvaluatorOptionsCeres optionsCeres = options as NNEvaluatorOptionsCeres;
-      bool useAugFeatures = optionsCeres?.UseAugFeatures ?? false;
 
-      // When aug features are on, each square contributes 3 extra bytes (per-square
-      // attacker counts). Total per-square width: 140 vs 137. See PerSquareAttacks.
-      const int AUG_BYTES_PER_SQUARE = 3;
-      int bytesPerSquareOut = useAugFeatures ? (TPGRecord.BYTES_PER_SQUARE_RECORD + AUG_BYTES_PER_SQUARE)
-                                              : TPGRecord.BYTES_PER_SQUARE_RECORD;
+      // v3 TPG layout: WritePosPieces unconditionally writes 140 bytes per square
+      // (the trailing 3 are aug features baked in via PerSquareAttacks). For
+      // 140-channel models we copy bytes through as-is. For 137-channel models
+      // (legacy) we slice off the aug tail per square. Auto-detected from the
+      // caller's output buffer width.
+      int bytesPerSquareOut = TPGRecord.BYTES_PER_SQUARE_RECORD;  // 140 with V3=true, 137 with V3=false
+      if (!squareValuesByte.IsEmpty)
+      {
+        int sizePerPos = squareValuesByte.Length / batch.NumPos;
+        if (sizePerPos == 64 * 137)
+        {
+          bytesPerSquareOut = 137;  // legacy 137-channel model — slice off aug tail
+        }
+        else if (sizePerPos == 64 * 140)
+        {
+          bytesPerSquareOut = 140;  // V3 140-channel model — pass through
+        }
+        else
+        {
+          throw new InvalidOperationException(
+            $"ConvertToFlatTPG: unexpected squareValuesByte width per position = {sizePerPos}; " +
+            $"expected {64 * 137} (legacy 137-channel) or {64 * 140} (v3 aug 140-channel).");
+        }
+      }
+      bool needsSliceFor137Model = bytesPerSquareOut == 137 && TPGRecord.BYTES_PER_SQUARE_RECORD == 140;
       int numConvertedElements = bytesPerSquareOut * 64 * batch.NumPos;
 
       bool useTemporarySqureValuesByte = squareValuesByte.IsEmpty;
@@ -299,79 +318,46 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
         squareValuesByte = squareValuesByteTemporary;
       }
 
-      if (!useAugFeatures)
+      if (!needsSliceFor137Model)
       {
-        // Standard 137-byte/square path — unchanged.
+        // Either V3 with 140-channel model, or V2 with 137-channel model.
+        // ConvertPositionsToRawSquareBytes writes natural-stride bytes matching
+        // the compile-time TPGRecord.BYTES_PER_SQUARE_RECORD — same as the caller's
+        // buffer width. Direct write.
         TPGRecordConverter.ConvertPositionsToRawSquareBytes(batch, includeHistory, batch.Moves, EMIT_PLY_SINCE,
                                                             optionsCeres.QNegativeBlunders, optionsCeres.QPositiveBlunders,
                                                             out _, squareValuesByte, legalMoveIndices);
       }
       else
       {
-        // Augmented 140-byte/square path:
-        //   1. Run base TPG converter into a 137-byte-stride temp buffer.
-        //   2. Compute per-square attacker counts (PerSquareAttacks).
-        //   3. Scatter 137 base bytes into the 140-byte-stride output AND append
-        //      the 3 aug bytes (our_attackers / opp_attackers / shifted_net) per square,
-        //      applying us-to-move orientation (TPG records are us-oriented).
-        const int BASE_PER_SQ = 137;  // TPGRecord.BYTES_PER_SQUARE_RECORD
-        int numBaseElements = BASE_PER_SQ * 64 * batch.NumPos;
-        byte[] baseBuffer = ArrayPool<byte>.Shared.Rent(numBaseElements);
+        // V3 layout but caller's buffer is sized for 137-channel model. Run the
+        // converter into a 140-byte-stride temp, then scatter to 137-byte-stride
+        // output (dropping the trailing 3 aug bytes per square).
+        const int SRC_STRIDE = 140;  // V3 TPGRecord
+        const int DST_STRIDE = 137;  // 137-channel model
+        int numFullElements = SRC_STRIDE * 64 * batch.NumPos;
+        byte[] fullBuffer = ArrayPool<byte>.Shared.Rent(numFullElements);
         try
         {
           TPGRecordConverter.ConvertPositionsToRawSquareBytes(batch, includeHistory, batch.Moves, EMIT_PLY_SINCE,
                                                               optionsCeres.QNegativeBlunders, optionsCeres.QPositiveBlunders,
-                                                              out MGPosition[] mgPositions,
-                                                              new Memory<byte>(baseBuffer, 0, numBaseElements),
+                                                              out _, new Memory<byte>(fullBuffer, 0, numFullElements),
                                                               legalMoveIndices);
-
-          // Sequential per-position loop (can't capture Span<byte> in lambda for Parallel.For).
-          // Aug feature compute is microseconds per position; total ~ms per batch — acceptable
-          // for the MVP. Parallelize later via byte[] + unsafe pointers if NPS measurement
-          // shows this as a bottleneck.
           Span<byte> outSpan = squareValuesByte.Span;
           for (int p = 0; p < batch.NumPos; p++)
           {
-            int srcBase = p * 64 * BASE_PER_SQ;
-            int dstBase = p * 64 * bytesPerSquareOut;
-
-            // Step 1: scatter base bytes (137 contiguous per sq → 140-stride slots)
+            int srcBase = p * 64 * SRC_STRIDE;
+            int dstBase = p * 64 * DST_STRIDE;
             for (int sq = 0; sq < 64; sq++)
             {
-              baseBuffer.AsSpan(srcBase + sq * BASE_PER_SQ, BASE_PER_SQ)
-                .CopyTo(outSpan.Slice(dstBase + sq * bytesPerSquareOut, BASE_PER_SQ));
-            }
-
-            // Step 2: compute attacker counts for this position (real-board WHITE/BLACK).
-            Span<byte> wAtt = stackalloc byte[64];
-            Span<byte> bAtt = stackalloc byte[64];
-            PerSquareAttacks.Compute(mgPositions[p], wAtt, bAtt);
-
-            // Step 3: append the 3 aug bytes per square, us-to-move oriented.
-            // TPG records have rank 0 = "us" back rank. So for black-to-move,
-            // TPG square index sq maps to real square (sq XOR 56) (vertical flip).
-            bool whiteToMove = !mgPositions[p].BlackToMove;
-            for (int sqTPG = 0; sqTPG < 64; sqTPG++)
-            {
-              int realSq = whiteToMove ? sqTPG : sqTPG ^ 56;
-              int ourCount = whiteToMove ? wAtt[realSq] : bAtt[realSq];
-              int oppCount = whiteToMove ? bAtt[realSq] : wAtt[realSq];
-
-              int augOffset = dstBase + sqTPG * bytesPerSquareOut + BASE_PER_SQ;
-              // Encoding (matches Python aug_features.py byte quantization):
-              //   our: count * 100 / 8       → byte [0, 100]
-              //   opp: count * 100 / 8       → byte [0, 100]
-              //   net: (our-opp+8) * 100/16  → byte [0, 100]  (shifted-positive)
-              // After /100 divide in the inference pipeline: all three in [0, 1].
-              outSpan[augOffset]     = (byte)(ourCount * 100 / 8);
-              outSpan[augOffset + 1] = (byte)(oppCount * 100 / 8);
-              outSpan[augOffset + 2] = (byte)((ourCount - oppCount + 8) * 100 / 16);
+              fullBuffer.AsSpan(srcBase + sq * SRC_STRIDE, DST_STRIDE)
+                .CopyTo(outSpan.Slice(dstBase + sq * DST_STRIDE, DST_STRIDE));
             }
           }
         }
         finally
         {
-          ArrayPool<byte>.Shared.Return(baseBuffer);
+          ArrayPool<byte>.Shared.Return(fullBuffer);
         }
       }
 

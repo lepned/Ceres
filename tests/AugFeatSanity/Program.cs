@@ -5,8 +5,11 @@
 
 using System;
 using System.IO;
+using System.Runtime.InteropServices;
+using Ceres.Chess;
 using Ceres.Chess.MoveGen;
 using Ceres.Chess.MoveGen.Converters;
+using Ceres.Chess.NNEvaluators.Ceres.TPG;
 using Ceres.Chess.PositionDataInfo;
 
 namespace AugFeatSanity;
@@ -15,6 +18,21 @@ class Program
 {
   static int Main(string[] args)
   {
+    // Phase 0: confirm v3 layout constants are in effect.
+    int sqRecSize = Marshal.SizeOf<TPGSquareRecord>();
+    Console.WriteLine($"Phase 0: layout sanity");
+    Console.WriteLine($"  sizeof(TPGSquareRecord)            = {sqRecSize}");
+    Console.WriteLine($"  TPGRecord.BYTES_PER_SQUARE_RECORD  = {TPGRecord.BYTES_PER_SQUARE_RECORD}");
+    Console.WriteLine($"  TPGRecord.USE_V3_TPG_RECORD        = {TPGRecord.USE_V3_TPG_RECORD}");
+    int expected = TPGRecord.USE_V3_TPG_RECORD ? 140 : 137;
+    if (sqRecSize != expected || TPGRecord.BYTES_PER_SQUARE_RECORD != expected)
+    {
+      Console.WriteLine($"  FAIL: expected size {expected}");
+      return 99;
+    }
+    Console.WriteLine($"  PASS (v3 layout: 140 bytes/square)");
+    Console.WriteLine();
+
     // Test 1: starting position.
     var startPos = MGChessPositionConverter.MGChessPositionFromFEN(
       "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
@@ -116,10 +134,99 @@ class Program
     int phase2Result = RunPhase2EqualityTest(fensPath, bytesPath);
     if (phase2Result != 0) return phase2Result;
 
+    int phase3Result = RunPhase3TPGBakeInTest(fensPath);
+    if (phase3Result != 0) return phase3Result;
+
     Console.WriteLine();
-    Console.WriteLine("ALL TESTS PASSED (Phase 1 + Phase 2)");
+    Console.WriteLine("ALL TESTS PASSED (Phase 1 + Phase 2 + Phase 3 v3-bake-in)");
     Console.WriteLine();
     return 0;
+  }
+
+  /// <summary>
+  /// Phase 3: end-to-end v3-layout test. For each FEN, build TPGSquareRecord[64] via
+  /// the production WritePosPieces() path, extract augFeatureBytes from each square,
+  /// and compare against the same bytes computed directly via PerSquareAttacks on the
+  /// real position + the canonical 180-rotation mapping.
+  ///
+  /// Per-channel byte derivation uses RAW counts (not the oracle's pre-quantized bytes
+  /// — quantization is lossy on count >> byte >> count round-trip). This isolates
+  /// the load-bearing assertion: WritePosPieces correctly orients aug bytes into TPG
+  /// slots regardless of side-to-move. The Python-equivalence of the byte VALUES
+  /// themselves is already established by Phase 2.
+  /// </summary>
+  static int RunPhase3TPGBakeInTest(string fensPath)
+  {
+    Console.WriteLine($"Phase 3: v3 TPG bake-in equality test (WritePosPieces vs PerSquareAttacks+orientation)");
+
+    var fens = new System.Collections.Generic.List<string>();
+    foreach (var line in File.ReadAllLines(fensPath))
+    {
+      var l = line.Trim();
+      if (l.Length == 0 || l.StartsWith("#")) continue;
+      fens.Add(l);
+    }
+
+    int totalMismatches = 0;
+    for (int fenIdx = 0; fenIdx < fens.Count; fenIdx++)
+    {
+      string fen = fens[fenIdx];
+      Position pos = Position.FromFEN(fen);
+      bool weAreWhite = pos.MiscInfo.SideToMove == SideType.White;
+
+      // Compute expected attack counts directly on the real position (raw bytes 0..8).
+      MGPosition mgPos = MGPosition.FromPosition(in pos);
+      Span<byte> wAtt = stackalloc byte[64];
+      Span<byte> bAtt = stackalloc byte[64];
+      PerSquareAttacks.Compute(in mgPos, wAtt, bAtt);
+
+      // Run the production v3 generator path.
+      Span<TPGSquareRecord> squareRecords = stackalloc TPGSquareRecord[64];
+      // history params unused for aug correctness; pass pos placeholder
+      TPGSquareRecord.WritePosPieces(in pos, in pos, in pos, in pos, in pos, in pos, in pos, in pos,
+                                     squareRecords, Span<byte>.Empty, false, 0f, 0f);
+
+      int mismatchesThisFen = 0;
+      for (int tpgIdx = 0; tpgIdx < 64; tpgIdx++)
+      {
+        // Per WritePosPieces: W-to-move places real-i at TPG-i; B-to-move places real-i at TPG-(63-i).
+        // So inverse: TPG idx t → real square (W: t, B: 63-t).
+        int realSq = weAreWhite ? tpgIdx : (63 - tpgIdx);
+        int ourCount = weAreWhite ? wAtt[realSq] : bAtt[realSq];
+        int oppCount = weAreWhite ? bAtt[realSq] : wAtt[realSq];
+
+        byte expectedOur = (byte)(ourCount * 100 / 8);
+        byte expectedOpp = (byte)(oppCount * 100 / 8);
+        byte expectedNet = (byte)((ourCount - oppCount + 8) * 100 / 16);
+
+        ReadOnlySpan<byte> actualAug = squareRecords[tpgIdx].AugFeatureBytesReadOnly;
+        if (actualAug[0] != expectedOur || actualAug[1] != expectedOpp || actualAug[2] != expectedNet)
+        {
+          if (mismatchesThisFen < 3)
+          {
+            Console.WriteLine($"  MISMATCH FEN[{fenIdx}] tpg={tpgIdx} (real={realSq}, weAreWhite={weAreWhite}):");
+            Console.WriteLine($"    raw   our={ourCount} opp={oppCount}");
+            Console.WriteLine($"    expected our={expectedOur} opp={expectedOpp} net={expectedNet}");
+            Console.WriteLine($"    actual   our={actualAug[0]} opp={actualAug[1]} net={actualAug[2]}");
+          }
+          mismatchesThisFen++;
+        }
+      }
+      if (mismatchesThisFen > 0)
+      {
+        Console.WriteLine($"  FEN[{fenIdx}] = {fen}: {mismatchesThisFen} byte mismatches");
+        totalMismatches += mismatchesThisFen;
+      }
+    }
+
+    Console.WriteLine($"  evaluated {fens.Count} FENs * 64 tpg-squares * 3 channels = {fens.Count * 192} byte comparisons");
+    if (totalMismatches == 0)
+    {
+      Console.WriteLine($"  PASS: WritePosPieces orients aug bytes correctly for both W-to-move and B-to-move");
+      return 0;
+    }
+    Console.WriteLine($"  FAIL: {totalMismatches} mismatches");
+    return 31;
   }
 
   /// <summary>

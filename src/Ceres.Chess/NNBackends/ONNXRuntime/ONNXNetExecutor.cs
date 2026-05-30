@@ -35,8 +35,12 @@ namespace Ceres.Chess.NNBackends.ONNXRuntime
   /// </summary>
   public class ONNXNetExecutor : IDisposable
   {
-    public const int TPG_BYTES_PER_SQUARE_RECORD = 137; // TODO: should be referenced from TPGRecord
-    public const int TPG_MAX_MOVES = 92; //  // TODO: should be referenced from TPGRecord
+    // Now references TPGRecord — automatically tracks V3 (140) vs legacy (137) per
+    // Ceres.Chess.NNEvaluators.Ceres.TPG.TPGRecord.USE_V3_TPG_RECORD. Legacy 137-channel
+    // ONNX models served via this path would need a slice in the input pipeline; the
+    // TensorRT path (NNEvaluatorTensorRT) already does this auto-detection.
+    public const int TPG_BYTES_PER_SQUARE_RECORD = NNEvaluators.Ceres.TPG.TPGRecord.BYTES_PER_SQUARE_RECORD;
+    public const int TPG_MAX_MOVES = NNEvaluators.Ceres.TPG.TPGRecord.MAX_MOVES;
 
 
     /// <summary>
