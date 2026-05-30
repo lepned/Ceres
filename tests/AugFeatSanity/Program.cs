@@ -1,11 +1,11 @@
-// Sanity test for PerSquareAttacks: starting position should have:
-//   - 38 total white attackers (sum across all 64 squares)
-//   - 38 total black attackers (symmetric)
-//   - Per-square symmetry: white_count[a3] == black_count[a6] etc. (mirror)
-// These numbers come from python-chess attackers_mask popcount, verified in the
-// aug_features.py selftest in CeresTrain.
+// Phase 1 sanity + Phase 2 equality tests for PerSquareAttacks.
+// Phase 1: starting position totals 38/38, symmetry, e4 spot check.
+// Phase 2: bit-exact equality with Python (aug_features.py / aug_features_dump_for_fen.py)
+//          on 25 hand-picked FENs (start, mid-game, EP, castling, endgame, mate).
 
 using System;
+using System.IO;
+using Ceres.Chess.MoveGen;
 using Ceres.Chess.MoveGen.Converters;
 using Ceres.Chess.PositionDataInfo;
 
@@ -100,13 +100,121 @@ class Program
     // For now, trust the symmetric + total = 38 + e4 = 0/0 trio.
 
     Console.WriteLine();
-    Console.WriteLine("ALL TESTS PASSED");
+    Console.WriteLine("Phase 1 tests PASSED");
     Console.WriteLine();
 
-    // Dump the boards for visual inspection
-    PrintBoard("white attackers (starting pos)", w);
-    PrintBoard("black attackers (starting pos)", b);
+    // ---------- Phase 2: Python ↔ C# bit-exact equality test ---------------
+    string fensPath = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "equality_fens.txt");
+    string bytesPath = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "aug_bytes_python.bin");
+    if (!File.Exists(fensPath) || !File.Exists(bytesPath))
+    {
+      Console.WriteLine($"Phase 2 SKIPPED: missing {(File.Exists(fensPath) ? "" : "fens.txt ")} {(File.Exists(bytesPath) ? "" : "aug_bytes_python.bin")}");
+      Console.WriteLine($"  Expected paths: {fensPath}  |  {bytesPath}");
+      return 0;
+    }
+
+    int phase2Result = RunPhase2EqualityTest(fensPath, bytesPath);
+    if (phase2Result != 0) return phase2Result;
+
+    Console.WriteLine();
+    Console.WriteLine("ALL TESTS PASSED (Phase 1 + Phase 2)");
+    Console.WriteLine();
     return 0;
+  }
+
+  /// <summary>
+  /// Phase 2: load FENs + Python-computed bytes, compute C# bytes, byte-for-byte compare.
+  /// Returns 0 on success, nonzero on first mismatch.
+  /// </summary>
+  static int RunPhase2EqualityTest(string fensPath, string bytesPath)
+  {
+    Console.WriteLine($"Phase 2: Python ↔ C# equality test");
+    Console.WriteLine($"  FENs:  {fensPath}");
+    Console.WriteLine($"  bytes: {bytesPath}");
+
+    var fens = new System.Collections.Generic.List<string>();
+    foreach (var line in File.ReadAllLines(fensPath))
+    {
+      var l = line.Trim();
+      if (l.Length == 0 || l.StartsWith("#")) continue;
+      fens.Add(l);
+    }
+
+    byte[] pythonBytes = File.ReadAllBytes(bytesPath);
+    int nFensInFile = BitConverter.ToInt32(pythonBytes, 0);
+    if (nFensInFile != fens.Count)
+    {
+      Console.WriteLine($"  FAIL: header says {nFensInFile} FENs but FEN file has {fens.Count}");
+      return 10;
+    }
+
+    int totalMismatches = 0;
+    for (int i = 0; i < fens.Count; i++)
+    {
+      string fen = fens[i];
+      MGPosition pos;
+      try { pos = MGChessPositionConverter.MGChessPositionFromFEN(fen); }
+      catch (Exception ex)
+      {
+        Console.WriteLine($"  FAIL FEN[{i}]: parse error: {ex.Message}");
+        return 11;
+      }
+
+      Span<byte> wCount = stackalloc byte[64];
+      Span<byte> bCount = stackalloc byte[64];
+      PerSquareAttacks.Compute(in pos, wCount, bCount);
+
+      // Build the 192-byte C# representation matching aug_features.py encoding:
+      //   byte[sq*3 + 0] = our (WHITE) count * 100 / 8
+      //   byte[sq*3 + 1] = opp (BLACK) count * 100 / 8
+      //   byte[sq*3 + 2] = (our - opp + 8) * 100 / 16
+      // NOTE: dump script writes REAL-board colors (WHITE in oracle = WHITE in C#).
+      // No us-to-move flip here — that's a TPG-layout concern, not a feature-value concern.
+      Span<byte> csharpBytes = stackalloc byte[64 * 3];
+      for (int sq = 0; sq < 64; sq++)
+      {
+        int w = wCount[sq];
+        int b = bCount[sq];
+        csharpBytes[sq * 3 + 0] = (byte)((w * 100) / 8);
+        csharpBytes[sq * 3 + 1] = (byte)((b * 100) / 8);
+        csharpBytes[sq * 3 + 2] = (byte)(((w - b + 8) * 100) / 16);
+      }
+
+      // Compare byte-for-byte against Python reference (offset 4 + i*192).
+      int offset = 4 + i * 192;
+      int mismatchesThisFen = 0;
+      for (int k = 0; k < 192; k++)
+      {
+        if (pythonBytes[offset + k] != csharpBytes[k])
+        {
+          if (mismatchesThisFen < 3) // print first 3 mismatches per FEN to aid debug
+          {
+            int sq = k / 3, channel = k % 3;
+            string chName = channel == 0 ? "our" : channel == 1 ? "opp" : "net";
+            Console.WriteLine($"  MISMATCH FEN[{i}] sq={Sq(sq)} ch={chName}: python={pythonBytes[offset + k]} csharp={csharpBytes[k]}");
+          }
+          mismatchesThisFen++;
+        }
+      }
+      if (mismatchesThisFen > 0)
+      {
+        Console.WriteLine($"  FEN[{i}] = {fen}");
+        Console.WriteLine($"    {mismatchesThisFen} byte mismatches");
+        totalMismatches += mismatchesThisFen;
+      }
+    }
+
+    Console.WriteLine($"  evaluated {fens.Count} FENs × 192 bytes = {fens.Count * 192} byte comparisons");
+    if (totalMismatches == 0)
+    {
+      Console.WriteLine($"  PASS: zero byte mismatches");
+      return 0;
+    }
+    else
+    {
+      Console.WriteLine($"  FAIL: {totalMismatches} total byte mismatches across {fens.Count} FENs");
+      return 20;
+    }
   }
 
   static string Sq(int sqIdx)

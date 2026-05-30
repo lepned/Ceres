@@ -141,6 +141,24 @@ namespace Ceres.Chess.PositionDataInfo
     // ---------- Main entry point ------------------------------------------------
 
     /// <summary>
+    /// Flip files of a bitboard: a1↔h1, b1↔g1, ..., a8↔h8.
+    /// Equivalent to bit-XOR-7 on every set bit, done in parallel via the
+    /// standard "delta swap" / file-mirror bit-twiddle.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static BitBoard FlipFiles(BitBoard bb)
+    {
+      return ((bb & 0x0101010101010101UL) << 7)
+           | ((bb & 0x0202020202020202UL) << 5)
+           | ((bb & 0x0404040404040404UL) << 3)
+           | ((bb & 0x0808080808080808UL) << 1)
+           | ((bb & 0x1010101010101010UL) >> 1)
+           | ((bb & 0x2020202020202020UL) >> 3)
+           | ((bb & 0x4040404040404040UL) >> 5)
+           | ((bb & 0x8080808080808080UL) >> 7);
+    }
+
+    /// <summary>
     /// For the given position, count for every square how many WHITE pieces and how many
     /// BLACK pieces attack it. Writes into the two 64-element spans (must be pre-zeroed
     /// by caller, OR overwritten — this method zero-fills before writing).
@@ -148,6 +166,12 @@ namespace Ceres.Chess.PositionDataInfo
     /// Convention: WHITE/BLACK here are the REAL board colors, not us-to-move
     /// canonical orientation. Caller is responsible for swapping if a different
     /// orientation is needed.
+    ///
+    /// Output square indexing is python-chess / TPG-standard convention:
+    ///   a1 = sq 0, h1 = sq 7, a8 = sq 56, h8 = sq 63
+    /// Note that Ceres internal MGPosition bitboards use a FILE-REVERSED bit layout
+    /// (a1 = bit 7, h1 = bit 0); we file-flip on entry so all internal logic
+    /// (attack tables, ray scans) can use standard convention.
     /// </summary>
     public static void Compute(in MGPosition pos,
                                 Span<byte> whiteAttackerCount,  // length 64
@@ -169,8 +193,14 @@ namespace Ceres.Chess.PositionDataInfo
       //   5 (0101) = WN, 6 (0110) = WQ, 7 (0111) = WK,
       //   9..15 = same with D=1 for black.
       //   En-passant square codes (3, 11) are markers, not pieces.
-
-      BitBoard A = pos.A, B = pos.B, C = pos.C, D = pos.D;
+      //
+      // File-flip on entry: Ceres bitboards have file 0 at bit 7, file 7 at bit 0.
+      // The remainder of this function (attack tables, ray scans) uses the standard
+      // a1=bit-0 / h1=bit-7 layout.
+      BitBoard A = FlipFiles(pos.A);
+      BitBoard B = FlipFiles(pos.B);
+      BitBoard C = FlipFiles(pos.C);
+      BitBoard D = FlipFiles(pos.D);
 
       // Per-color piece-type bitboards (excludes EP-marker squares since EP has A=B=1, C=0):
       BitBoard wP = A & ~B & ~C & ~D;     // White Pawn (code 1)
