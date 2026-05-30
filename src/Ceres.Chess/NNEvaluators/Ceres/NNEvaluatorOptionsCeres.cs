@@ -108,6 +108,16 @@ namespace Ceres.Chess.NNEvaluators.Ceres
     public bool UseBF16 { get; init; } = false;
 
     /// <summary>
+    /// If INT8 precision should be used for TensorRT execution.
+    /// When true, mixed INT8 + FP16 mode is enabled (TRT picks per-layer).
+    /// Requires a TRT calibration cache file at "<onnxPath>.calib" next to
+    /// the ONNX — produced offline by CeresTrain's scripts/int8_validate.py
+    /// (or any compatible IInt8EntropyCalibrator2 run). Engine build fails
+    /// with a clear error if the cache file is missing.
+    /// </summary>
+    public bool UseInt8 { get; init; } = false;
+
+    /// <summary>
     /// If engine refitting support should be enabled for TensorRT.
     /// When true, the engine can have its weights updated at runtime without rebuilding.
     /// Uses BuilderFlag::kREFIT_IDENTICAL which requires identical weight shapes.
@@ -126,6 +136,16 @@ namespace Ceres.Chess.NNEvaluators.Ceres
     /// </summary>
     public PlySinceLastMoveModeEnum PlySinceLastMoveMode { get; init; } = PlySinceLastMoveModeEnum.Zero;
 
+    /// <summary>
+    /// If augmented input features (per-square attacker counts) should be computed
+    /// at inference time and appended to the network input. When true, the network's
+    /// embedding layer must expect 140 channels per square (137 base + 3 aug). Used
+    /// for CeresTrain nets trained with CERES_AUG_FEATURES_PER_SQUARE=3.
+    ///
+    /// Per-position cost: ~64 popcount + ray-scan ops via PerSquareAttacks.Compute.
+    /// Expected NPS hit: &lt;5% at typical batch sizes.
+    /// </summary>
+    public bool UseAugFeatures { get; init; } = false;
 
 
     /// <summary>
@@ -215,8 +235,14 @@ namespace Ceres.Chess.NNEvaluators.Ceres
       float valueUncertaintyTempScalingFactor2 = CheckOptionSpecifiedElseDefaultFloat(optionsDict, "V2_UNC_SCALE", 0f);
 
       bool useBF16 = CheckOptionSpecifiedElseDefaultBoolean(optionsDict, "BF16", false);
+      bool useInt8 = CheckOptionSpecifiedElseDefaultBoolean(optionsDict, "INT8", false);
       bool refittable = CheckOptionSpecifiedElseDefaultBoolean(optionsDict, "REFITTABLE", false);
       int fp32AllNorms = CheckOptionSpecifiedElseDefaultInt(optionsDict, "FP32ALLNORMS", -1, -1, 4);
+
+      if (useBF16 && useInt8)
+      {
+        throw new ArgumentException("BF16 and INT8 options are mutually exclusive.");
+      }
 
       PlySinceLastMoveModeEnum plySinceMode = baseOptions is NNEvaluatorOptionsCeres ceresOptions
                                                            ? ceresOptions.PlySinceLastMoveMode
@@ -261,6 +287,7 @@ namespace Ceres.Chess.NNEvaluators.Ceres
         PolicyUncertaintyTemperatureScalingFactor = baseOptions.PolicyUncertaintyTemperatureScalingFactor,
         PlySinceLastMoveMode = plySinceMode,
         UseBF16 = useBF16,
+        UseInt8 = useInt8,
         Refittable = refittable,
         Fp32AllNorms = fp32AllNorms,
       };
