@@ -177,32 +177,13 @@ namespace Ceres.Chess.PositionDataInfo
                                 Span<byte> whiteAttackerCount,  // length 64
                                 Span<byte> blackAttackerCount)  // length 64
     {
-      if (whiteAttackerCount.Length != 64) throw new ArgumentException("whiteAttackerCount must be length 64");
-      if (blackAttackerCount.Length != 64) throw new ArgumentException("blackAttackerCount must be length 64");
-
-      whiteAttackerCount.Clear();
-      blackAttackerCount.Clear();
-
-      // Bitplane representation per MGPosition (see MGPosition.cs):
-      //   D (msb) = Color (1=Black, 0=White)
-      //   C       = 1=Straight-moving (Q or R)
-      //   B       = 1=Diagonal-moving (Q or B)
-      //   A (lsb) = 1=Pawn
-      // Piece codes:
-      //   1 (0001) = WP, 2 (0010) = WB, 3 (0011) = W EP, 4 (0100) = WR,
-      //   5 (0101) = WN, 6 (0110) = WQ, 7 (0111) = WK,
-      //   9..15 = same with D=1 for black.
-      //   En-passant square codes (3, 11) are markers, not pieces.
-      //
       // File-flip on entry: Ceres bitboards have file 0 at bit 7, file 7 at bit 0.
-      // The remainder of this function (attack tables, ray scans) uses the standard
-      // a1=bit-0 / h1=bit-7 layout.
       BitBoard A = FlipFiles(pos.A);
       BitBoard B = FlipFiles(pos.B);
       BitBoard C = FlipFiles(pos.C);
       BitBoard D = FlipFiles(pos.D);
 
-      // Per-color piece-type bitboards (excludes EP-marker squares since EP has A=B=1, C=0):
+      // Per-color piece-type bitboards (excludes EP-marker squares: EP has A=B=1, C=0):
       BitBoard wP = A & ~B & ~C & ~D;     // White Pawn (code 1)
       BitBoard wB = ~A & B & ~C & ~D;     // White Bishop (code 2)
       BitBoard wR = ~A & ~B & C & ~D;     // White Rook (code 4)
@@ -216,15 +197,30 @@ namespace Ceres.Chess.PositionDataInfo
       BitBoard bQ = ~A & B & C & D;       // Black Queen (code 14)
       BitBoard bK = A & B & C & D;        // Black King (code 15)
 
-      // True occupancy (excludes EP markers — those have A=1,B=1,C=0 patterns).
-      BitBoard whitePieces = wP | wB | wR | wN | wQ | wK;
-      BitBoard blackPieces = bP | bB | bR | bN | bQ | bK;
-      BitBoard occupancy = whitePieces | blackPieces;
+      ComputeFromBitboards(wP, wN, wB, wR, wQ, wK, bP, bN, bB, bR, bQ, bK,
+                           whiteAttackerCount, blackAttackerCount);
+    }
 
-      // Walk each piece, OR its attack-mask into a per-color "all attacks" map by
-      // incrementing per-target-square counters. We need COUNTS, not just unions —
-      // because two pieces of the same color could attack the same square.
+    /// <summary>
+    /// Compute attacker counts directly from 12 per-piece-type bitboards. Bitboards must
+    /// be in STANDARD convention (a1=bit 0, h8=bit 63) — i.e. python-chess / TPG layout.
+    /// Used by the V2→V3 TPG upgrade path, which extracts bitboards from the one-hot
+    /// piece bytes already stored in V2 records.
+    /// </summary>
+    public static void ComputeFromBitboards(
+        BitBoard wP, BitBoard wN, BitBoard wB, BitBoard wR, BitBoard wQ, BitBoard wK,
+        BitBoard bP, BitBoard bN, BitBoard bB, BitBoard bR, BitBoard bQ, BitBoard bK,
+        Span<byte> whiteAttackerCount, Span<byte> blackAttackerCount)
+    {
+      if (whiteAttackerCount.Length != 64) throw new ArgumentException("whiteAttackerCount must be length 64");
+      if (blackAttackerCount.Length != 64) throw new ArgumentException("blackAttackerCount must be length 64");
 
+      whiteAttackerCount.Clear();
+      blackAttackerCount.Clear();
+
+      BitBoard occupancy = wP | wN | wB | wR | wQ | wK | bP | bN | bB | bR | bQ | bK;
+
+      // Walk each piece, accumulate per-target-square counters.
       AddAttacks(whiteAttackerCount, wP, PAWN_ATTACKS_WHITE);
       AddAttacks(whiteAttackerCount, wN, KNIGHT_ATTACKS);
       AddAttacks(whiteAttackerCount, wK, KING_ATTACKS);
@@ -240,6 +236,61 @@ namespace Ceres.Chess.PositionDataInfo
       AddSlidingAttacks(blackAttackerCount, bR, occupancy, ROOK_DIRS);
       AddSlidingAttacks(blackAttackerCount, bQ, occupancy, BISHOP_DIRS);
       AddSlidingAttacks(blackAttackerCount, bQ, occupancy, ROOK_DIRS);
+    }
+
+    /// <summary>
+    /// V2→V3 TPG upgrade helper. Reads the 64×137-byte square block from a V2 TPG record,
+    /// extracts the per-square piece one-hot (bytes [0:13]: 0=empty, 1-6=our P,N,B,R,Q,K,
+    /// 7-12=opp P,N,B,R,Q,K), builds per-piece bitboards, and computes "our"/"opp" attacker
+    /// counts per TPG square.
+    ///
+    /// Since V2 records are already us-to-move oriented (our pieces at low TPG ranks), the
+    /// "white" attackers in the bitboard sense ARE our attackers in TPG sense — no
+    /// orientation flip needed in the caller. Output spans directly correspond to
+    /// per-TPG-slot our-attackers / opp-attackers.
+    /// </summary>
+    public static void ComputeFromTpgSquareBytes(ReadOnlySpan<byte> squareBytes,  // 64 * 137 contiguous
+                                                 Span<byte> ourAttackerCount,     // length 64
+                                                 Span<byte> oppAttackerCount,     // length 64)
+                                                 int bytesPerSquare = 137)
+    {
+      if (squareBytes.Length < 64 * bytesPerSquare)
+      {
+        throw new ArgumentException($"squareBytes too short ({squareBytes.Length}, need {64 * bytesPerSquare})");
+      }
+
+      // Extract per-piece-type bitboards from the V2 one-hot.
+      // V2 byte encoding (per ByteScaled convention): byte=100 means "this class present" (float 1.0
+      // after /100). We use >50 as the threshold — any byte ≥50 means "set".
+      BitBoard ourP = 0, ourN = 0, ourB = 0, ourR = 0, ourQ = 0, ourK = 0;
+      BitBoard oppP = 0, oppN = 0, oppB = 0, oppR = 0, oppQ = 0, oppK = 0;
+      for (int sq = 0; sq < 64; sq++)
+      {
+        int off = sq * bytesPerSquare;
+        BitBoard bit = 1UL << sq;
+        // Slots: 0=empty, 1=ourP, 2=ourN, 3=ourB, 4=ourR, 5=ourQ, 6=ourK,
+        //        7=oppP, 8=oppN, 9=oppB, 10=oppR, 11=oppQ, 12=oppK
+        if      (squareBytes[off + 1]  > 50) ourP |= bit;
+        else if (squareBytes[off + 2]  > 50) ourN |= bit;
+        else if (squareBytes[off + 3]  > 50) ourB |= bit;
+        else if (squareBytes[off + 4]  > 50) ourR |= bit;
+        else if (squareBytes[off + 5]  > 50) ourQ |= bit;
+        else if (squareBytes[off + 6]  > 50) ourK |= bit;
+        else if (squareBytes[off + 7]  > 50) oppP |= bit;
+        else if (squareBytes[off + 8]  > 50) oppN |= bit;
+        else if (squareBytes[off + 9]  > 50) oppB |= bit;
+        else if (squareBytes[off + 10] > 50) oppR |= bit;
+        else if (squareBytes[off + 11] > 50) oppQ |= bit;
+        else if (squareBytes[off + 12] > 50) oppK |= bit;
+        // empty or EP marker — no piece bitboard updated
+      }
+
+      // Compute attacker counts. "Our" bitboards take the WHITE-pawn-attack pattern (which
+      // attacks forward-up), "opp" take the BLACK pawn pattern — since the canonical board
+      // has our pieces on low ranks moving up.
+      ComputeFromBitboards(ourP, ourN, ourB, ourR, ourQ, ourK,
+                           oppP, oppN, oppB, oppR, oppQ, oppK,
+                           ourAttackerCount, oppAttackerCount);
     }
 
     // For non-sliders: iterate pieces, look up attack mask from precomputed table,
