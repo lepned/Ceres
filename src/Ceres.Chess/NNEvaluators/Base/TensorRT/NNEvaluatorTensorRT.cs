@@ -249,6 +249,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
                              int softMaxBatchSize = 0,
                              int optimizationLevel = 3,
                              bool forceBF16 = false,
+                             bool forceInt8 = false,
                              bool refittable = false,
                              int fp32AllNormsOverride = -1)
   {
@@ -330,6 +331,25 @@ public class NNEvaluatorTensorRT : NNEvaluator
       options.FP32AllNorms = 0;
     }
 
+    if (forceInt8)
+    {
+      // INT8 + FP16 mixed precision: TRT's INT8 calibrator picks per-tensor
+      // INT8 ranges from the loaded cache and selects layer precision
+      // accordingly (INT8 where ranges are good, FP16 elsewhere). Requires a
+      // TRT calibration cache at "<onnxPath>.calib" — the C++ wrapper reads
+      // it and fails the build with a clear error if missing.
+      //
+      // Keep FP32 norm/softmax markers ON — measured behavior with them off
+      // in Ceres' multi-profile build is much worse than expected (puzzle
+      // accuracy collapses to ~0.5%). With them on we land at ~37% pol acc,
+      // still below int8_validate.py's 99.69% top-1 baseline but at least
+      // runnable. The single-profile script doesn't need the markers because
+      // it's a different code path entirely. Diagnosis WIP — see TODO.
+      options.UseInt8 = 1;
+      options.UseFP16 = 1;
+      options.UseBF16 = 0;
+    }
+
     if (refittable)
     {
       options.Refittable = 1;
@@ -342,7 +362,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
 
     options.Validate();
 
-    Console.WriteLine($"  Build options: FP16={options.UseFP16}, BF16={options.UseBF16}, FP32PostAttentionNorm={options.FP32PostAttentionNorm}, FP32Softmax={options.FP32Softmax}, FP32AllNorms={options.FP32AllNorms}, UseCUDAGraphs={options.UseCudaGraphs}");
+    Console.WriteLine($"  Build options: FP16={options.UseFP16}, BF16={options.UseBF16}, INT8={options.UseInt8}, FP32PostAttentionNorm={options.FP32PostAttentionNorm}, FP32Softmax={options.FP32Softmax}, FP32AllNorms={options.FP32AllNorms}, UseCUDAGraphs={options.UseCudaGraphs}");
 
     const int MIN_BATCH_SIZE_PER_GPU = 6;
     pool = new MultiGPUEnginePool(trt, onnxFileName, effectiveSizesPerGPU, poolMode, options, 0, 0, GpuIDs, MIN_BATCH_SIZE_PER_GPU, cacheDir);
@@ -457,8 +477,11 @@ public class NNEvaluatorTensorRT : NNEvaluator
 
     if (netType == ONNXNetExecutor.NetTypeEnum.TPG)
     {
-      int bytesPerSquareRecord = TPGRecord.BYTES_PER_SQUARE_RECORD;
-      squareByteBuffer = new byte[maxBatchSize * 64 * bytesPerSquareRecord];
+      // Size the byte buffer for the model's actual input shape — supports both
+      // standard 137-byte/square nets and augmented-features 140-byte/square nets
+      // (per CeresTrain's CERES_AUG_FEATURES_PER_SQUARE flag). inputElementsPerPosition
+      // is derived from the ONNX input dimension at engine load.
+      squareByteBuffer = new byte[maxBatchSize * inputElementsPerPosition];
     }
 
     if (useByteInputs)
@@ -1425,13 +1448,20 @@ public class NNEvaluatorTensorRT : NNEvaluator
         throw new InvalidOperationException("ConverterToFlat must be set before evaluation for TPG networks");
       }
 
-      Memory<byte> byteBuffer = new Memory<byte>(squareByteBuffer, 0, numPos * 64 * TPGRecord.BYTES_PER_SQUARE_RECORD);
+      // Size byteBuffer for the model's actual per-position layout (137 or 140 bytes/square,
+      // depending on whether augmented features are enabled). inputElementsPerPosition was
+      // determined from the ONNX input dimension at engine load.
+      Memory<byte> byteBuffer = new Memory<byte>(squareByteBuffer, 0, numPos * inputElementsPerPosition);
       Memory<Half> emptyHalf = Memory<Half>.Empty;
       ConverterToFlat(Options, batch, USE_HISTORY, byteBuffer, emptyHalf, null);
 
       // Apply PlySinceLastMove transformation for each position in the batch.
       // Pass pre-computed LastMovePlies if available; otherwise history-based estimation is used.
       // Only apply if Options is NNEvaluatorOptionsCeres; otherwise skip ply-since logic entirely.
+      // KNOWN LIMITATION: ApplyPlySinceLastMoveTransformationToTPGBuffer casts the buffer as
+      // Span<TPGSquareRecord> (137-byte stride). With augmented features (140-byte stride) and
+      // a non-Zero PlySinceLastMoveMode, this would misalign. For aug-features MVP use, keep
+      // PlySinceLastMoveMode == Zero (the default for puzzle eval).
       if (Options is NNEvaluatorOptionsCeres ceresOptions)
       {
         ReadOnlySpan<byte> lastMovePlies = batch.LastMovePlies.IsEmpty ? default : batch.LastMovePlies.Span.Slice(0, numPos * 64);
@@ -2344,6 +2374,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
 
     //const bool ENABLE_GRAPHS = false;
     bool forceBF16 = options is NNEvaluatorOptionsCeres optionsCeres && optionsCeres.UseBF16;
+    bool forceInt8 = options is NNEvaluatorOptionsCeres optionsCeresInt8 && optionsCeresInt8.UseInt8;
     bool refittable = options is NNEvaluatorOptionsCeres optionsCeresRefit && optionsCeresRefit.Refittable;
     int fp32AllNorms = options is NNEvaluatorOptionsCeres optionsCeresNorms ? optionsCeresNorms.Fp32AllNorms : -1;
     NNEvaluatorTensorRT trtNativeEngine = new(netFileName,
@@ -2357,6 +2388,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
                                               softMaxBatchSize: 1024,
                                               optimizationLevel: options.OptimizationLevel,
                                               forceBF16: forceBF16,
+                                              forceInt8: forceInt8,
                                               refittable: refittable,
                                               fp32AllNormsOverride: fp32AllNorms);
     trtNativeEngine.Options = options;
