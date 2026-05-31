@@ -24,7 +24,7 @@ namespace Ceres.Chess.PositionDataInfo
 {
   /// <summary>
   /// Computes per-square attacker counts (one byte per square per color) for use as
-  /// augmented input features in CeresTrain transformer networks.
+  /// auxiliary input features in CeresTrain transformer networks.
   ///
   /// The output for each square is the popcount of pieces of a given color whose
   /// attack pattern includes that square — matches python-chess

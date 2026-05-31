@@ -279,7 +279,7 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
       NNEvaluatorOptionsCeres optionsCeres = options as NNEvaluatorOptionsCeres;
 
       // v3 TPG layout: WritePosPieces unconditionally writes 140 bytes per square
-      // (the trailing 3 are aug features baked in via PerSquareAttacks). For
+      // (the trailing 3 are aux features baked in via PerSquareAttacks). For
       // 140-channel models we copy bytes through as-is. For 137-channel models
       // (legacy) we slice off the aug tail per square. Auto-detected from the
       // caller's output buffer width.

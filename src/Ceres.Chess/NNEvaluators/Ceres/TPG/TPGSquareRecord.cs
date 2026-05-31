@@ -199,22 +199,22 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
     fixed byte fileEncoding[8];
 
     /// <summary>
-    /// V3 layout: augmented input features baked at TAR->TPG conversion time.
+    /// V3 layout: auxiliary input features baked at TAR->TPG conversion time.
     ///   [0] = our_attackers count * 100 / 8           (byte 0..100, float 0..1)
     ///   [1] = opp_attackers count * 100 / 8           (byte 0..100, float 0..1)
     ///   [2] = (our - opp + 8) * 100 / 16              (byte 0..100, float 0..1, shifted-positive)
     /// Computed via Ceres.Chess.PositionDataInfo.PerSquareAttacks. Zero per-batch
     /// CPU cost at training time (just disk read).
     /// </summary>
-    fixed byte augFeatureBytes[TPGRecord.NUM_AUG_FEATURE_BYTES_PER_SQUARE];
+    fixed byte auxFeatureBytes[TPGRecord.NUM_AUX_FEATURE_BYTES_PER_SQUARE];
 
     #endregion
 
-    public Span<byte> AugFeatureBytesSetter
-      => MemoryMarshal.CreateSpan(ref augFeatureBytes[0], TPGRecord.NUM_AUG_FEATURE_BYTES_PER_SQUARE);
+    public Span<byte> AuxFeatureBytesSetter
+      => MemoryMarshal.CreateSpan(ref auxFeatureBytes[0], TPGRecord.NUM_AUX_FEATURE_BYTES_PER_SQUARE);
 
-    public ReadOnlySpan<byte> AugFeatureBytesReadOnly
-      => MemoryMarshal.CreateReadOnlySpan(ref augFeatureBytes[0], TPGRecord.NUM_AUG_FEATURE_BYTES_PER_SQUARE);
+    public ReadOnlySpan<byte> AuxFeatureBytesReadOnly
+      => MemoryMarshal.CreateReadOnlySpan(ref auxFeatureBytes[0], TPGRecord.NUM_AUX_FEATURE_BYTES_PER_SQUARE);
 
     public ReadOnlySpan<ByteScaled> PieceTypeHistory(int historyPosIndex)
     {
@@ -268,7 +268,7 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
       // bytes into each square's slot inside the loop below. This covers BOTH
       // offline TPG generation (TAR->TPG conversion) and live inference (where
       // TPGConvertersToFlat goes through this same WritePosPieces call), so
-      // aug features are bit-identical end-to-end with zero per-batch training cost.
+      // aux features are bit-identical end-to-end with zero per-batch training cost.
       Span<byte> whiteAttackers = stackalloc byte[TPGRecord.USE_V3_TPG_RECORD ? 64 : 0];
       Span<byte> blackAttackers = stackalloc byte[TPGRecord.USE_V3_TPG_RECORD ? 64 : 0];
       if (TPGRecord.USE_V3_TPG_RECORD)
@@ -374,7 +374,7 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
         Square squareInTPG = needsReversal ? squareFromPos.Reversed : squareFromPos;
         TPGRecordUtils.WriteSquareEncoding(squareInTPG, pieceRecord.RankEncodingSetter, pieceRecord.FileEncodingSetter);
 
-        // V3 layout: append the 3 aug feature bytes for this square.
+        // V3 layout: append the 3 aux feature bytes for this square.
         // The per-color (white/black) attack counts were computed once at the top
         // of this method on the real position. Map "our" / "opp" by side-to-move.
         // Encoding matches Python aug_features.py exactly (byte * 100 / 8 etc.)
@@ -383,7 +383,7 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
         {
           int ourCount = weAreWhite ? whiteAttackers[squareNum] : blackAttackers[squareNum];
           int oppCount = weAreWhite ? blackAttackers[squareNum] : whiteAttackers[squareNum];
-          Span<byte> aug = pieceRecord.AugFeatureBytesSetter;
+          Span<byte> aug = pieceRecord.AuxFeatureBytesSetter;
           aug[0] = (byte)(ourCount * 100 / 8);
           aug[1] = (byte)(oppCount * 100 / 8);
           aug[2] = (byte)((ourCount - oppCount + 8) * 100 / 16);

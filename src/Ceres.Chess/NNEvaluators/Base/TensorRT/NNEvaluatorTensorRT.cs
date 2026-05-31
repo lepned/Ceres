@@ -478,8 +478,8 @@ public class NNEvaluatorTensorRT : NNEvaluator
     if (netType == ONNXNetExecutor.NetTypeEnum.TPG)
     {
       // Size the byte buffer for the model's actual input shape — supports both
-      // standard 137-byte/square nets and augmented-features 140-byte/square nets
-      // (per CeresTrain's CERES_AUG_FEATURES_PER_SQUARE flag). inputElementsPerPosition
+      // standard 137-byte/square nets and auxiliary-features 140-byte/square nets
+      // (per CeresTrain's CERES_AUX_FEATURES_PER_SQUARE flag). inputElementsPerPosition
       // is derived from the ONNX input dimension at engine load.
       squareByteBuffer = new byte[maxBatchSize * inputElementsPerPosition];
     }
@@ -1449,7 +1449,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
       }
 
       // Size byteBuffer for the model's actual per-position layout (137 or 140 bytes/square,
-      // depending on whether augmented features are enabled). inputElementsPerPosition was
+      // depending on whether auxiliary features are enabled). inputElementsPerPosition was
       // determined from the ONNX input dimension at engine load.
       Memory<byte> byteBuffer = new Memory<byte>(squareByteBuffer, 0, numPos * inputElementsPerPosition);
       Memory<Half> emptyHalf = Memory<Half>.Empty;
@@ -1459,7 +1459,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
       // Pass pre-computed LastMovePlies if available; otherwise history-based estimation is used.
       // Only apply if Options is NNEvaluatorOptionsCeres; otherwise skip ply-since logic entirely.
       // KNOWN LIMITATION: ApplyPlySinceLastMoveTransformationToTPGBuffer casts the buffer as
-      // Span<TPGSquareRecord> (137-byte stride). With augmented features (140-byte stride) and
+      // Span<TPGSquareRecord> (137-byte stride). With auxiliary features (140-byte stride) and
       // a non-Zero PlySinceLastMoveMode, this would misalign. For aug-features MVP use, keep
       // PlySinceLastMoveMode == Zero (the default for puzzle eval).
       if (Options is NNEvaluatorOptionsCeres ceresOptions)

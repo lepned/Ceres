@@ -136,16 +136,11 @@ namespace Ceres.Chess.NNEvaluators.Ceres
     /// </summary>
     public PlySinceLastMoveModeEnum PlySinceLastMoveMode { get; init; } = PlySinceLastMoveModeEnum.Zero;
 
-    /// <summary>
-    /// If augmented input features (per-square attacker counts) should be computed
-    /// at inference time and appended to the network input. When true, the network's
-    /// embedding layer must expect 140 channels per square (137 base + 3 aug). Used
-    /// for CeresTrain nets trained with CERES_AUG_FEATURES_PER_SQUARE=3.
-    ///
-    /// Per-position cost: ~64 popcount + ray-scan ops via PerSquareAttacks.Compute.
-    /// Expected NPS hit: &lt;5% at typical batch sizes.
-    /// </summary>
-    public bool UseAugFeatures { get; init; } = false;
+    // Note on augmented input features (per-square attacker counts via PerSquareAttacks):
+    // No config flag is needed — auto-detected in TPGConvertersToFlat.ConvertToFlatTPG
+    // from the caller-supplied output buffer width (137 vs 140 bytes/square). The
+    // ONNX model's input shape determines this and the caller's buffer is sized from
+    // that ONNX shape via NNEvaluatorTensorRT.inputElementsPerPosition.
 
 
     /// <summary>

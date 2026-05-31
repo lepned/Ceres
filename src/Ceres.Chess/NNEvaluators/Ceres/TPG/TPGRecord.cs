@@ -86,7 +86,7 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
     internal const int NUM_PLY_BIN_PER_SQUARE = USE_V2_TPG_RECORD ? 64 : 0;
 
     /// <summary>
-    /// V3 layout adds 3 per-square augmented-input-feature bytes appended
+    /// V3 layout adds 3 per-square auxiliary-input-feature bytes appended
     /// to TPGSquareRecord (see PerSquareAttacks):
     ///   [0] = our_attackers * 100 / 8           in [0, 100] -> float [0, 1]
     ///   [1] = opp_attackers * 100 / 8           in [0, 100] -> float [0, 1]
@@ -98,7 +98,7 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
     /// Toggling this flag requires regenerating the TPG corpus from TAR.
     /// </summary>
     public const bool USE_V3_TPG_RECORD = true;
-    internal const int NUM_AUG_FEATURE_BYTES_PER_SQUARE = USE_V3_TPG_RECORD ? 3 : 0;
+    internal const int NUM_AUX_FEATURE_BYTES_PER_SQUARE = USE_V3_TPG_RECORD ? 3 : 0;
 
     /// <summary>
     /// Currently hardcoded value for the per-square dimension of the prior state information, 
@@ -128,11 +128,11 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
     public const int MAX_MOVES = 92;
 
     // *** WARNING **** value hardcoded in ONNXRuntimeExecutor.TPG_BYTES_PER_SQUARE_RECORD currently, fix
-    public const int BYTES_PER_SQUARE_RECORD = 137 + NUM_AUG_FEATURE_BYTES_PER_SQUARE;
+    public const int BYTES_PER_SQUARE_RECORD = 137 + NUM_AUX_FEATURE_BYTES_PER_SQUARE;
 
     public const int TOTAL_BYTES = 9250
                                   + (USE_V2_TPG_RECORD ? (2 * 64) : 0)
-                                  + (USE_V3_TPG_RECORD ? (NUM_AUG_FEATURE_BYTES_PER_SQUARE * 64) : 0);
+                                  + (USE_V3_TPG_RECORD ? (NUM_AUX_FEATURE_BYTES_PER_SQUARE * 64) : 0);
 
     #endregion
 

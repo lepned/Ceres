@@ -19,18 +19,29 @@ class Program
   static int Main(string[] args)
   {
     // Phase 0: confirm v3 layout constants are in effect.
-    int sqRecSize = Marshal.SizeOf<TPGSquareRecord>();
+    int sqRecSize    = Marshal.SizeOf<TPGSquareRecord>();
+    int sq64Size     = Marshal.SizeOf<TPGSquareRecord64>();
+    int tpgRecSize   = Marshal.SizeOf<TPGRecord>();
     Console.WriteLine($"Phase 0: layout sanity");
-    Console.WriteLine($"  sizeof(TPGSquareRecord)            = {sqRecSize}");
+    Console.WriteLine($"  sizeof(TPGSquareRecord)            = {sqRecSize}    (expected 140 with V3)");
+    Console.WriteLine($"  sizeof(TPGSquareRecord64)          = {sq64Size}   (expected 64 * 140 = 8960)");
+    Console.WriteLine($"  sizeof(TPGRecord)                  = {tpgRecSize}");
+    Console.WriteLine($"  TPGRecord.TOTAL_BYTES (const)      = {TPGRecord.TOTAL_BYTES}");
     Console.WriteLine($"  TPGRecord.BYTES_PER_SQUARE_RECORD  = {TPGRecord.BYTES_PER_SQUARE_RECORD}");
-    Console.WriteLine($"  TPGRecord.USE_V3_TPG_RECORD        = {TPGRecord.USE_V3_TPG_RECORD}");
-    int expected = TPGRecord.USE_V3_TPG_RECORD ? 140 : 137;
-    if (sqRecSize != expected || TPGRecord.BYTES_PER_SQUARE_RECORD != expected)
+    Console.WriteLine($"  USE_V2={TPGRecord.USE_V2_TPG_RECORD}, USE_V3={TPGRecord.USE_V3_TPG_RECORD}");
+    int expectedSq = TPGRecord.USE_V3_TPG_RECORD ? 140 : 137;
+    if (sqRecSize != expectedSq || TPGRecord.BYTES_PER_SQUARE_RECORD != expectedSq)
     {
-      Console.WriteLine($"  FAIL: expected size {expected}");
+      Console.WriteLine($"  FAIL: expected TPGSquareRecord size {expectedSq}");
       return 99;
     }
-    Console.WriteLine($"  PASS (v3 layout: 140 bytes/square)");
+    if (tpgRecSize != TPGRecord.TOTAL_BYTES)
+    {
+      Console.WriteLine($"  FAIL: sizeof(TPGRecord)={tpgRecSize} != TOTAL_BYTES={TPGRecord.TOTAL_BYTES} (off by {tpgRecSize - TPGRecord.TOTAL_BYTES})");
+      Console.WriteLine($"  This means the TPG file format const is out of sync with the actual struct — writer will corrupt files.");
+      return 98;
+    }
+    Console.WriteLine($"  PASS (v3 layout: 140 bytes/square, TPGRecord {tpgRecSize} bytes matches TOTAL_BYTES)");
     Console.WriteLine();
 
     // Test 1: starting position.
@@ -199,7 +210,7 @@ class Program
         byte expectedOpp = (byte)(oppCount * 100 / 8);
         byte expectedNet = (byte)((ourCount - oppCount + 8) * 100 / 16);
 
-        ReadOnlySpan<byte> actualAug = squareRecords[tpgIdx].AugFeatureBytesReadOnly;
+        ReadOnlySpan<byte> actualAug = squareRecords[tpgIdx].AuxFeatureBytesReadOnly;
         if (actualAug[0] != expectedOur || actualAug[1] != expectedOpp || actualAug[2] != expectedNet)
         {
           if (mismatchesThisFen < 3)
