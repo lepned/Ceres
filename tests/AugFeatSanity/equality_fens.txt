@@ -1,0 +1,78 @@
+# Test FENs for Python ↔ C# aug-feature equality test.
+# Mix of starting, midgame, endgame, en-passant, castling, both colors to move.
+# Format: FEN. Lines starting with # are comments.
+
+# 1. Starting position (W to move)
+rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1
+
+# 2. Starting position (B to move) — verifies orientation handling
+rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1
+
+# 3. After 1.e4 (B to move)
+rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1
+
+# 4. After 1.e4 e5 2.Nf3 (B to move)
+rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq - 1 2
+
+# 5. King's Indian Defense midgame
+r1bq1rk1/ppp2ppp/2np1n2/2b1p3/2B1P3/2NP1N2/PPP2PPP/R1BQ1RK1 w - - 0 1
+
+# 6. En-passant possible (W to move, e6 EP)
+rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 3
+
+# 7. Castled both sides
+r2qkb1r/pppb1ppp/2np1n2/4p3/2B1P3/2NP1N2/PPP2PPP/R1BQ1RK1 b kq - 0 6
+
+# 8. Endgame K+R vs K
+8/8/4k3/8/8/8/4R3/4K3 w - - 0 1
+
+# 9. K+P endgame
+8/8/8/3k4/8/2P5/8/3K4 w - - 0 1
+
+# 10. Mate in 1: back-rank
+6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1
+
+# 11. Tactical midgame with pinned pieces
+r3k2r/pp3ppp/2n5/1B1P4/3p4/PqN2N2/PP1QbPPP/R3K2R w KQkq - 0 1
+
+# 12. Sicilian Najdorf middlegame
+r1bqkb1r/3npppp/p2p1n2/1p6/3NP3/2N5/PPP2PPP/R1BQKB1R w KQkq - 0 7
+
+# 13. Tactical king attack
+r1b2rk1/pppq1ppp/2n1pn2/3p4/2PP4/2NBPN2/PP3PPP/R1BQ1RK1 b - - 0 1
+
+# 14. Endgame K+B+B vs K (bishop pair)
+8/8/8/8/4k3/8/2B5/3KB3 w - - 0 1
+
+# 15. Queen attacking multiple squares
+8/8/8/3Q4/8/8/k7/7K w - - 0 1
+
+# 16. Stalemate-like / many attackers on one square
+4k3/4p3/8/3P1P2/8/8/8/4K3 w - - 0 1
+
+# 17. Initial Italian Game position
+r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 4 4
+
+# 18. Complex sliding pieces, B to move
+r2q1rk1/pp1bbppp/2np1n2/2p1p3/4P3/2NPBN1P/PPP1BPP1/R2Q1RK1 b - - 0 1
+
+# 19. King + rook endgame (B to move)
+8/8/8/3k4/8/8/4R3/4K3 b - - 0 1
+
+# 20. Mate position (test edge case)
+4k3/4P3/4K3/8/8/8/8/8 w - - 0 1
+
+# 21. Lots of pieces clustered (heavy attacker counts)
+rnbqkbnr/8/8/8/8/8/8/RNBQKBNR w KQkq - 0 1
+
+# 22. Highly tactical Sveshnikov-style position
+r1bqkb1r/5ppp/p3p3/np1p4/3P4/1QN1PN2/PP3PPP/R1B1KB1R w KQkq - 0 9
+
+# 23. Bishop battery on long diagonal
+8/2k5/8/3b4/8/3B4/8/K7 w - - 0 1
+
+# 24. Pawn-locked position
+2k5/2p5/1pP5/pP6/P7/8/8/2K5 w - - 0 1
+
+# 25. Knight on rim
+8/8/8/8/8/N7/8/k6K w - - 0 1

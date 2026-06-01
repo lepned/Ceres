@@ -18,6 +18,8 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 using Ceres.Base.DataType;
+using Ceres.Chess.MoveGen;
+using Ceres.Chess.PositionDataInfo;
 
 #endregion
 
@@ -196,7 +198,23 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
     /// </summary>
     fixed byte fileEncoding[8];
 
+    /// <summary>
+    /// V3 layout: auxiliary input features baked at TAR->TPG conversion time.
+    ///   [0] = our_attackers count * 100 / 8           (byte 0..100, float 0..1)
+    ///   [1] = opp_attackers count * 100 / 8           (byte 0..100, float 0..1)
+    ///   [2] = (our - opp + 8) * 100 / 16              (byte 0..100, float 0..1, shifted-positive)
+    /// Computed via Ceres.Chess.PositionDataInfo.PerSquareAttacks. Zero per-batch
+    /// CPU cost at training time (just disk read).
+    /// </summary>
+    fixed byte auxFeatureBytes[TPGRecord.NUM_AUX_FEATURE_BYTES_PER_SQUARE];
+
     #endregion
+
+    public Span<byte> AuxFeatureBytesSetter
+      => MemoryMarshal.CreateSpan(ref auxFeatureBytes[0], TPGRecord.NUM_AUX_FEATURE_BYTES_PER_SQUARE);
+
+    public ReadOnlySpan<byte> AuxFeatureBytesReadOnly
+      => MemoryMarshal.CreateReadOnlySpan(ref auxFeatureBytes[0], TPGRecord.NUM_AUX_FEATURE_BYTES_PER_SQUARE);
 
     public ReadOnlySpan<ByteScaled> PieceTypeHistory(int historyPosIndex)
     {
@@ -226,7 +244,7 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
 
     static bool haveWarned = false;
 
-    static internal unsafe void WritePosPieces(in Position pos,
+    public static unsafe void WritePosPieces(in Position pos,
                                                in Position historyPos1,
                                                in Position historyPos2,
                                                in Position historyPos3,
@@ -244,6 +262,34 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
 
       // N.B. Assumed that the squareRecords start out cleared (verified below in debug mode).
       bool weAreWhite = pos.MiscInfo.SideToMove == SideType.White;
+
+      // V3 layout: compute per-square auxiliary features ONCE on the real position
+      // (real-board WHITE / BLACK), then write the appropriate "our"/"opp"-mapped
+      // bytes into each square's slot inside the loop below. This covers BOTH
+      // offline TPG generation (TAR->TPG conversion) and live inference (where
+      // TPGConvertersToFlat goes through this same WritePosPieces call), so
+      // aux features are bit-identical end-to-end with zero per-batch training cost.
+      //
+      // 7 V3 channels: our_attackers, opp_attackers, net, mobility, defender, is_pinned, is_threatened.
+      // Mobility/pinned/threatened are PIECE-side (set only on squares with a piece).
+      // is_pinned/is_threatened are encoded WITHOUT us/opp mapping — they're booleans about
+      // the piece on the square, regardless of color. (A pinned black piece on a B-to-move
+      // record gets is_pinned=100 just like a pinned white piece would on a W-to-move record.)
+      Span<byte> whiteAttackers = stackalloc byte[TPGRecord.USE_V3_TPG_RECORD ? 64 : 0];
+      Span<byte> blackAttackers = stackalloc byte[TPGRecord.USE_V3_TPG_RECORD ? 64 : 0];
+      Span<byte> mobility       = stackalloc byte[TPGRecord.USE_V3_TPG_RECORD ? 64 : 0];
+      Span<byte> defenderCount  = stackalloc byte[TPGRecord.USE_V3_TPG_RECORD ? 64 : 0];
+      Span<byte> isPinned       = stackalloc byte[TPGRecord.USE_V3_TPG_RECORD ? 64 : 0];
+      Span<byte> isThreatened   = stackalloc byte[TPGRecord.USE_V3_TPG_RECORD ? 64 : 0];
+      if (TPGRecord.USE_V3_TPG_RECORD)
+      {
+        MGPosition mgPos = MGPosition.FromPosition(in pos);
+        // whiteAttackers + blackAttackers are computed internally because defender_count
+        // needs them, but the per-color attacker bytes are NOT written to the TPG record
+        // (dropped from V3 after the 2026-06-01 cleanup — model derives internally).
+        PerSquareAttacks.ComputeExtendedFeatures(in mgPos,
+          whiteAttackers, blackAttackers, mobility, defenderCount, isPinned, isThreatened);
+      }
 
       byte canOO, canOOO, opponentCanOO, opponentCanOOO;
 
@@ -341,6 +387,18 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
         bool needsReversal = pos.SideToMove == SideType.Black;
         Square squareInTPG = needsReversal ? squareFromPos.Reversed : squareFromPos;
         TPGRecordUtils.WriteSquareEncoding(squareInTPG, pieceRecord.RankEncodingSetter, pieceRecord.FileEncodingSetter);
+
+        // V3 layout: append the 4 aux feature bytes for this square.
+        // All four are SIDE-AGNOSTIC properties of the piece on the square (no us/opp flip).
+        // The 3 attacker channels and SEE were tested and dropped (see TPGRecord.cs comment).
+        if (TPGRecord.USE_V3_TPG_RECORD)
+        {
+          Span<byte> aug = pieceRecord.AuxFeatureBytesSetter;
+          aug[0] = mobility[squareNum];
+          aug[1] = defenderCount[squareNum];
+          aug[2] = isPinned[squareNum];
+          aug[3] = isThreatened[squareNum];
+        }
 
         if (pos.SideToMove == SideType.White)
         {

@@ -20,9 +20,11 @@ using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using System.Threading.Tasks;
 using Ceres.Chess.LC0.Batches;
+using Ceres.Chess.MoveGen;
 using Ceres.Chess.NNEvaluators;
 //using CeresTrain.NNEvaluators;
 using Ceres.Chess.NNEvaluators.Ceres.TPG;
+using Ceres.Chess.PositionDataInfo;
 
 #endregion 
 
@@ -274,23 +276,87 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
 
       byte[] moveBytesAll;
 
-      int numConvertedElements = TPGRecord.BYTES_PER_SQUARE_RECORD * 64 * batch.NumPos;
+      NNEvaluatorOptionsCeres optionsCeres = options as NNEvaluatorOptionsCeres;
+
+      // V3 TPG layout: WritePosPieces unconditionally writes 141 bytes per square
+      // (137 base + 4 aux features baked in via PerSquareAttacks). The trained model can
+      // consume either 137 (legacy, aux-blind) or 141 (V3). Width is auto-detected from
+      // the caller's output buffer; the extra aux bytes are sliced off the per-square tail.
+      int bytesPerSquareOut = TPGRecord.BYTES_PER_SQUARE_RECORD;  // 141 with V3=true, 137 with V3=false
+      if (!squareValuesByte.IsEmpty)
+      {
+        int sizePerPos = squareValuesByte.Length / batch.NumPos;
+        if (sizePerPos == 64 * 137)
+        {
+          bytesPerSquareOut = 137;  // legacy 137-channel model — slice off all 4 aux bytes
+        }
+        else if (sizePerPos == 64 * 141)
+        {
+          bytesPerSquareOut = 141;  // V3 141-channel model — pass through
+        }
+        else
+        {
+          throw new InvalidOperationException(
+            $"ConvertToFlatTPG: unexpected squareValuesByte width per position = {sizePerPos}; " +
+            $"expected {64 * 137} (legacy) or {64 * 141} (V3).");
+        }
+      }
+      bool needsSliceForModel = bytesPerSquareOut < TPGRecord.BYTES_PER_SQUARE_RECORD;
+      int numConvertedElements = bytesPerSquareOut * 64 * batch.NumPos;
+
       bool useTemporarySqureValuesByte = squareValuesByte.IsEmpty;
       if (useTemporarySqureValuesByte)
       {
-        squareValuesByteTemporary ??= new byte[137 * 64 * 1024];   // intial guess for max batch size 1024
+        // Size the temporary for the LARGEST (V3) width even when aux is off, so a
+        // single pool covers all three model widths. Default 1024 max batch size.
+        squareValuesByteTemporary ??= new byte[TPGRecord.BYTES_PER_SQUARE_RECORD * 64 * 1024];
         if (squareValuesByteTemporary.Length < numConvertedElements)
         {
-          squareValuesByteTemporary ??= new byte[numConvertedElements];
+          squareValuesByteTemporary = new byte[numConvertedElements];
         }
         squareValuesByte = squareValuesByteTemporary;
       }
 
-      NNEvaluatorOptionsCeres optionsCeres = options as NNEvaluatorOptionsCeres;
-      // TODO: consider pushing the CopyAndDivide below into this next method
-      TPGRecordConverter.ConvertPositionsToRawSquareBytes(batch, includeHistory, batch.Moves, EMIT_PLY_SINCE,
-                                                          optionsCeres.QNegativeBlunders, optionsCeres.QPositiveBlunders,
-                                                          out _, squareValuesByte, legalMoveIndices);
+      if (!needsSliceForModel)
+      {
+        // Caller's buffer matches the natural compile-time stride
+        // (V3/141 with V3=true, or 137 with V3=false). Direct write.
+        TPGRecordConverter.ConvertPositionsToRawSquareBytes(batch, includeHistory, batch.Moves, EMIT_PLY_SINCE,
+                                                            optionsCeres.QNegativeBlunders, optionsCeres.QPositiveBlunders,
+                                                            out _, squareValuesByte, legalMoveIndices);
+      }
+      else
+      {
+        // V3 layout (141 bytes/sq) but caller's buffer is sized for the legacy 137-channel
+        // model. Run the converter into the full 141-byte-stride temp, then scatter to the
+        // narrower stride by copying only the first 137 bytes of each square (dropping aux).
+        int SRC_STRIDE = TPGRecord.BYTES_PER_SQUARE_RECORD;  // 141 with V3
+        int DST_STRIDE = bytesPerSquareOut;                   // 137 (only narrower option)
+        int numFullElements = SRC_STRIDE * 64 * batch.NumPos;
+        byte[] fullBuffer = ArrayPool<byte>.Shared.Rent(numFullElements);
+        try
+        {
+          TPGRecordConverter.ConvertPositionsToRawSquareBytes(batch, includeHistory, batch.Moves, EMIT_PLY_SINCE,
+                                                              optionsCeres.QNegativeBlunders, optionsCeres.QPositiveBlunders,
+                                                              out _, new Memory<byte>(fullBuffer, 0, numFullElements),
+                                                              legalMoveIndices);
+          Span<byte> outSpan = squareValuesByte.Span;
+          for (int p = 0; p < batch.NumPos; p++)
+          {
+            int srcBase = p * 64 * SRC_STRIDE;
+            int dstBase = p * 64 * DST_STRIDE;
+            for (int sq = 0; sq < 64; sq++)
+            {
+              fullBuffer.AsSpan(srcBase + sq * SRC_STRIDE, DST_STRIDE)
+                .CopyTo(outSpan.Slice(dstBase + sq * DST_STRIDE, DST_STRIDE));
+            }
+          }
+        }
+        finally
+        {
+          ArrayPool<byte>.Shared.Return(fullBuffer);
+        }
+      }
 
       // If we are providing float inputs, then it is necessary to do the
       // (slow) convertion from Half to float (and also divide by 100).

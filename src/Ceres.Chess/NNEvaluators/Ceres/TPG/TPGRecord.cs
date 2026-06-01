@@ -86,6 +86,25 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
     internal const int NUM_PLY_BIN_PER_SQUARE = USE_V2_TPG_RECORD ? 64 : 0;
 
     /// <summary>
+    /// V3 layout (post-2026-06-01 cleanup): 4 aux feature bytes per square, all tactical-
+    /// motif features that earned their place via ablation. The 3 original attacker channels
+    /// and SEE were tested and dropped (the former derivable by the model internally; the
+    /// latter redundant with is_threatened + the model's own tactical reasoning).
+    ///
+    /// Aux channels (in this order in each square's tail bytes):
+    ///   [0] = mobility            * 100 / 27 (capped)  in [0, 100] -> float [0, 1]
+    ///   [1] = defender_count      * 100 / 8            in [0, 100] -> float [0, 1] (same-color attackers of piece on sq)
+    ///   [2] = is_pinned           0 or 100             in {0, 100} -> float {0, 1} (piece pinned to its king by opp slider)
+    ///   [3] = is_threatened       0 or 100             in {0, 100} -> float {0, 1} (piece attacked by strictly-lower-value opp piece, NNUE-spirit)
+    ///
+    /// BYTES_PER_SQUARE_RECORD 137 -> 141 (137 base + 4 aux). Computed at TAR->TPG
+    /// conversion time so training has zero per-batch CPU cost. Toggling this flag requires
+    /// regenerating the TPG corpus from TAR.
+    /// </summary>
+    public const bool USE_V3_TPG_RECORD = true;
+    internal const int NUM_AUX_FEATURE_BYTES_PER_SQUARE = USE_V3_TPG_RECORD ? 4 : 0;
+
+    /// <summary>
     /// Currently hardcoded value for the per-square dimension of the prior state information, 
     /// if the network has a state output. Linked to TPGRecord.SIZE_STATE_PER_SQUARE.NNEvaluator
     /// </summary>
@@ -112,10 +131,12 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
     /// </summary>
     public const int MAX_MOVES = 92;
 
-    // *** WARNING **** value hardcoded in ONNXRuntimeExecutor.TPG_BYTES_PER_SQUARE_RECORD currently, fix 
-    public const int BYTES_PER_SQUARE_RECORD = 137;
+    // *** WARNING **** value hardcoded in ONNXRuntimeExecutor.TPG_BYTES_PER_SQUARE_RECORD currently, fix
+    public const int BYTES_PER_SQUARE_RECORD = 137 + NUM_AUX_FEATURE_BYTES_PER_SQUARE;
 
-    public const int TOTAL_BYTES = 9250 + (USE_V2_TPG_RECORD ? (2 * 64) : 0);
+    public const int TOTAL_BYTES = 9250
+                                  + (USE_V2_TPG_RECORD ? (2 * 64) : 0)
+                                  + (USE_V3_TPG_RECORD ? (NUM_AUX_FEATURE_BYTES_PER_SQUARE * 64) : 0);
 
     #endregion
 
