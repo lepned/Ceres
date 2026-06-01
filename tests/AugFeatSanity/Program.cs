@@ -23,13 +23,13 @@ class Program
     int sq64Size     = Marshal.SizeOf<TPGSquareRecord64>();
     int tpgRecSize   = Marshal.SizeOf<TPGRecord>();
     Console.WriteLine($"Phase 0: layout sanity");
-    Console.WriteLine($"  sizeof(TPGSquareRecord)            = {sqRecSize}    (expected 140 with V3)");
-    Console.WriteLine($"  sizeof(TPGSquareRecord64)          = {sq64Size}   (expected 64 * 140 = 8960)");
+    Console.WriteLine($"  sizeof(TPGSquareRecord)            = {sqRecSize}    (expected 141 with V3)");
+    Console.WriteLine($"  sizeof(TPGSquareRecord64)          = {sq64Size}   (expected 64 * 141 = 9024)");
     Console.WriteLine($"  sizeof(TPGRecord)                  = {tpgRecSize}");
     Console.WriteLine($"  TPGRecord.TOTAL_BYTES (const)      = {TPGRecord.TOTAL_BYTES}");
     Console.WriteLine($"  TPGRecord.BYTES_PER_SQUARE_RECORD  = {TPGRecord.BYTES_PER_SQUARE_RECORD}");
     Console.WriteLine($"  USE_V2={TPGRecord.USE_V2_TPG_RECORD}, USE_V3={TPGRecord.USE_V3_TPG_RECORD}");
-    int expectedSq = TPGRecord.USE_V3_TPG_RECORD ? 140 : 137;
+    int expectedSq = TPGRecord.USE_V3_TPG_RECORD ? 141 : 137;
     if (sqRecSize != expectedSq || TPGRecord.BYTES_PER_SQUARE_RECORD != expectedSq)
     {
       Console.WriteLine($"  FAIL: expected TPGSquareRecord size {expectedSq}");
@@ -41,7 +41,7 @@ class Program
       Console.WriteLine($"  This means the TPG file format const is out of sync with the actual struct — writer will corrupt files.");
       return 98;
     }
-    Console.WriteLine($"  PASS (v3 layout: 140 bytes/square, TPGRecord {tpgRecSize} bytes matches TOTAL_BYTES)");
+    Console.WriteLine($"  PASS (v3 layout: 141 bytes/square, TPGRecord {tpgRecSize} bytes matches TOTAL_BYTES)");
     Console.WriteLine();
 
     // Test 1: starting position.
@@ -145,11 +145,12 @@ class Program
     int phase2Result = RunPhase2EqualityTest(fensPath, bytesPath);
     if (phase2Result != 0) return phase2Result;
 
-    int phase3Result = RunPhase3TPGBakeInTest(fensPath);
-    if (phase3Result != 0) return phase3Result;
+    // Phase 3 (WritePosPieces aux[0..2] orientation for attacker bytes) DROPPED 2026-06-01.
+    // The 3 attacker channels are no longer part of the V3 layout; the 4 new aux channels
+    // (mobility/defender/pinned/threatened) are validated by scripts/validate_v3ext_aux_bytes.py.
 
     Console.WriteLine();
-    Console.WriteLine("ALL TESTS PASSED (Phase 1 + Phase 2 + Phase 3 v3-bake-in)");
+    Console.WriteLine("ALL TESTS PASSED (Phase 1 + Phase 2)");
     Console.WriteLine();
     return 0;
   }

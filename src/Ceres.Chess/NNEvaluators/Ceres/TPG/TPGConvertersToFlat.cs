@@ -278,39 +278,38 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
 
       NNEvaluatorOptionsCeres optionsCeres = options as NNEvaluatorOptionsCeres;
 
-      // v3 TPG layout: WritePosPieces unconditionally writes 140 bytes per square
-      // (the trailing 3 are aux features baked in via PerSquareAttacks). For
-      // 140-channel models we copy bytes through as-is. For 137-channel models
-      // (legacy) we slice off the aug tail per square. Auto-detected from the
-      // caller's output buffer width.
-      int bytesPerSquareOut = TPGRecord.BYTES_PER_SQUARE_RECORD;  // 140 with V3=true, 137 with V3=false
+      // V3 TPG layout: WritePosPieces unconditionally writes 141 bytes per square
+      // (137 base + 4 aux features baked in via PerSquareAttacks). The trained model can
+      // consume either 137 (legacy, aux-blind) or 141 (V3). Width is auto-detected from
+      // the caller's output buffer; the extra aux bytes are sliced off the per-square tail.
+      int bytesPerSquareOut = TPGRecord.BYTES_PER_SQUARE_RECORD;  // 141 with V3=true, 137 with V3=false
       if (!squareValuesByte.IsEmpty)
       {
         int sizePerPos = squareValuesByte.Length / batch.NumPos;
         if (sizePerPos == 64 * 137)
         {
-          bytesPerSquareOut = 137;  // legacy 137-channel model — slice off aug tail
+          bytesPerSquareOut = 137;  // legacy 137-channel model — slice off all 4 aux bytes
         }
-        else if (sizePerPos == 64 * 140)
+        else if (sizePerPos == 64 * 141)
         {
-          bytesPerSquareOut = 140;  // V3 140-channel model — pass through
+          bytesPerSquareOut = 141;  // V3 141-channel model — pass through
         }
         else
         {
           throw new InvalidOperationException(
             $"ConvertToFlatTPG: unexpected squareValuesByte width per position = {sizePerPos}; " +
-            $"expected {64 * 137} (legacy 137-channel) or {64 * 140} (v3 aug 140-channel).");
+            $"expected {64 * 137} (legacy) or {64 * 141} (V3).");
         }
       }
-      bool needsSliceFor137Model = bytesPerSquareOut == 137 && TPGRecord.BYTES_PER_SQUARE_RECORD == 140;
+      bool needsSliceForModel = bytesPerSquareOut < TPGRecord.BYTES_PER_SQUARE_RECORD;
       int numConvertedElements = bytesPerSquareOut * 64 * batch.NumPos;
 
       bool useTemporarySqureValuesByte = squareValuesByte.IsEmpty;
       if (useTemporarySqureValuesByte)
       {
-        // Size the temporary for the LARGER (aug) width even when aug is off, so a single
-        // pool covers both modes. Default 1024 max batch size.
-        squareValuesByteTemporary ??= new byte[140 * 64 * 1024];
+        // Size the temporary for the LARGEST (V3) width even when aux is off, so a
+        // single pool covers all three model widths. Default 1024 max batch size.
+        squareValuesByteTemporary ??= new byte[TPGRecord.BYTES_PER_SQUARE_RECORD * 64 * 1024];
         if (squareValuesByteTemporary.Length < numConvertedElements)
         {
           squareValuesByteTemporary = new byte[numConvertedElements];
@@ -318,23 +317,21 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
         squareValuesByte = squareValuesByteTemporary;
       }
 
-      if (!needsSliceFor137Model)
+      if (!needsSliceForModel)
       {
-        // Either V3 with 140-channel model, or V2 with 137-channel model.
-        // ConvertPositionsToRawSquareBytes writes natural-stride bytes matching
-        // the compile-time TPGRecord.BYTES_PER_SQUARE_RECORD — same as the caller's
-        // buffer width. Direct write.
+        // Caller's buffer matches the natural compile-time stride
+        // (V3/141 with V3=true, or 137 with V3=false). Direct write.
         TPGRecordConverter.ConvertPositionsToRawSquareBytes(batch, includeHistory, batch.Moves, EMIT_PLY_SINCE,
                                                             optionsCeres.QNegativeBlunders, optionsCeres.QPositiveBlunders,
                                                             out _, squareValuesByte, legalMoveIndices);
       }
       else
       {
-        // V3 layout but caller's buffer is sized for 137-channel model. Run the
-        // converter into a 140-byte-stride temp, then scatter to 137-byte-stride
-        // output (dropping the trailing 3 aug bytes per square).
-        const int SRC_STRIDE = 140;  // V3 TPGRecord
-        const int DST_STRIDE = 137;  // 137-channel model
+        // V3 layout (141 bytes/sq) but caller's buffer is sized for the legacy 137-channel
+        // model. Run the converter into the full 141-byte-stride temp, then scatter to the
+        // narrower stride by copying only the first 137 bytes of each square (dropping aux).
+        int SRC_STRIDE = TPGRecord.BYTES_PER_SQUARE_RECORD;  // 141 with V3
+        int DST_STRIDE = bytesPerSquareOut;                   // 137 (only narrower option)
         int numFullElements = SRC_STRIDE * 64 * batch.NumPos;
         byte[] fullBuffer = ArrayPool<byte>.Shared.Rent(numFullElements);
         try

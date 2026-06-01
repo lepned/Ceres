@@ -263,18 +263,32 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
       // N.B. Assumed that the squareRecords start out cleared (verified below in debug mode).
       bool weAreWhite = pos.MiscInfo.SideToMove == SideType.White;
 
-      // V3 layout: compute per-square attacker counts ONCE on the real position
+      // V3 layout: compute per-square auxiliary features ONCE on the real position
       // (real-board WHITE / BLACK), then write the appropriate "our"/"opp"-mapped
       // bytes into each square's slot inside the loop below. This covers BOTH
       // offline TPG generation (TAR->TPG conversion) and live inference (where
       // TPGConvertersToFlat goes through this same WritePosPieces call), so
       // aux features are bit-identical end-to-end with zero per-batch training cost.
+      //
+      // 7 V3 channels: our_attackers, opp_attackers, net, mobility, defender, is_pinned, is_threatened.
+      // Mobility/pinned/threatened are PIECE-side (set only on squares with a piece).
+      // is_pinned/is_threatened are encoded WITHOUT us/opp mapping — they're booleans about
+      // the piece on the square, regardless of color. (A pinned black piece on a B-to-move
+      // record gets is_pinned=100 just like a pinned white piece would on a W-to-move record.)
       Span<byte> whiteAttackers = stackalloc byte[TPGRecord.USE_V3_TPG_RECORD ? 64 : 0];
       Span<byte> blackAttackers = stackalloc byte[TPGRecord.USE_V3_TPG_RECORD ? 64 : 0];
+      Span<byte> mobility       = stackalloc byte[TPGRecord.USE_V3_TPG_RECORD ? 64 : 0];
+      Span<byte> defenderCount  = stackalloc byte[TPGRecord.USE_V3_TPG_RECORD ? 64 : 0];
+      Span<byte> isPinned       = stackalloc byte[TPGRecord.USE_V3_TPG_RECORD ? 64 : 0];
+      Span<byte> isThreatened   = stackalloc byte[TPGRecord.USE_V3_TPG_RECORD ? 64 : 0];
       if (TPGRecord.USE_V3_TPG_RECORD)
       {
         MGPosition mgPos = MGPosition.FromPosition(in pos);
-        PerSquareAttacks.Compute(in mgPos, whiteAttackers, blackAttackers);
+        // whiteAttackers + blackAttackers are computed internally because defender_count
+        // needs them, but the per-color attacker bytes are NOT written to the TPG record
+        // (dropped from V3 after the 2026-06-01 cleanup — model derives internally).
+        PerSquareAttacks.ComputeExtendedFeatures(in mgPos,
+          whiteAttackers, blackAttackers, mobility, defenderCount, isPinned, isThreatened);
       }
 
       byte canOO, canOOO, opponentCanOO, opponentCanOOO;
@@ -374,19 +388,16 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
         Square squareInTPG = needsReversal ? squareFromPos.Reversed : squareFromPos;
         TPGRecordUtils.WriteSquareEncoding(squareInTPG, pieceRecord.RankEncodingSetter, pieceRecord.FileEncodingSetter);
 
-        // V3 layout: append the 3 aux feature bytes for this square.
-        // The per-color (white/black) attack counts were computed once at the top
-        // of this method on the real position. Map "our" / "opp" by side-to-move.
-        // Encoding matches Python aug_features.py exactly (byte * 100 / 8 etc.)
-        // for bit-identical training-vs-inference features.
+        // V3 layout: append the 4 aux feature bytes for this square.
+        // All four are SIDE-AGNOSTIC properties of the piece on the square (no us/opp flip).
+        // The 3 attacker channels and SEE were tested and dropped (see TPGRecord.cs comment).
         if (TPGRecord.USE_V3_TPG_RECORD)
         {
-          int ourCount = weAreWhite ? whiteAttackers[squareNum] : blackAttackers[squareNum];
-          int oppCount = weAreWhite ? blackAttackers[squareNum] : whiteAttackers[squareNum];
           Span<byte> aug = pieceRecord.AuxFeatureBytesSetter;
-          aug[0] = (byte)(ourCount * 100 / 8);
-          aug[1] = (byte)(oppCount * 100 / 8);
-          aug[2] = (byte)((ourCount - oppCount + 8) * 100 / 16);
+          aug[0] = mobility[squareNum];
+          aug[1] = defenderCount[squareNum];
+          aug[2] = isPinned[squareNum];
+          aug[3] = isThreatened[squareNum];
         }
 
         if (pos.SideToMove == SideType.White)

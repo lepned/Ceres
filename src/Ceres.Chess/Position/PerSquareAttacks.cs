@@ -293,6 +293,343 @@ namespace Ceres.Chess.PositionDataInfo
                            ourAttackerCount, oppAttackerCount);
     }
 
+    // ============================================================================
+    // V3 aux features (mobility, defender count, is-pinned, is-threatened)
+    // ============================================================================
+
+    /// <summary>
+    /// One-shot computation of all V3 per-square aux features in a single pass over
+    /// the position. Cheaper than 4 separate Compute*() calls because the piece-bitboard
+    /// extraction + per-color attacker bitboards are shared.
+    ///
+    /// All 6 output spans must be length 64 (overwritten).
+    /// Output convention: WHITE/BLACK are the REAL board colors. Caller maps to our/opp by side-to-move.
+    ///
+    /// Mobility encoding: scaled count * 100 / 27 (max plausible mobility, fits in byte 0-100).
+    /// Defender encoding: count * 100 / 8 (same as our_attackers).
+    /// Is-pinned encoding: 0 or 100 (boolean).
+    /// Is-threatened encoding: 0 or 100 (boolean, value-aware — attacked by an opp piece of
+    ///   strictly LOWER piece value than the piece on the square).
+    /// </summary>
+    public static void ComputeExtendedFeatures(in MGPosition pos,
+                                               Span<byte> whiteAttackers,    // 64 (computed internally; used to derive defender_count)
+                                               Span<byte> blackAttackers,    // 64 (computed internally; used to derive defender_count)
+                                               Span<byte> mobility,          // 64 — by piece on square
+                                               Span<byte> defenderCount,     // 64 — friendly attackers of piece on sq
+                                               Span<byte> isPinned,          // 64 — boolean, piece is pinned to its king
+                                               Span<byte> isThreatened)      // 64 — boolean, value-aware
+    {
+      // ---- Shared piece-bitboard extraction (file-flip on entry, same as Compute) ----
+      BitBoard A = FlipFiles(pos.A);
+      BitBoard B = FlipFiles(pos.B);
+      BitBoard C = FlipFiles(pos.C);
+      BitBoard D = FlipFiles(pos.D);
+
+      BitBoard wP = A & ~B & ~C & ~D;
+      BitBoard wB = ~A & B & ~C & ~D;
+      BitBoard wR = ~A & ~B & C & ~D;
+      BitBoard wN = A & ~B & C & ~D;
+      BitBoard wQ = ~A & B & C & ~D;
+      BitBoard wK = A & B & C & ~D;
+      BitBoard bP = A & ~B & ~C & D;
+      BitBoard bB = ~A & B & ~C & D;
+      BitBoard bR = ~A & ~B & C & D;
+      BitBoard bN = A & ~B & C & D;
+      BitBoard bQ = ~A & B & C & D;
+      BitBoard bK = A & B & C & D;
+
+      ComputeExtendedFromBitboards(wP, wN, wB, wR, wQ, wK, bP, bN, bB, bR, bQ, bK,
+                                    whiteAttackers, blackAttackers,
+                                    mobility, defenderCount, isPinned, isThreatened);
+    }
+
+    /// <summary>
+    /// V2→V3 TPG upgrade helper. Companion to <see cref="ComputeFromTpgSquareBytes"/>:
+    /// reads 64×137-byte V2 square block + computes the 4 V3-min extended-feature spans by
+    /// treating "our" pieces as white and "opp" as black (extended features are color-
+    /// symmetric: a pinned piece is pinned regardless of color label; mobility/defender/
+    /// threatened likewise).
+    ///
+    /// All output spans must be length 64. The attacker-count spans are written internally
+    /// (defender_count needs them) but are no longer part of the V3 output format.
+    /// </summary>
+    public static void ComputeExtendedFromTpgSquareBytes(ReadOnlySpan<byte> squareBytes,
+                                                          Span<byte> ourAttackerCount,
+                                                          Span<byte> oppAttackerCount,
+                                                          Span<byte> mobility,
+                                                          Span<byte> defenderCount,
+                                                          Span<byte> isPinned,
+                                                          Span<byte> isThreatened,
+                                                          int bytesPerSquare = 137)
+    {
+      if (squareBytes.Length < 64 * bytesPerSquare)
+      {
+        throw new ArgumentException($"squareBytes too short ({squareBytes.Length}, need {64 * bytesPerSquare})");
+      }
+
+      // Decode 12 piece bitboards from V2 one-hot (same logic as ComputeFromTpgSquareBytes).
+      BitBoard ourP = 0, ourN = 0, ourB = 0, ourR = 0, ourQ = 0, ourK = 0;
+      BitBoard oppP = 0, oppN = 0, oppB = 0, oppR = 0, oppQ = 0, oppK = 0;
+      for (int sq = 0; sq < 64; sq++)
+      {
+        int off = sq * bytesPerSquare;
+        BitBoard bit = 1UL << sq;
+        if      (squareBytes[off + 1]  > 50) ourP |= bit;
+        else if (squareBytes[off + 2]  > 50) ourN |= bit;
+        else if (squareBytes[off + 3]  > 50) ourB |= bit;
+        else if (squareBytes[off + 4]  > 50) ourR |= bit;
+        else if (squareBytes[off + 5]  > 50) ourQ |= bit;
+        else if (squareBytes[off + 6]  > 50) ourK |= bit;
+        else if (squareBytes[off + 7]  > 50) oppP |= bit;
+        else if (squareBytes[off + 8]  > 50) oppN |= bit;
+        else if (squareBytes[off + 9]  > 50) oppB |= bit;
+        else if (squareBytes[off + 10] > 50) oppR |= bit;
+        else if (squareBytes[off + 11] > 50) oppQ |= bit;
+        else if (squareBytes[off + 12] > 50) oppK |= bit;
+      }
+
+      // "our" plays the white role for the extended-features algorithm. All 4 extra channels
+      // are color-symmetric (pin = friendly king alignment; mobility/defender = own-color
+      // exclusion; threat = piece-value comparison) so the role assignment is unobservable.
+      ComputeExtendedFromBitboards(ourP, ourN, ourB, ourR, ourQ, ourK,
+                                    oppP, oppN, oppB, oppR, oppQ, oppK,
+                                    ourAttackerCount, oppAttackerCount,
+                                    mobility, defenderCount, isPinned, isThreatened);
+    }
+
+    /// <summary>
+    /// Shared core: computes all 6 extended-feature spans from 12 per-piece-type bitboards.
+    /// Called by both <see cref="ComputeExtendedFeatures"/> (MGPosition front-end) and
+    /// <see cref="ComputeExtendedFromTpgSquareBytes"/> (V2 upgrade front-end).
+    /// </summary>
+    private static void ComputeExtendedFromBitboards(BitBoard wP, BitBoard wN, BitBoard wB, BitBoard wR, BitBoard wQ, BitBoard wK,
+                                                      BitBoard bP, BitBoard bN, BitBoard bB, BitBoard bR, BitBoard bQ, BitBoard bK,
+                                                      Span<byte> whiteAttackers,
+                                                      Span<byte> blackAttackers,
+                                                      Span<byte> mobility,
+                                                      Span<byte> defenderCount,
+                                                      Span<byte> isPinned,
+                                                      Span<byte> isThreatened)
+    {
+      BitBoard whitePieces = wP | wN | wB | wR | wQ | wK;
+      BitBoard blackPieces = bP | bN | bB | bR | bQ | bK;
+      BitBoard occupancy = whitePieces | blackPieces;
+
+      // ---- 1. Attacker counts (same as Compute) ----
+      ComputeFromBitboards(wP, wN, wB, wR, wQ, wK, bP, bN, bB, bR, bQ, bK,
+                           whiteAttackers, blackAttackers);
+
+      // ---- 2. Mobility per piece ----
+      // For each piece on the board, count the squares it can MOVE to
+      // (attack mask AND NOT own pieces).
+      mobility.Clear();
+      AddMobility(mobility, wP, ~whitePieces, PAWN_ATTACKS_WHITE);
+      AddMobility(mobility, wN, ~whitePieces, KNIGHT_ATTACKS);
+      AddMobility(mobility, wK, ~whitePieces, KING_ATTACKS);
+      AddMobilitySlider(mobility, wB, occupancy, ~whitePieces, BISHOP_DIRS);
+      AddMobilitySlider(mobility, wR, occupancy, ~whitePieces, ROOK_DIRS);
+      AddMobilitySlider(mobility, wQ, occupancy, ~whitePieces, BISHOP_DIRS);
+      AddMobilitySlider(mobility, wQ, occupancy, ~whitePieces, ROOK_DIRS);
+      AddMobility(mobility, bP, ~blackPieces, PAWN_ATTACKS_BLACK);
+      AddMobility(mobility, bN, ~blackPieces, KNIGHT_ATTACKS);
+      AddMobility(mobility, bK, ~blackPieces, KING_ATTACKS);
+      AddMobilitySlider(mobility, bB, occupancy, ~blackPieces, BISHOP_DIRS);
+      AddMobilitySlider(mobility, bR, occupancy, ~blackPieces, ROOK_DIRS);
+      AddMobilitySlider(mobility, bQ, occupancy, ~blackPieces, BISHOP_DIRS);
+      AddMobilitySlider(mobility, bQ, occupancy, ~blackPieces, ROOK_DIRS);
+      // Scale: raw 0..27 → byte 0..100. Use *100/27 with min(100) cap.
+      for (int s = 0; s < 64; s++)
+      {
+        int raw = mobility[s];
+        int scaled = raw * 100 / 27;
+        if (scaled > 100) scaled = 100;
+        mobility[s] = (byte)scaled;
+      }
+
+      // ---- 3. Defender count per occupied square ----
+      // For each square with a piece, count of FRIENDLY pieces attacking that square.
+      // - Our piece on sq → defenders = whiteAttackers[sq] (if our=white) or blackAttackers (if our=black)
+      // - Opp piece on sq → defenders for opp = the other color's attackers
+      // Empty squares: 0.
+      defenderCount.Clear();
+      for (int s = 0; s < 64; s++)
+      {
+        BitBoard bit = 1UL << s;
+        int defenders;
+        if ((whitePieces & bit) != 0)      defenders = whiteAttackers[s];   // white piece, white defends
+        else if ((blackPieces & bit) != 0) defenders = blackAttackers[s];   // black piece, black defends
+        else                                defenders = 0;
+        defenderCount[s] = (byte)(defenders * 100 / 8);
+      }
+
+      // ---- 4. Is-pinned ----
+      // A piece is pinned if: a friendly king lies on the same line as the piece, and
+      // beyond the piece (away from king) lies an opp slider whose attack pattern matches
+      // the line direction. Compute per king, scan 8 rays.
+      isPinned.Clear();
+      MarkPinnedAlongRays(isPinned, wK, whitePieces, blackPieces, bR | bQ, bB | bQ, occupancy);
+      MarkPinnedAlongRays(isPinned, bK, blackPieces, whitePieces, wR | wQ, wB | wQ, occupancy);
+
+      // ---- 5. Is-threatened (value-aware, NNUE-spirit) ----
+      // A piece is threatened iff attacked by an opp piece of STRICTLY LOWER piece value
+      // (pawn=1, knight=3, bishop=3, rook=5, queen=9, king=∞).
+      // For symmetry, "king is attacked at all" → threatened (king never has lower-value attacker).
+      // Pawn never strictly threatened (only pawns can attack pawns, equal trade).
+      // Compute per-opp-piece-type attack bitboards, then per-square decide.
+      isThreatened.Clear();
+      ComputeIsThreatenedForColor(isThreatened, wP, wN, wB, wR, wQ, wK, bP, bN, bB, bR, bQ, bK, occupancy, attackerIsWhite: false);
+      ComputeIsThreatenedForColor(isThreatened, bP, bN, bB, bR, bQ, bK, wP, wN, wB, wR, wQ, wK, occupancy, attackerIsWhite: true);
+    }
+
+    // Helper: accumulate non-slider mobility (pieces of one type vs allowed destinations)
+    private static void AddMobility(Span<byte> counter, BitBoard pieces, BitBoard notOwn, BitBoard[] attackTable)
+    {
+      while (pieces != 0)
+      {
+        int sq = BitOperations.TrailingZeroCount(pieces);
+        pieces &= pieces - 1;
+        BitBoard targets = attackTable[sq] & notOwn;
+        counter[sq] = (byte)(BitOperations.PopCount(targets));
+      }
+    }
+
+    private static void AddMobilitySlider(Span<byte> counter, BitBoard pieces, BitBoard occupancy,
+                                          BitBoard notOwn, (int df, int dr)[] dirs)
+    {
+      while (pieces != 0)
+      {
+        int sq = BitOperations.TrailingZeroCount(pieces);
+        pieces &= pieces - 1;
+        BitBoard targets = SlidingAttacks(sq, occupancy, dirs) & notOwn;
+        // counter[sq] may have been set by other-direction pass for queen — accumulate
+        counter[sq] = (byte)(counter[sq] + BitOperations.PopCount(targets));
+      }
+    }
+
+    // Helper: mark all pieces of `friendlyPieces` that are pinned to their king by an opp slider.
+    // Pin = friendly piece between king and an opp R/Q (rook-like) or B/Q (bishop-like) along same ray.
+    private static void MarkPinnedAlongRays(Span<byte> pinned, BitBoard king,
+                                            BitBoard friendlyPieces, BitBoard enemyPieces,
+                                            BitBoard enemyRookLike, BitBoard enemyBishopLike,
+                                            BitBoard occupancy)
+    {
+      if (king == 0) return;
+      int kingSq = BitOperations.TrailingZeroCount(king);
+      // 4 rook directions
+      foreach (var dir in ROOK_DIRS)
+      {
+        TryMarkPinAlongRay(pinned, kingSq, dir, friendlyPieces, enemyRookLike, occupancy);
+      }
+      // 4 bishop directions
+      foreach (var dir in BISHOP_DIRS)
+      {
+        TryMarkPinAlongRay(pinned, kingSq, dir, friendlyPieces, enemyBishopLike, occupancy);
+      }
+    }
+
+    private static void TryMarkPinAlongRay(Span<byte> pinned, int kingSq, (int df, int dr) dir,
+                                           BitBoard friendlyPieces, BitBoard enemySlidersOfLineType, BitBoard occupancy)
+    {
+      int sf = kingSq & 7, sr = kingSq >> 3;
+      int nf = sf + dir.df, nr = sr + dir.dr;
+      int firstFriendly = -1;
+      while (nf >= 0 && nf < 8 && nr >= 0 && nr < 8)
+      {
+        int sq = nr * 8 + nf;
+        BitBoard bit = 1UL << sq;
+        if ((occupancy & bit) != 0)
+        {
+          if (firstFriendly < 0)
+          {
+            // First obstacle on the ray
+            if ((friendlyPieces & bit) != 0)
+            {
+              firstFriendly = sq;
+              // Keep scanning to find what's beyond
+            }
+            else
+            {
+              return;  // First obstacle is enemy — no pin on this ray
+            }
+          }
+          else
+          {
+            // Second obstacle — is it an opp slider matching this line direction?
+            if ((enemySlidersOfLineType & bit) != 0)
+            {
+              pinned[firstFriendly] = 100;
+            }
+            return;
+          }
+        }
+        nf += dir.df; nr += dir.dr;
+      }
+    }
+
+    // Compute is-threatened for one color's pieces (attackerIsWhite indicates whose attackers we check).
+    // For each piece P of the defending color, check if any opp piece of strictly lower value attacks P's square.
+    private static void ComputeIsThreatenedForColor(Span<byte> threatened,
+                                                    BitBoard defP, BitBoard defN, BitBoard defB, BitBoard defR, BitBoard defQ, BitBoard defK,
+                                                    BitBoard attP, BitBoard attN, BitBoard attB, BitBoard attR, BitBoard attQ, BitBoard attK,
+                                                    BitBoard occupancy, bool attackerIsWhite)
+    {
+      // Compute per-attacker-piece-type attack bitboards (squares any attacker of that type covers).
+      // Pawn attacks depend on color.
+      BitBoard atkByP = ComputeNonSliderAttackUnion(attP, attackerIsWhite ? PAWN_ATTACKS_WHITE : PAWN_ATTACKS_BLACK);
+      BitBoard atkByN = ComputeNonSliderAttackUnion(attN, KNIGHT_ATTACKS);
+      BitBoard atkByB = ComputeSliderAttackUnion(attB, occupancy, BISHOP_DIRS);
+      BitBoard atkByR = ComputeSliderAttackUnion(attR, occupancy, ROOK_DIRS);
+      BitBoard atkByQ = ComputeSliderAttackUnion(attQ, occupancy, BISHOP_DIRS) | ComputeSliderAttackUnion(attQ, occupancy, ROOK_DIRS);
+
+      // King: threatened iff attacked at all (king has no lower-value attacker — but check is most-critical)
+      BitBoard anyAttack = atkByP | atkByN | atkByB | atkByR | atkByQ;
+      ApplyThreatMask(threatened, defK, anyAttack);
+      // Queen: threatened by P/N/B/R (anything except Q)
+      ApplyThreatMask(threatened, defQ, atkByP | atkByN | atkByB | atkByR);
+      // Rook: threatened by P/N/B (cheaper pieces)
+      ApplyThreatMask(threatened, defR, atkByP | atkByN | atkByB);
+      // Knight/Bishop (~equal value 3): threatened by pawn only
+      ApplyThreatMask(threatened, defN, atkByP);
+      ApplyThreatMask(threatened, defB, atkByP);
+      // Pawn: only pawn attacks pawn (equal trade) — not strictly lower-value attacker. Skip.
+    }
+
+    private static BitBoard ComputeNonSliderAttackUnion(BitBoard pieces, BitBoard[] attackTable)
+    {
+      BitBoard u = 0;
+      while (pieces != 0)
+      {
+        int sq = BitOperations.TrailingZeroCount(pieces);
+        pieces &= pieces - 1;
+        u |= attackTable[sq];
+      }
+      return u;
+    }
+
+    private static BitBoard ComputeSliderAttackUnion(BitBoard pieces, BitBoard occupancy, (int df, int dr)[] dirs)
+    {
+      BitBoard u = 0;
+      while (pieces != 0)
+      {
+        int sq = BitOperations.TrailingZeroCount(pieces);
+        pieces &= pieces - 1;
+        u |= SlidingAttacks(sq, occupancy, dirs);
+      }
+      return u;
+    }
+
+    private static void ApplyThreatMask(Span<byte> threatened, BitBoard defenderPieces, BitBoard threatMask)
+    {
+      BitBoard hit = defenderPieces & threatMask;
+      while (hit != 0)
+      {
+        int sq = BitOperations.TrailingZeroCount(hit);
+        hit &= hit - 1;
+        threatened[sq] = 100;
+      }
+    }
+
+
     // For non-sliders: iterate pieces, look up attack mask from precomputed table,
     // increment counter[target_sq] for each target bit.
     private static void AddAttacks(Span<byte> counter, BitBoard piecesOfType, BitBoard[] attackTable)
@@ -327,5 +664,12 @@ namespace Ceres.Chess.PositionDataInfo
         }
       }
     }
+
+    // ============================================================================
+    // SEE (Static Exchange Evaluation) helpers were DROPPED 2026-06-01 after ablation
+    // showed SEE was redundant with is_threatened + the model's internal reasoning.
+    // Removed code: ComputeSEEPerSquare, SEEAt, PieceValueAt, AttackersOfSquare, XRayThrough
+    // (preserved in git history, commit prior to V3 cleanup).
+    // ============================================================================
   }
 }
