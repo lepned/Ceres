@@ -58,6 +58,7 @@ extern "C"
     int32_t fp32Softmax;               // 1 = force FP32 for all Softmax layers, 0 = false (default)
     int32_t fp32AllNorms;              // 1 = force FP32 for ALL norm chains (not just residual stream), 0 = false (default)
     int32_t refittable;                // 1 = enable refit support (kREFIT_IDENTICAL), 0 = false (default)
+    int32_t useInt8;                   // 1 = enable INT8 + FP16 mixed precision, requires <onnxPath>.calib alongside the ONNX
   };
 
   // Initialize build options with defaults

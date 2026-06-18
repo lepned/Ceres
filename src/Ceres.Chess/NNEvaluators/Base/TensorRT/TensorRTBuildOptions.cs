@@ -129,6 +129,15 @@ public record struct TensorRTBuildOptions
   public int Refittable;
 
   /// <summary>
+  /// Use INT8 precision (1 = true, 0 = false (default)).
+  /// Appended to the end of the struct for binary compatibility — pre-existing
+  /// field offsets must remain stable for the C++ wrapper struct layout.
+  /// When enabled the wrapper requires a TRT calibration cache at
+  /// "&lt;onnxPath&gt;.calib" and will fail engine build if it's missing.
+  /// </summary>
+  public int UseInt8;
+
+  /// <summary>
   /// Returns default build options.
   /// </summary>
   public static TensorRTBuildOptions Default => new TensorRTBuildOptions
@@ -149,7 +158,8 @@ public record struct TensorRTBuildOptions
     FP32SmolgenNorm = 0,
     FP32Softmax = 0,
     FP32AllNorms = 0,
-    Refittable = 0
+    Refittable = 0,
+    UseInt8 = 0
   };
 
 
@@ -162,6 +172,10 @@ public record struct TensorRTBuildOptions
     if (UseFP16 != 0 && UseBF16 != 0)
     {
       throw new ArgumentException("Cannot enable both UseFP16 and UseBF16 simultaneously.");
+    }
+    if (UseInt8 != 0 && UseBF16 != 0)
+    {
+      throw new ArgumentException("Cannot enable both UseInt8 and UseBF16 simultaneously.");
     }
   }
 }

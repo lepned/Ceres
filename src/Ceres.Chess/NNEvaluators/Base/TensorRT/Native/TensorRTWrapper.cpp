@@ -297,9 +297,76 @@ extern "C"
     options->fp32Softmax = 0;
     options->fp32AllNorms = 0;
     options->refittable = 0;
+    options->useInt8 = 0;
   }
 
 } // end extern "C" (temporarily, for C++ helper functions below)
+
+// INT8 calibrator that ONLY reads a pre-computed calibration cache file
+// (typically produced offline by CeresTrain's scripts/int8_validate.py or
+// any IInt8EntropyCalibrator2-compatible tool). Never runs actual calibration
+// at engine-build time — getBatch() returns nullptr immediately, so TRT must
+// satisfy the calibration from the cache alone.
+//
+// File convention: "<onnxPath>.calib" next to the model file.
+// Format: TRT's IInt8EntropyCalibrator2 text format, e.g. emitted by
+//   IInt8EntropyCalibrator2::writeCalibrationCache(...).
+class CalibFromCacheFile : public nvinfer1::IInt8EntropyCalibrator2
+{
+public:
+  CalibFromCacheFile(const std::string& onnxPath)
+    : cachePath_(onnxPath + ".calib")
+  {
+    std::ifstream f(cachePath_, std::ios::binary);
+    if (f.good())
+    {
+      f.seekg(0, std::ios::end);
+      std::streamsize size = f.tellg();
+      f.seekg(0, std::ios::beg);
+      cache_.resize(static_cast<size_t>(size));
+      f.read(cache_.data(), size);
+      fprintf(stderr, "[TensorRT INT8] Loaded calibration cache: %s (%zu bytes)\n",
+              cachePath_.c_str(), cache_.size());
+    }
+  }
+
+  bool hasCache() const { return !cache_.empty(); }
+  const std::string& cachePath() const { return cachePath_; }
+
+  // Required IInt8Calibrator overrides.
+  // Returns the calibration-time batch size (must match what produced the
+  // cache file). The CeresTrain scripts/int8_validate.py uses batch=64; we
+  // hard-code that here so TRT's cache-vs-current-engine compatibility check
+  // passes. If a future calibration uses a different batch, this constant
+  // needs to match.
+  int32_t getBatchSize() const noexcept override { return 64; }
+
+  bool getBatch(void* /*bindings*/[], const char* /*names*/[], int32_t /*nbBindings*/) noexcept override
+  {
+    // No live calibration — return false immediately so TRT uses the cache.
+    return false;
+  }
+
+  const void* readCalibrationCache(size_t& length) noexcept override
+  {
+    if (cache_.empty())
+    {
+      length = 0;
+      return nullptr;
+    }
+    length = cache_.size();
+    return cache_.data();
+  }
+
+  void writeCalibrationCache(const void* /*cache*/, size_t /*length*/) noexcept override
+  {
+    // No-op: never rewrite the cache from runtime (this is deployment mode).
+  }
+
+private:
+  std::string cachePath_;
+  std::vector<char> cache_;
+};
 
 // Helper: print colored console message
 static void PrintColored(const char* color, const char* message)
@@ -805,14 +872,25 @@ extern "C"
       return nullptr;
     }
 
-    // Create network (kEXPLICIT_BATCH is deprecated in TRT 10+; 0 is equivalent)
+    // STRONGLY-TYPED for QDQ (INT8/FP8): TRT honors the ONNX/QDQ types exactly
+    // (like ORT) instead of re-deriving precisions and discarding dequant scales
+    // on outlier tensors (which corrupts the value head). Mirrors the
+    // multi-profile path so INT8/FP8 stay correct even if CUDA graphs / EXACT
+    // mode are disabled (which routes here, single-profile). No precision flags
+    // / calibrator / pins in strongly-typed mode — the Q/DQ nodes drive it.
+    const bool stronglyTyped = (opts->useInt8 || opts->useFP8);
+    uint32_t netFlags = stronglyTyped
+        ? (1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED))
+        : 0U;
     auto network = std::unique_ptr<nvinfer1::INetworkDefinition>(
-      builder->createNetworkV2(0));
+      builder->createNetworkV2(netFlags));
     if (!network)
     {
       SetError("Failed to create network");
       return nullptr;
     }
+    if (stronglyTyped)
+      fprintf(stderr, "[TensorRT] STRONGLY-TYPED build (QDQ, single-profile): precision from ONNX types.\n");
 
     // Create ONNX parser
     auto parser = std::unique_ptr<nvonnxparser::IParser>(
@@ -847,28 +925,82 @@ extern "C"
     // Apply build options
     config->setBuilderOptimizationLevel(opts->builderOptimizationLevel);
 
+    // Match the proven-GREEN standalone qdq_export.py build: an explicit large
+    // workspace. An under-sized workspace makes TRT fall back to worse INT8
+    // tactics (suspected cause of the in-engine value-head degradation).
+    config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 1ULL << 33);
+
     if (opts->tilingOptimizationLevel >= 0)
     {
       config->setTilingOptimizationLevel(
         static_cast<nvinfer1::TilingOptimizationLevel>(opts->tilingOptimizationLevel));
     }
 
-    // Precision flags
-    if (opts->useBest)
+    // Precision flags — illegal in strongly-typed mode (types from the ONNX).
+    if (!stronglyTyped)
     {
-      config->setFlag(nvinfer1::BuilderFlag::kPREFER_PRECISION_CONSTRAINTS);
+      if (opts->useBest)
+      {
+        config->setFlag(nvinfer1::BuilderFlag::kPREFER_PRECISION_CONSTRAINTS);
+      }
+      if (opts->useFP16)
+      {
+        config->setFlag(nvinfer1::BuilderFlag::kFP16);
+      }
+      if (opts->useBF16)
+      {
+        config->setFlag(nvinfer1::BuilderFlag::kBF16);
+      }
+      if (opts->useFP8)
+      {
+        config->setFlag(nvinfer1::BuilderFlag::kFP8);
+      }
     }
-    if (opts->useFP16)
+
+    // INT8. Two modes, auto-selected by inspecting the parsed network:
+    //  - Explicit quantization (QDQ): the ONNX already carries
+    //    QuantizeLinear/DequantizeLinear nodes (from CeresTrain
+    //    scripts/qdq_export.py). TRT honors those embedded scales directly, so
+    //    we only enable INT8 kernels — NO calibrator/cache needed. High-fidelity
+    //    path: MatMuls -> INT8, norms/softmax/value-head stay FP (validated
+    //    GREEN standalone: policy KLD ~0.017, WDL argmax 99.9%, +35% @batch256).
+    //  - Implicit calibration (legacy): no QDQ -> requires a pre-computed
+    //    "<onnxPath>.calib" IInt8EntropyCalibrator2 cache (int8_validate.py).
+    // Detect explicit quantization (QDQ) at FUNCTION scope so the FP32-pinning
+    // blocks below can skip themselves for QDQ graphs (kOBEY_PRECISION_CONSTRAINTS
+    // + setPrecision conflict with embedded Q/DQ scales).
+    bool hasQDQ = false;
+    for (int32_t li = 0; li < network->getNbLayers(); ++li)
     {
-      config->setFlag(nvinfer1::BuilderFlag::kFP16);
+      auto lt = network->getLayer(li)->getType();
+      if (lt == nvinfer1::LayerType::kQUANTIZE || lt == nvinfer1::LayerType::kDEQUANTIZE)
+      {
+        hasQDQ = true;
+        break;
+      }
     }
-    if (opts->useBF16)
+    // Skipped in strongly-typed mode (QDQ types drive INT8/FP8; kINT8 is illegal).
+    std::unique_ptr<CalibFromCacheFile> int8Calib_single;
+    if (!stronglyTyped && opts->useInt8)
     {
-      config->setFlag(nvinfer1::BuilderFlag::kBF16);
-    }
-    if (opts->useFP8)
-    {
-      config->setFlag(nvinfer1::BuilderFlag::kFP8);
+      if (hasQDQ)
+      {
+        config->setFlag(nvinfer1::BuilderFlag::kINT8);
+        fprintf(stderr, "[TensorRT INT8] Explicit QDQ graph detected -> INT8 kernels enabled, no calibrator.\n");
+      }
+      else
+      {
+        int8Calib_single = std::make_unique<CalibFromCacheFile>(onnxPath);
+        if (!int8Calib_single->hasCache())
+        {
+          SetError("INT8 mode requested but graph has no QDQ nodes and no calibration cache: " +
+                   int8Calib_single->cachePath() +
+                   ". Provide a QDQ ONNX (CeresTrain scripts/qdq_export.py) or a .calib cache (int8_validate.py).");
+          return nullptr;
+        }
+        config->setFlag(nvinfer1::BuilderFlag::kINT8);
+        config->setInt8Calibrator(int8Calib_single.get());
+      }
     }
 
     // Enable refit support if requested
@@ -885,7 +1017,7 @@ extern "C"
     // Three modes: broad (fp32PostAttentionNorm) = all normalization layers (recommended),
     //              strict (fp32PostAttentionNormStrict) = only main encoder ln1 (LC0-specific),
     //              smolgen (fp32SmolgenNorm) = only smolgen attention ln1 (LC0-specific).
-    if (opts->fp32PostAttentionNorm || opts->fp32PostAttentionNormStrict || opts->fp32SmolgenNorm)
+    if (!stronglyTyped && !hasQDQ && (opts->fp32PostAttentionNorm || opts->fp32PostAttentionNormStrict || opts->fp32SmolgenNorm))
     {
       config->setFlag(nvinfer1::BuilderFlag::kOBEY_PRECISION_CONSTRAINTS);
 
@@ -930,8 +1062,11 @@ extern "C"
         layersMarked, totalLayers, modeName);
     }
 
-    // Force FP32 for all Softmax layers (prevents exp() overflow in FP16)
-    if (opts->fp32Softmax)
+    // Force FP32 for all Softmax layers (prevents exp() overflow in FP16).
+    // SKIPPED for QDQ: kOBEY_PRECISION_CONSTRAINTS + setPrecision around the
+    // attention softmaxes degrades the INT8 value path (the GREEN standalone
+    // qdq_export.py sets neither kOBEY nor any softmax pin).
+    if (!stronglyTyped && !hasQDQ && opts->fp32Softmax)
     {
       config->setFlag(nvinfer1::BuilderFlag::kOBEY_PRECISION_CONSTRAINTS);
       int totalLayers = network->getNbLayers();
@@ -952,8 +1087,9 @@ extern "C"
       fprintf(stderr, "[TensorRT] Marked %d Softmax layers as FP32\n", softmaxMarked);
     }
 
-    // Force FP32 for normalization chains (scope: 1=all, 2=QKV, 3=smolgen, 4=QKV+smolgen)
-    if (opts->fp32AllNorms)
+    // Force FP32 for normalization chains (scope: 1=all, 2=QKV, 3=smolgen, 4=QKV+smolgen).
+    // SKIPPED for QDQ (see softmax block — kOBEY degrades the INT8 value path).
+    if (!stronglyTyped && !hasQDQ && opts->fp32AllNorms)
     {
       config->setFlag(nvinfer1::BuilderFlag::kOBEY_PRECISION_CONSTRAINTS);
       int totalLayers = network->getNbLayers();
@@ -1213,6 +1349,13 @@ extern "C"
     if (opts->refittable)
     {
       hash ^= std::hash<int32_t>{}(opts->refittable) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    }
+    // INT8 mode produces a fundamentally different engine — must invalidate any
+    // pre-existing FP16/BF16 cache entry. Only include when non-zero so existing
+    // cached files (with useInt8=0) remain valid.
+    if (opts->useInt8)
+    {
+      hash ^= std::hash<int32_t>{}(opts->useInt8) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
     }
     return hash;
   }
@@ -1557,6 +1700,8 @@ extern "C"
     std::string precision;
     if (opts->useFP8) precision = "FP8";
     else if (opts->useBF16) precision = "BF16";
+    else if (opts->useInt8 && opts->useFP16) precision = "INT8+FP16";
+    else if (opts->useInt8) precision = "INT8";
     else if (opts->useFP16) precision = "FP16";
     else precision = "FP32";
 
@@ -3018,13 +3163,24 @@ extern "C"
       return -4;
     }
 
-    // Create network
-    auto network = std::unique_ptr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(0));
+    // STRONGLY-TYPED for QDQ (INT8/FP8): TRT then honors the ONNX/QDQ types
+    // EXACTLY (like ORT), instead of re-deriving precisions and discarding
+    // dequant scales on outlier tensors (which corrupts the value head). In
+    // strongly-typed mode we set NO precision flags / calibrator / pins — the
+    // Q/DQ nodes dictate everything. (ORT-simulated INT8 preserves value 100%;
+    // standard TRT build collapses it -> this is the fix.)
+    const bool stronglyTyped = (opts->useInt8 || opts->useFP8);
+    uint32_t netFlags = stronglyTyped
+        ? (1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED))
+        : 0U;
+    auto network = std::unique_ptr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(netFlags));
     if (!network)
     {
       SetError("Failed to create network");
       return -5;
     }
+    if (stronglyTyped)
+      fprintf(stderr, "[TensorRT] STRONGLY-TYPED build (QDQ): precision from ONNX types, no flags/calibrator/pins.\n");
 
     // Parse ONNX
     auto parser = std::unique_ptr<nvonnxparser::IParser>(nvonnxparser::createParser(*network, g_logger));
@@ -3070,16 +3226,70 @@ extern "C"
     // Apply build options
     config->setBuilderOptimizationLevel(opts->builderOptimizationLevel);
 
+    // Match the proven-GREEN standalone qdq_export.py build: an explicit large
+    // workspace. An under-sized workspace makes TRT fall back to worse INT8
+    // tactics (suspected cause of the in-engine value-head degradation).
+    config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 1ULL << 33);
+
     if (opts->tilingOptimizationLevel >= 0)
     {
       config->setTilingOptimizationLevel(
         static_cast<nvinfer1::TilingOptimizationLevel>(opts->tilingOptimizationLevel));
     }
 
-    if (opts->useBest) config->setFlag(nvinfer1::BuilderFlag::kPREFER_PRECISION_CONSTRAINTS);
-    if (opts->useFP16) config->setFlag(nvinfer1::BuilderFlag::kFP16);
-    if (opts->useBF16) config->setFlag(nvinfer1::BuilderFlag::kBF16);
-    if (opts->useFP8) config->setFlag(nvinfer1::BuilderFlag::kFP8);
+    // Precision builder flags are illegal in strongly-typed mode (types come
+    // from the ONNX) -> only set them for the standard path.
+    if (!stronglyTyped)
+    {
+      if (opts->useBest) config->setFlag(nvinfer1::BuilderFlag::kPREFER_PRECISION_CONSTRAINTS);
+      if (opts->useFP16) config->setFlag(nvinfer1::BuilderFlag::kFP16);
+      if (opts->useBF16) config->setFlag(nvinfer1::BuilderFlag::kBF16);
+      if (opts->useFP8) config->setFlag(nvinfer1::BuilderFlag::kFP8);
+    }
+
+    // Detect explicit quantization (QDQ): if the ONNX carries
+    // QuantizeLinear/DequantizeLinear nodes (from CeresTrain scripts/qdq_export.py),
+    // TRT honors those embedded scales directly -> no calibrator/cache needed.
+    // (Declared at function scope so the calibration-profile block below can skip
+    // itself for QDQ graphs.)
+    bool hasQDQ = false;
+    for (int32_t li = 0; li < network->getNbLayers(); ++li)
+    {
+      auto lt = network->getLayer(li)->getType();
+      if (lt == nvinfer1::LayerType::kQUANTIZE || lt == nvinfer1::LayerType::kDEQUANTIZE)
+      {
+        hasQDQ = true;
+        break;
+      }
+    }
+
+    // INT8. Explicit QDQ -> enable INT8 kernels, no calibrator. Otherwise legacy
+    // implicit path requires <onnxPath>.calib (int8_validate.py).
+    // Skipped entirely in strongly-typed mode (the QDQ types drive INT8/FP8
+    // automatically; setting kINT8 is illegal there).
+    std::unique_ptr<CalibFromCacheFile> int8Calib;
+    if (!stronglyTyped && opts->useInt8)
+    {
+      if (hasQDQ)
+      {
+        config->setFlag(nvinfer1::BuilderFlag::kINT8);
+        fprintf(stderr, "[TensorRT] Multi-profile INT8: explicit QDQ graph -> INT8 kernels, no calibrator.\n");
+      }
+      else
+      {
+        int8Calib = std::make_unique<CalibFromCacheFile>(onnxPath);
+        if (!int8Calib->hasCache())
+        {
+          SetError("INT8 mode requested but graph has no QDQ nodes and no calibration cache: " +
+                   int8Calib->cachePath() +
+                   ". Provide a QDQ ONNX (CeresTrain scripts/qdq_export.py) or a .calib cache (int8_validate.py).");
+          return -8;
+        }
+        config->setFlag(nvinfer1::BuilderFlag::kINT8);
+        config->setInt8Calibrator(int8Calib.get());
+        fprintf(stderr, "[TensorRT] Multi-profile INT8+FP16 build enabled (calibration cache loaded)\n");
+      }
+    }
 
     if (opts->refittable)
     {
@@ -3103,7 +3313,11 @@ extern "C"
     // Skipped under BF16: BF16 has the same 8-bit exponent as FP32, so the
     // overflow path doesn't exist — forcing FP32 there is pure conversion
     // overhead with no accuracy gain.
-    if (!opts->useBF16)
+    // Skipped under BF16 (same exponent range as FP32 — no overflow risk).
+    // Skipped under INT8 — TRT's INT8 calibration places norms in higher
+    // precision automatically; manual FP32 marking on top conflicts with
+    // the calibrator's layer-precision decisions.
+    if (!opts->useBF16 && !opts->useInt8 && !stronglyTyped)
     {
       int totalAuto = network->getNbLayers();
       std::unordered_map<std::string, int32_t> autoProducer;
@@ -3228,6 +3442,41 @@ extern "C"
     }
     // ------ end STRUCTURAL FP32 norm marker -----
 
+    // -------- FP32 FUSED-norm marker (opset-23 RMSNormalization / LayerNormalization) --------
+    // The scale-const -> Mul walk above only reaches DECOMPOSED norms (opset<=18
+    // export: Pow/ReduceMean/Sqrt/Div/Mul). PyTorch opset-23 export collapses each
+    // RMSNorm/LayerNorm into a single FUSED op that TensorRT imports as one
+    // kNORMALIZATION layer with NO downstream elementwise Mul -- so the walk finds
+    // mulIdx == -1, bails, and the norm is left in FP16. TRT then runs the fused
+    // norm's internal mean(x^2) in FP16, which OVERFLOWS once the (unnormalized)
+    // residual stream grows past ~256 -> Inf/NaN. The poison lands in the value
+    // head (garbage WDL/eval) while the argmax policy still looks plausible.
+    //
+    // This is exactly the failure that decomposed-norm nets avoid via the walk
+    // above; mark every fused normalization layer FP32 to cover the opset-23 case.
+    // ONNXRuntime/Torch keep the norm accumulation in FP32 internally, which is why
+    // they are bit-correct while only the TRT FP16 path regresses.
+    // Skipped under BF16 (8-bit exponent, no overflow) and INT8 (calibrator-managed).
+    if (!opts->useBF16 && !opts->useInt8 && !stronglyTyped)
+    {
+      int totalNorm = network->getNbLayers();
+      int fusedNormMarked = 0;
+      for (int32_t i = 0; i < totalNorm; ++i)
+      {
+        auto* L = network->getLayer(i);
+        if (L->getType() != nvinfer1::LayerType::kNORMALIZATION) continue;
+        config->setFlag(nvinfer1::BuilderFlag::kOBEY_PRECISION_CONSTRAINTS);
+        L->setPrecision(nvinfer1::DataType::kFLOAT);
+        for (int32_t j = 0; j < L->getNbOutputs(); ++j)
+          L->setOutputType(j, nvinfer1::DataType::kFLOAT);
+        fusedNormMarked++;
+      }
+      if (fusedNormMarked > 0)
+        fprintf(stderr, "[TensorRT] Auto-marked %d fused kNORMALIZATION layers FP32 (opset-23 RMSNormalization FP16-overflow guard)\n",
+                fusedNormMarked);
+    }
+    // ------ end FP32 FUSED-norm marker -----
+
     // DEBUG: enumerate norm-scale constants and trace forward to the Mul that
     // consumes them — that Mul is the tail of a RMSNorm compute chain. Then
     // walk back through its producers to enumerate Pow/ReduceMean/Add/Sqrt/Div.
@@ -3323,7 +3572,10 @@ extern "C"
     }
 
     // Force FP32 precision for normalization layers to prevent FP16 overflow.
-    if (opts->fp32PostAttentionNorm || opts->fp32PostAttentionNormStrict || opts->fp32SmolgenNorm)
+    // Applied for QDQ too (protects value head from decomposed-norm FP16 overflow;
+    // coexists with QDQ on MatMuls). The "[SCALE] invalid precision" warnings are
+    // benign (present in the GREEN +35% standalone build).
+    if (!stronglyTyped && !hasQDQ && (opts->fp32PostAttentionNorm || opts->fp32PostAttentionNormStrict || opts->fp32SmolgenNorm))
     {
       config->setFlag(nvinfer1::BuilderFlag::kOBEY_PRECISION_CONSTRAINTS);
 
@@ -3368,8 +3620,11 @@ extern "C"
         layersMarked, totalLayers, modeName);
     }
 
-    // Force FP32 for all Softmax layers (prevents exp() overflow in FP16)
-    if (opts->fp32Softmax)
+    // Force FP32 for all Softmax layers (prevents exp() overflow in FP16).
+    // SKIPPED for QDQ: kOBEY_PRECISION_CONSTRAINTS + setPrecision around the
+    // attention softmaxes degrades the INT8 value path (the GREEN standalone
+    // qdq_export.py sets neither kOBEY nor any softmax pin).
+    if (!stronglyTyped && !hasQDQ && opts->fp32Softmax)
     {
       config->setFlag(nvinfer1::BuilderFlag::kOBEY_PRECISION_CONSTRAINTS);
       int totalLayers = network->getNbLayers();
@@ -3390,8 +3645,9 @@ extern "C"
       fprintf(stderr, "[TensorRT] Marked %d Softmax layers as FP32\n", softmaxMarked);
     }
 
-    // Force FP32 for normalization chains (scope: 1=all, 2=QKV, 3=smolgen, 4=QKV+smolgen)
-    if (opts->fp32AllNorms)
+    // Force FP32 for normalization chains (scope: 1=all, 2=QKV, 3=smolgen, 4=QKV+smolgen).
+    // SKIPPED for QDQ (see softmax block — kOBEY degrades the INT8 value path).
+    if (!stronglyTyped && !hasQDQ && opts->fp32AllNorms)
     {
       config->setFlag(nvinfer1::BuilderFlag::kOBEY_PRECISION_CONSTRAINTS);
       int totalLayers = network->getNbLayers();
@@ -3436,6 +3692,31 @@ extern "C"
         profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX, maxDims);
       }
       config->addOptimizationProfile(profile);
+    }
+
+    // INT8 + multi-profile requires an explicit calibration profile, otherwise TRT
+    // picks the first runtime profile (batch=240 here) and the calibration cache
+    // — which was generated at a different shape (typically batch=64) — produces
+    // a corrupt engine. We add a dedicated single-shape calibration profile that
+    // matches the shape calibration data was generated against.
+    // Skipped for QDQ graphs: explicit quantization carries its own scales, so
+    // there is no calibrator and no calibration profile is needed.
+    if (!stronglyTyped && opts->useInt8 && !hasQDQ)
+    {
+      const int32_t kCalibBatch = 64;  // must match the shape used to generate <onnx>.calib
+      auto calibProfile = builder->createOptimizationProfile();
+      for (int32_t i = 0; i < network->getNbInputs(); ++i)
+      {
+        auto input = network->getInput(i);
+        auto dims = input->getDimensions();
+        nvinfer1::Dims d = dims;
+        if (d.d[0] == -1) d.d[0] = kCalibBatch;
+        calibProfile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN, d);
+        calibProfile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT, d);
+        calibProfile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX, d);
+      }
+      config->setCalibrationProfile(calibProfile);
+      fprintf(stderr, "[TensorRT] INT8 calibration profile set: batch=%d (matches calib cache shape)\n", kCalibBatch);
     }
 
     // Build a batch sizes description for logging

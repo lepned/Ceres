@@ -118,6 +118,14 @@ namespace Ceres.Chess.NNEvaluators.Ceres
     public bool UseInt8 { get; init; } = false;
 
     /// <summary>
+    /// When true, build an FP8 (E4M3) TensorRT engine from an FP8-QDQ ONNX
+    /// (CeresTrain scripts/qdq_export.py --precision fp8). FP8 is floating-point
+    /// so it preserves small-magnitude signals (e.g. the value head) that
+    /// fixed-point INT8 rounds to zero. Native on Blackwell.
+    /// </summary>
+    public bool UseFP8 { get; init; } = false;
+
+    /// <summary>
     /// If engine refitting support should be enabled for TensorRT.
     /// When true, the engine can have its weights updated at runtime without rebuilding.
     /// Uses BuilderFlag::kREFIT_IDENTICAL which requires identical weight shapes.
@@ -231,12 +239,17 @@ namespace Ceres.Chess.NNEvaluators.Ceres
 
       bool useBF16 = CheckOptionSpecifiedElseDefaultBoolean(optionsDict, "BF16", false);
       bool useInt8 = CheckOptionSpecifiedElseDefaultBoolean(optionsDict, "INT8", false);
+      bool useFP8 = CheckOptionSpecifiedElseDefaultBoolean(optionsDict, "FP8", false);
       bool refittable = CheckOptionSpecifiedElseDefaultBoolean(optionsDict, "REFITTABLE", false);
       int fp32AllNorms = CheckOptionSpecifiedElseDefaultInt(optionsDict, "FP32ALLNORMS", -1, -1, 4);
 
       if (useBF16 && useInt8)
       {
         throw new ArgumentException("BF16 and INT8 options are mutually exclusive.");
+      }
+      if ((useFP8 ? 1 : 0) + (useInt8 ? 1 : 0) + (useBF16 ? 1 : 0) > 1)
+      {
+        throw new ArgumentException("FP8, INT8 and BF16 options are mutually exclusive.");
       }
 
       PlySinceLastMoveModeEnum plySinceMode = baseOptions is NNEvaluatorOptionsCeres ceresOptions
@@ -283,6 +296,7 @@ namespace Ceres.Chess.NNEvaluators.Ceres
         PlySinceLastMoveMode = plySinceMode,
         UseBF16 = useBF16,
         UseInt8 = useInt8,
+        UseFP8 = useFP8,
         Refittable = refittable,
         Fp32AllNorms = fp32AllNorms,
       };

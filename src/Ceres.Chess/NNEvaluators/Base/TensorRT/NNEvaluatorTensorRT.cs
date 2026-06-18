@@ -250,6 +250,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
                              int optimizationLevel = 3,
                              bool forceBF16 = false,
                              bool forceInt8 = false,
+                             bool forceFP8 = false,
                              bool refittable = false,
                              int fp32AllNormsOverride = -1)
   {
@@ -346,6 +347,18 @@ public class NNEvaluatorTensorRT : NNEvaluator
       // runnable. The single-profile script doesn't need the markers because
       // it's a different code path entirely. Diagnosis WIP — see TODO.
       options.UseInt8 = 1;
+      options.UseFP16 = 1;
+      options.UseBF16 = 0;
+    }
+
+    if (forceFP8)
+    {
+      // FP8 (E4M3) from an FP8-QDQ ONNX (qdq_export.py --precision fp8). The C++
+      // wrapper sets BuilderFlag::kFP8; the embedded Q/DQ carry the scales (no
+      // calibrator/cache). FP8 is floating-point -> preserves the small-magnitude
+      // value signal that fixed-point INT8 erases. FP32 norm/softmax pins stay
+      // OFF for QDQ graphs (gated on !hasQDQ in the wrapper).
+      options.UseFP8 = 1;
       options.UseFP16 = 1;
       options.UseBF16 = 0;
     }
@@ -2375,20 +2388,29 @@ public class NNEvaluatorTensorRT : NNEvaluator
     //const bool ENABLE_GRAPHS = false;
     bool forceBF16 = options is NNEvaluatorOptionsCeres optionsCeres && optionsCeres.UseBF16;
     bool forceInt8 = options is NNEvaluatorOptionsCeres optionsCeresInt8 && optionsCeresInt8.UseInt8;
+    bool forceFP8 = options is NNEvaluatorOptionsCeres optionsCeresFP8 && optionsCeresFP8.UseFP8;
     bool refittable = options is NNEvaluatorOptionsCeres optionsCeresRefit && optionsCeresRefit.Refittable;
     int fp32AllNorms = options is NNEvaluatorOptionsCeres optionsCeresNorms ? optionsCeresNorms.Fp32AllNorms : -1;
+    // INT8 and FP8 (QDQ) both use the multi-profile path, which now builds a
+    // STRONGLY-TYPED network so TRT honors the ONNX/QDQ types exactly (the fix
+    // for the value-head collapse — standard TRT was discarding dequant scales).
+    // (Earlier single-profile routing for INT8 was a diagnostic; it did not fix
+    // value, and the real cause was the non-strongly-typed build.)
+    EnginePoolMode poolMode = EXACT_BATCHES ? EnginePoolMode.Exact : EnginePoolMode.Range;
+    int[] poolSizes = EXACT_BATCHES ? [1, 8, 20, 42, 64, 88, 116, 240] : [96, 1024];
+    bool poolCudaGraphs = EXACT_BATCHES;
     NNEvaluatorTensorRT trtNativeEngine = new(netFileName,
                                               netType,
-                                              EXACT_BATCHES ? EnginePoolMode.Exact : EnginePoolMode.Range,
-                                              EXACT_BATCHES ? [1, 8, 20, 42, 64, 88, 116, 240]
-                                                            : [96, 1024],
+                                              poolMode,
+                                              poolSizes,
                                               buildOptions,
                                               gpuIDs: gpuIDs,
-                                              useCudaGraphs: EXACT_BATCHES,
+                                              useCudaGraphs: poolCudaGraphs,
                                               softMaxBatchSize: 1024,
                                               optimizationLevel: options.OptimizationLevel,
                                               forceBF16: forceBF16,
                                               forceInt8: forceInt8,
+                                              forceFP8: forceFP8,
                                               refittable: refittable,
                                               fp32AllNormsOverride: fp32AllNorms);
     trtNativeEngine.Options = options;
