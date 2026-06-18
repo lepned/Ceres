@@ -18,6 +18,7 @@
 #include <memory>
 #include <functional>
 #include <cstring>
+#include <cstdlib>
 #include <atomic>
 #include <unordered_map>
 #include <unordered_set>
@@ -80,6 +81,18 @@ namespace
   nvinfer1::IRuntime* g_runtime = nullptr;
   std::string g_lastError;
   bool g_initialized = false;
+
+  // Stream sync wait policy. Default 3="auto" decides per-sync from the per-GPU batch size
+  // (the count being synced): SPIN when it is small (<= SYNC_SPIN_MAX_PERGPU, where the GPU
+  // burst is short so the block-sync OS wakeup latency is a large fraction of the wait) and
+  // BLOCK otherwise (long GPU work => wakeup negligible, and blocking frees the core). This
+  // is measured to be the crossover: spin helps fast/small per-GPU batches (e.g. multi-GPU
+  // splits and fast nets) while block is free and CPU-cheap on large batches / big nets.
+  // Override via env CERES_TRT_SYNC = auto|spin|block|driver.
+  //   0 = "driver" (cudaStreamSynchronize), 1 = "spin" (event busy-poll, low latency,
+  //   burns a core), 2 = "block" (blocking-sync event, low CPU), 3 = "auto" (the rule).
+  int g_syncMode = 3;
+  constexpr int SYNC_SPIN_MAX_PERGPU = 64;
 
   // Thread-local cache for current CUDA device to avoid redundant cudaSetDevice() calls.
   // Value of -1 means no device has been set on this thread yet.
@@ -151,6 +164,8 @@ namespace
     SharedEngine* sharedOwner = nullptr;  // Non-null when sharing engine via multi-profile
     int32_t batchSize = 0;
     int32_t deviceId = 0;  // GPU device ID
+    int32_t profileIndex = 0;  // Optimization profile this context is bound to (0 if single-profile)
+    bool useSpinWait = false;  // Retained so a shared-engine clone can reproduce this context's options
 
     std::vector<std::string> inputNames;
     std::vector<std::string> outputNames;
@@ -181,6 +196,9 @@ namespace
     void* streamCapturedInput[3] = { nullptr, nullptr, nullptr };
     void* streamCapturedOutput[3] = { nullptr, nullptr, nullptr };
 
+    // Reusable per-stream events for non-default sync modes (lazily created, see g_syncMode).
+    cudaEvent_t syncEvents[3] = { nullptr, nullptr, nullptr };
+
     ~EngineContext()
     {
       cudaSetDevice(deviceId);  // Ensure correct device for cleanup
@@ -191,6 +209,7 @@ namespace
       {
         if (streamGraphExecs[i]) cudaGraphExecDestroy(streamGraphExecs[i]);
         if (streamGraphs[i]) cudaGraphDestroy(streamGraphs[i]);
+        if (syncEvents[i]) cudaEventDestroy(syncEvents[i]);
       }
       for (int i = 0; i < 3; ++i)
       {
@@ -1410,6 +1429,8 @@ extern "C"
     ec->batchSize = batchSize;
     ec->deviceId = deviceId;
     ec->useCudaGraphs = useCudaGraphs;
+    ec->profileIndex = 0;
+    ec->useSpinWait = useSpinWait;
 
     cudaStreamCreate(&ec->streams[0]);
     cudaStreamCreate(&ec->streams[1]);
@@ -2620,12 +2641,48 @@ extern "C"
     return 0;
   }
 
-  TRT_API int32_t TRT_SyncStreamIdx(TRT_EngineHandle handle, int32_t streamIdx)
+  // count = number of positions in the batch being synced on this stream (i.e. the per-GPU
+  // batch size). Used to resolve "auto" mode (3): spin for small batches, block for large.
+  TRT_API int32_t TRT_SyncStreamIdx(TRT_EngineHandle handle, int32_t streamIdx, int32_t count)
   {
     if (!handle || streamIdx < 0 || streamIdx > 2) return -1;
     auto* ec = static_cast<EngineContext*>(handle);
     if (!EnsureDevice(ec->deviceId)) return -1;
-    cudaStreamSynchronize(ec->streams[streamIdx]);
+
+    cudaStream_t stream = ec->streams[streamIdx];
+
+    // Resolve the wait policy. "auto" picks spin vs block per-sync from the per-GPU batch
+    // size: short GPU bursts (small batch) spin to avoid the OS wakeup latency; long bursts
+    // block to free the core.
+    int mode = g_syncMode;
+    if (mode == 3)
+    {
+      mode = (count <= SYNC_SPIN_MAX_PERGPU) ? 1 : 2;
+    }
+
+    if (mode == 0)
+    {
+      // Driver policy (typically spins when CUDA contexts <= cores, else blocks).
+      cudaStreamSynchronize(stream);
+      return 0;
+    }
+
+    // Reusable per-stream event. Created with the blocking flag so the BLOCK path actually
+    // blocks; the SPIN path busy-polls cudaEventQuery, which ignores the flag. A single
+    // stream may use either policy across batches (auto mode), hence the fixed flag.
+    if (!ec->syncEvents[streamIdx])
+    {
+      cudaEventCreateWithFlags(&ec->syncEvents[streamIdx], cudaEventBlockingSync | cudaEventDisableTiming);
+    }
+    cudaEventRecord(ec->syncEvents[streamIdx], stream);
+    if (mode == 1)
+    {
+      while (cudaEventQuery(ec->syncEvents[streamIdx]) == cudaErrorNotReady) { }
+    }
+    else
+    {
+      cudaEventSynchronize(ec->syncEvents[streamIdx]);
+    }
     return 0;
   }
 
@@ -2961,6 +3018,8 @@ extern "C"
     ec->batchSize = batchSize;
     ec->deviceId = deviceId;
     ec->useCudaGraphs = useCudaGraphs;
+    ec->profileIndex = profileIndex;
+    ec->useSpinWait = useSpinWait;
 
     // Create streams first (needed for setOptimizationProfileAsync)
     for (int i = 0; i < 3; ++i)
@@ -2968,11 +3027,18 @@ extern "C"
       cudaError_t serr = cudaStreamCreate(&ec->streams[i]);
       if (serr != cudaSuccess)
       {
-        // Clean up already-created streams
+        // Clean up already-created streams, then the partial context. Detach the (shared) engine
+        // and owner first so ~EngineContext neither double-frees `context` nor touches the
+        // engine/refcount on this failure path (the caller owns refcount rollback).
         for (int j = 0; j < i; ++j)
         {
           cudaStreamDestroy(ec->streams[j]);
+          ec->streams[j] = nullptr;
         }
+        ec->stream = nullptr;
+        ec->context = nullptr;
+        ec->sharedOwner = nullptr;
+        ec->engine = nullptr;
         delete context;
         delete ec;
         return nullptr;
@@ -2985,6 +3051,10 @@ extern "C"
     {
       if (!context->setOptimizationProfileAsync(profileIndex, ec->stream))
       {
+        // Detach engine/owner so ~EngineContext does not touch the engine/refcount here
+        // (caller owns refcount rollback); the streams and context are real and freed by the dtor.
+        ec->sharedOwner = nullptr;
+        ec->engine = nullptr;
         delete ec;
         return nullptr;
       }
@@ -3817,6 +3887,86 @@ extern "C"
   }
 
 
+  // Create a new EngineContext that SHARES the already-deserialized ICudaEngine owned by an
+  // existing context (referenceHandle), rather than deserializing/allocating the weights again.
+  // The clone gets its OWN IExecutionContext, streams, and GPU buffers (so it can run concurrently
+  // with the reference), but points at the same engine via the same ref-counted SharedEngine.
+  // Used so a second (overlap) evaluator can reuse the primary evaluator's engine weights.
+  // Returns 0 on success and writes the new handle to *outHandle; negative on error.
+  TRT_API int32_t TRT_CloneContextSharingEngine(TRT_EngineHandle referenceHandle,
+    int32_t deviceId, TRT_EngineHandle* outHandle)
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    if (!g_initialized)
+    {
+      SetError("TensorRT not initialized");
+      return -1;
+    }
+    if (!referenceHandle || !outHandle)
+    {
+      SetError("Invalid arguments for clone-context");
+      return -2;
+    }
+
+    auto* ref = static_cast<EngineContext*>(referenceHandle);
+    if (!ref->engine)
+    {
+      SetError("Reference handle has no engine to share");
+      return -3;
+    }
+
+    if (deviceId < 0)
+    {
+      deviceId = ref->deviceId;
+    }
+
+    // Reuse the reference's shared owner so the reference and all clones share one refcount.
+    // If the reference is a sole-owner (single-profile) context, promote it to ref-counted
+    // ownership first: count = 1 (the existing reference) + 1 (this clone, added below).
+    SharedEngine* shared = ref->sharedOwner;
+    bool promoted = false;
+    if (!shared)
+    {
+      shared = new SharedEngine(ref->engine, 1);
+      ref->sharedOwner = shared;
+      promoted = true;
+    }
+
+    // Reserve the clone's reference before creating it. InitializeEngineContextForProfile is
+    // refcount-neutral on failure, so on error we simply undo this reservation.
+    shared->refCount.fetch_add(1);
+
+    EngineContext* ec = InitializeEngineContextForProfile(ref->engine, shared,
+      ref->profileIndex, ref->batchSize, ref->useCudaGraphs, ref->useSpinWait, deviceId);
+    if (!ec)
+    {
+      shared->refCount.fetch_sub(1);
+      if (promoted)
+      {
+        // Revert the reference to sole-owner; do NOT delete the engine (reference still owns it).
+        ref->sharedOwner = nullptr;
+        delete shared;
+      }
+      SetError("Failed to initialize cloned execution context");
+      return -4;
+    }
+
+    *outHandle = ec;
+    g_lastError.clear();
+
+#if NOT
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+      "[TensorRT] Sharing engine (cloned context, batch=%d, profile=%d) - no deserialize",
+      ref->batchSize, ref->profileIndex);
+    PrintGreen(msg);
+
+#endif
+    return 0;
+  }
+
+
   TRT_API char* TRT_GenerateMultiProfileCacheFilename(const char* onnxPath,
     const int32_t* batchSizes, int32_t numProfiles,
     const TRT_BuildOptions* options, int32_t deviceId)
@@ -3886,8 +4036,17 @@ extern "C"
       }
     }
 
-    // Try loading from cache
-    if (!forceRebuild && FileExists(cachePath.c_str()))
+    // Try loading from cache.
+    // NOTE: every branch that ends up rebuilding logs an explicit reason to avoid a silent rebuilds
+    if (forceRebuild)
+    {
+      fprintf(stderr, "[TensorRT] Cache rebuild forced; ignoring any cached engine: %s\n", cachePath.c_str());
+    }
+    else if (!FileExists(cachePath.c_str()))
+    {
+      fprintf(stderr, "[TensorRT] Cache miss (no cached engine file found): %s\n", cachePath.c_str());
+    }
+    else
     {
       // Check if ONNX file is newer than cache
       struct stat onnxStat, cacheStat;
@@ -3897,6 +4056,7 @@ extern "C"
         if (onnxStat.st_mtime > cacheStat.st_mtime)
         {
           cacheValid = false;
+          fprintf(stderr, "[TensorRT] Cache stale (ONNX is newer than cached engine), rebuilding: %s\n", cachePath.c_str());
         }
       }
 
@@ -3930,21 +4090,39 @@ extern "C"
                 }
                 std::string basename = GetBaseName(onnxPath);
                 char msg[512];
-                snprintf(msg, sizeof(msg), "[TensorRT] Loading multi-profile %s: batches=[%s], %d profiles",
-                  basename.c_str(), batchDesc.c_str(), numProfiles);
+                snprintf(msg, sizeof(msg), "[TensorRT] Loading multi-profile %s: batches=[%s], %d profiles (%lld bytes)",
+                  basename.c_str(), batchDesc.c_str(), numProfiles, (long long)buffer.size());
                 PrintGreen(msg);
 
                 if (outWasCached) *outWasCached = 1;
                 g_lastError.clear();
                 return 0;
               }
-              // CreateContextsFromEngine deleted engine on failure
+              else
+              {
+                // CreateContextsFromEngine deleted engine on failure
+                fprintf(stderr, "[TensorRT WARNING] Cache load FAILED: CreateContextsFromEngine returned %d (%lld bytes), rebuilding: %s\n",
+                  result, (long long)buffer.size(), cachePath.c_str());
+              }
+            }
+            else
+            {
+              fprintf(stderr, "[TensorRT WARNING] Cache load FAILED: deserializeCudaEngine returned null "
+                "(cached engine file likely corrupt, truncated, or built by an incompatible TensorRT/GPU), "
+                "size=%lld bytes, rebuilding: %s\n", (long long)buffer.size(), cachePath.c_str());
             }
           }
           else
           {
+            fprintf(stderr, "[TensorRT WARNING] Cache load FAILED: short read of engine file (got %lld of %lld bytes), rebuilding: %s\n",
+              (long long)file.gcount(), (long long)size, cachePath.c_str());
             file.close();
           }
+        }
+        else
+        {
+          fprintf(stderr, "[TensorRT WARNING] Cache load FAILED: could not open cached engine file for reading, rebuilding: %s\n",
+            cachePath.c_str());
         }
         // Fall through to rebuild if cache load failed
       }

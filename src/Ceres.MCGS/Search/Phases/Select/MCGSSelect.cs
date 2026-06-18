@@ -15,7 +15,6 @@
 
 using System;
 using System.Diagnostics;
-using System.IO;
 using System.Linq;
 using System.Numerics.Tensors;
 using System.Threading;
@@ -23,8 +22,10 @@ using Ceres.Base.DataTypes;
 using Ceres.Base.Math;
 using Ceres.Base.Misc;
 using Ceres.Chess;
+using Ceres.Chess.EncodedPositions;
 using Ceres.Chess.EncodedPositions.Basic;
 using Ceres.Chess.MoveGen;
+using Ceres.Chess.Positions;
 using Ceres.Chess.MoveGen.Converters;
 using Ceres.Chess.NNEvaluators;
 using Ceres.Chess.NNEvaluators.Defs;
@@ -34,7 +35,6 @@ using Ceres.MCGS.Search.Coordination;
 using Ceres.MCGS.Search.Params;
 using Ceres.MCGS.Search.Paths;
 using Ceres.MCGS.Search.Strategies;
-using Ceres.MCGS.Search.RPO;
 using Ceres.MCGS.Utils;
 using Microsoft.Extensions.ObjectPool;
 
@@ -43,8 +43,32 @@ using Microsoft.Extensions.ObjectPool;
 namespace Ceres.MCGS.Search.Phases;
 
 /// <summary>
-/// Performs the select phase of MCGS, recursively descending the graph 
+/// Performs the select phase of MCGS, recursively descending the graph
 /// until a node is encountered from which an evaluation can be extracted.
+///
+/// Invariants relied upon throughout this file:
+///   1. Non-terminal evaluated nodes maintain N == 1 + sum(child edge N)
+///      (asserted on every backup in MCGSStrategyPUCT.BackupToNode). In particular,
+///      a node with NumEdgesExpanded == 0 has N == 1, which is what makes the
+///      single-visit fast path below safe. CBGPUCT cross-parent absorption is the
+///      one (experimental) feature which relaxes this.
+///   2. Lock ordering: while holding a node lock (the expansion parent's lock is
+///      held across child processing), a second node lock may only be acquired
+///      NON-blockingly (TryAcquireLock / nonBlockingExistingNodeLock), with a
+///      graceful fallback on contention. Blocking would deadlock: position-keyed
+///      transposition links admit cycles in the lock-wait graph (and the deferred
+///      policy copy connects position-equal nodes with unrelated keys).
+///      See TranspositionAutoExtension for the canonical pattern.
+///   3. MCGSPath.PossiblyBranched(numVisitsRemaining, ...): the first argument is
+///      the number of visits remaining for OTHER children AFTER this one;
+///      0 means this is the final consumer and the path object itself is reused.
+///   4. Visits which are abandoned mid-frame (suboptimality rejection, lock-contention
+///      abort) must be backed out of every ancestor visit's NumVisitsAttempted /
+///      NumVisitsAttemptedPendingBackup and edge in-flight counters; otherwise the
+///      backup-phase merge counters never reach zero and the ancestor updates are
+///      silently lost. The backout is DEFERRED to the start of the backup phase
+///      (MCGSPathsSet.RecordDroppedVisits / ApplyDroppedVisits): performing the
+///      ancestor walk during select races with concurrent path-segment reallocation.
 /// </summary>
 public class MCGSSelect
 {
@@ -71,13 +95,16 @@ public class MCGSSelect
       LaunchParallel = launchParallel;
     }
 
-    public int CompareTo(DeferredSubPath other) => 0; // Not used for sorting
+    // Required only by the ListBounded<T> constraint (where T : IComparable<T>); never sorted.
+    public int CompareTo(DeferredSubPath other) => 0;
   }
 
-  // Pooled object policy for ListBounded<DeferredSubPath>
+  // Pooled object policy for ListBounded<DeferredSubPath>.
+  // Capacity must cover the worst case of every considered child deferring
+  // (numChildrenToConsider is bounded by CompressedPolicyVector.NUM_MOVE_SLOTS).
   private sealed class DeferredSubPathListPolicy : PooledObjectPolicy<ListBounded<DeferredSubPath>>
   {
-    public override ListBounded<DeferredSubPath> Create() => new ListBounded<DeferredSubPath>(64);
+    public override ListBounded<DeferredSubPath> Create() => new ListBounded<DeferredSubPath>(CompressedPolicyVector.NUM_MOVE_SLOTS);
 
     public override bool Return(ListBounded<DeferredSubPath> obj)
     {
@@ -110,7 +137,7 @@ public class MCGSSelect
   ///   1. Initialize path from search root(or continue from parent's child).
   ///   2. Acquire parent lock and do deferred policy copy.
   ///   3. Determine children to consider: NumEdgesExpanded + numTargetVisits, clamped to NumPolicyMoves.
-  ///   4. Fast path: If 1 visit and 0 expanded edges, directly assign visit to child 0 (bypass PUCT).
+  ///   4. Fast path: If 1 visit, N == 1 and 0 expanded edges, directly assign visit to child 0 (bypass PUCT).
   ///   5. PUCT selection via PUCTSelector.ComputeTopChildScores() -> PUCTScoreCalcVector.ScoreCalcMulti() with SIMD-vectorized score computation.
   ///      Handles virtual loss, FPU, CPUCT with log scaling, temperature, futility pruning, checkmate, certainty propagation.
   ///   6. Q reset (graph mode): Immediately propagate recomputed child stats to parent Q.
@@ -155,19 +182,10 @@ public class MCGSSelect
   {
     Debug.Assert(numAttemptedVisits > 0);
 
-    MCGSPathsSet pathsSet = iterator.PathsSet;
-
-    ParamsSearch paramsSearch = iterator.Engine.Manager.ParamsSearch;
-    bool graphEnabled = paramsSearch.EnableGraph;
-    bool enablePUCSuboptimalityThreshold = paramsSearch.VisitSuboptimalityRejectThreshold.HasValue;
-    bool parallelEnabled = paramsSearch.Execution.SelectOperationParallelThresholdNumVisits < int.MaxValue;
-    float cpuctMultiplier = iterator.CPUCTMultiplier;
-    bool refreshSibling = MCGSParamsFixed.REFRESH_SIBLING_DURING_SELECT_PHASE && paramsSearch.EnablePseudoTranspositionBlending;
-
     GNode parentNode;
     if (path == null)
     {
-      path = iterator.AllocatedPath(NumInitialSlotsFromNumVisits(0, numAttemptedVisits));
+      path = iterator.AllocatedPath();
       path.RunningHash = Engine.SearchRootRunningHash;
       parentNode = path.Engine.SearchRootNode;
 
@@ -181,11 +199,61 @@ public class MCGSSelect
       // The parent of the next level was the child of the prior level.
       parentNode = path.LeafVisitRef.ParentChildEdge.ChildNode;
     }
-    Debug.Assert(path.NumVisitsInPath == 0 || path.LeafVisitRef.ChildNode.N > 0); // TODO: Not true if prefetch?
+    Debug.Assert(path.NumVisitsInPath == 0 || path.LeafVisitRef.ChildNode.N > 0);
 
+    // The parent lock is held across child selection and processing, and released in a
+    // finally block so an exception (e.g. path-visit pool exhaustion) cannot leave the
+    // node locked forever (the spin lock has no timeout). Deferred recursive descents
+    // are dispatched only after the lock is released.
+    ListBounded<DeferredSubPath> deferredSubPaths;
     parentNode.AcquireLock();
+    try
+    {
+      deferredSubPaths = ExtendPathAtLockedParent(iterator, path, numAttemptedVisits, parentNode);
+    }
+    finally
+    {
+      parentNode.ReleaseLock();
+    }
 
-    parentNode.DoDeferredPolicyCopyIfNeeded();
+    DispatchDeferredSubPaths(iterator, deferredSubPaths);
+
+    MCGSParamsFixed.Assert(path.TerminationReason != MCGSPathTerminationReason.NotYetTerminated, "NotYetTerminated");
+  }
+
+
+  /// <summary>
+  /// Performs the per-level work requiring the parent node's lock (which the caller holds):
+  /// deferred policy copy, child selection (fast path or PUCT), parent Q reset (graph mode),
+  /// capacity checks and child processing.
+  /// Returns the deferred recursive descents for the caller to dispatch after releasing
+  /// the lock (null if none).
+  /// </summary>
+  private ListBounded<DeferredSubPath> ExtendPathAtLockedParent(MCGSIterator iterator, MCGSPath path,
+                                                                int numAttemptedVisits, GNode parentNode)
+  {
+    MCGSPathsSet pathsSet = iterator.PathsSet;
+
+    ParamsSearch paramsSearch = iterator.Engine.Manager.ParamsSearch;
+    ParamsSelect paramsSelect = iterator.Engine.Manager.ParamsSelect;
+    bool graphEnabled = paramsSearch.EnableGraph;
+    bool enablePUCSuboptimalityThreshold = paramsSearch.VisitSuboptimalityRejectThreshold.HasValue;
+    float cpuctMultiplier = iterator.CPUCTMultiplier;
+    bool refreshSibling = MCGSParamsFixed.REFRESH_SIBLING_DURING_SELECT_PHASE && paramsSearch.EnablePseudoTranspositionBlending;
+
+    if (!parentNode.TryDoDeferredPolicyCopyIfNeeded())
+    {
+      // The deferred policy-copy source lock is contended (rare). Blocking while holding
+      // the parent lock would risk deadlock (see lock-ordering remarks on the class);
+      // abort this path instead - backup of a path with 0 accepted visits backs out
+      // its in-flight counts.
+      path.TerminationReason = MCGSPathTerminationReason.Abort;
+      if (path.NumVisitsInPath > 0)
+      {
+        pathsSet.AddPath(path, 0);
+      }
+      return null;
+    }
 
     const bool ALSO_COMPUTE_CHILD_SCORES = false;
 
@@ -209,11 +277,16 @@ public class MCGSSelect
     Span<double> scores;
     NodeSelectAccumulator childStats;
     if (numAttemptedVisits == 1
-     //     && parentNode.N == 1
+     && parentNode.N == 1
      && parentNode.NumEdgesExpanded == 0
      && !ALSO_COMPUTE_CHILD_SCORES)
     {
-      // Shortcut common case of first visit to any child sd always first child.
+      // Shortcut common case: a node with no expanded edges ordinarily has N == 1
+      // (see class invariants), so the single visit always goes to (possibly re-sorted)
+      // child 0 and the one-visit accumulator below is exact. The N == 1 guard keeps
+      // this safe under CBGPUCT cross-parent absorption, which can produce N > 1 with
+      // no expanded edges (such nodes must take the full SelectChildren path so the
+      // Q reset below is not computed from a single-visit accumulator).
       // Reset the reused ThreadStatic array to represent a single visit to first child.
       singleVisitArray ??= new short[1];
       singleVisitArray[0] = 1;
@@ -223,15 +296,14 @@ public class MCGSSelect
     }
     else
     {
-      float temperatureMultiplierBase = false && Engine.Manager.ParamsSearch.TestFlag2 ? (0.95f + 1 * 0.25f * parentNode.UncertaintyPolicy) : 1.0f;
+      float temperatureMultiplierBase = false && paramsSearch.TestFlag2 ? (0.95f + 1 * 0.25f * parentNode.UncertaintyPolicy) : 1.0f;
 
       // Possible adjustement for path-dependent CPUCT scaling
       const float THRESHOLD_SUBOPTIMALITY_POSSIBLY_SCALE_CPUCT = 0.15f;
-      if (Engine.Manager.ParamsSearch.EnablePathDependentCPUCTScaling
-       && path.MaxQSubOptimality > THRESHOLD_SUBOPTIMALITY_POSSIBLY_SCALE_CPUCT)
+      if (paramsSearch.EnablePathDependentCPUCTScaling && path.MaxQSubOptimality > THRESHOLD_SUBOPTIMALITY_POSSIBLY_SCALE_CPUCT)
       {
-        // Experimental idea is to reduce exportation if we have
-        // already seen highly explortory visits above since
+        // Experimental idea is to reduce exploration if we have
+        // already seen highly exploratory visits above since
         // we will have few samples of the branch and therefore
         // want to suppress subsequent exploration.
         // The attenuation is proportional to the max suboptimality seen.
@@ -241,40 +313,43 @@ public class MCGSSelect
         cpuctMultiplier *= MathF.Max(MIN_CPUCT, 1.0f - CPUCT_SCALE_MULTIPLIER * path.MaxQSubOptimality);
       }
 
-      if (false && parentNode.N > 10 && Engine.Manager.ParamsSearch.SelectExplorationForUncertaintyAtNode > 0)
+      if (false && parentNode.N > 10 && paramsSearch.SelectExplorationForUncertaintyAtNode > 0)
       {
-        cpuctMultiplier *= 1f + 0.2f * (float)(parentNode.NodeRef.StdDevEstimate.RunningStdDev - 0.1);
+        cpuctMultiplier *= 1f + 0.2f * (float)(parentNode.NodeRef.LeafValueVolatility.RunningStdDev - 0.1);
       }
 
-//#if FEATURE_UNCERTAINTY_POLICY
-      if ( 
+      //#if FEATURE_UNCERTAINTY_POLICY
+      if (
         //-7 Elo
-        false && Engine.Manager.ParamsSearch.TestFlag2)
+        false && paramsSearch.TestFlag2)
       {
         Debug.Assert(!float.IsNaN(parentNode.UncertaintyPolicy));
-//Console.WriteLine("UCCP: " + parentNode.UncertaintyPolicy + "  " + parentNode.UncertaintyValue);
+        //Console.WriteLine("UCCP: " + parentNode.UncertaintyPolicy + "  " + parentNode.UncertaintyValue);
         // Research idea: increase CPUCT if high policy uncertainty.
         // Low uncertainty may just indicate network saw position many times
         // (not any reflection of optimal policy).
         // However high uncertanity indicates we should somewhat discount policy.
         // Tests did not show improvement.
         cpuctMultiplier *= (parentNode.UncertaintyPolicy > 0.3 || parentNode.UncertaintyValue > 0.5)
-          ? StatUtils.Bounded(1f 
+          ? StatUtils.Bounded(1f
           + 0.15f * parentNode.UncertaintyPolicy
           + 0.25f * parentNode.UncertaintyValue,
           0.5f, 1.5f)
-          : 0.95f; // Scale to keep average close to 1.0        
+          : 0.95f; // Scale to keep average close to 1.0
       }
-//#endif
+      //#endif
 
-      if ((Engine.Manager.ParamsSearch.MoveOrderingPhase == ParamsSearch.MoveOrderingPhaseEnum.ChildSelection
-       || Engine.Manager.ParamsSearch.MoveOrderingPhase == ParamsSearch.MoveOrderingPhaseEnum.NodeInitializationAndChildSelect)
+
+      if ((paramsSearch.MoveOrderingPhase == ParamsSearch.MoveOrderingPhaseEnum.ChildSelection
+       || paramsSearch.MoveOrderingPhase == ParamsSearch.MoveOrderingPhaseEnum.NodeInitializationAndChildSelect)
        && !parentNode.IsSearchRoot)
       {
+        // TODO: possibly this check for reordering could be skipped in many situations (for improved speed).
+        //       If using standard FPU and no action head is in use, children are already policy sorted thus likely unnecessary.
         const int MAX_LOOK_RIGHT = 5;
-        int firstIndex = parentNode.NumEdgesExpanded; // only allow reordering if not yet expanded (guaranteening no side effects)
+        int firstIndex = parentNode.NumEdgesExpanded;
         int numLookRight = Math.Min(MAX_LOOK_RIGHT, numAttemptedVisits);
-        parentNode.CheckMoveOrderRearrangeAtIndex(in path.LeafVisitRef.ChildPosition, firstIndex, firstIndex + MAX_LOOK_RIGHT, MCGSParamsFixed.MOVE_ORDERING_MIN_RATIO_POLICY);
+        parentNode.CheckMoveOrderRearrangeAtIndex(in path.LeafVisitRef.ChildPosition, firstIndex, numLookRight, MCGSParamsFixed.MOVE_ORDERING_MIN_RATIO_POLICY);
       }
 
       // If EnableBackupPropagationToParentsOffDirectPath was true, back up phase may have marked some edges as stale.
@@ -297,8 +372,8 @@ public class MCGSSelect
       // from current child stats and is also unchanged since children weren't touched).
       int numAbsorbedAtParent = numAttemptedVisits - childStats.NumVisitsAccepted;
       if (numAbsorbedAtParent > 0
-          && Engine.Manager.ParamsSelect.CBGPUCTSelectActive
-          && Engine.Manager.ParamsSelect.CBGPUCT_SelectCrossParentNEnabled)
+          && paramsSelect.CBGPUCTSelectActive
+          && paramsSelect.CBGPUCT_SelectCrossParentNEnabled)
       {
         strategy.BackupToNode(parentNode, numAbsorbedAtParent,
                               parentNode.Q * numAbsorbedAtParent,
@@ -320,12 +395,10 @@ public class MCGSSelect
 
       if (enablePUCSuboptimalityThreshold)
       {
-        numAttemptedVisits = ApplyPUCTSuboptimalityThreshold(path, numAttemptedVisits, childStats.NumVisitsAccepted, childVisitCounts);
+        numAttemptedVisits = ApplyPUCTSuboptimalityThreshold(path, pathsSet, numAttemptedVisits, childStats.NumVisitsAccepted, childVisitCounts);
       }
     }
 
-    // TODO: can this be removed (along with the acquire elsewhere in this file)
-    //parentNode.ReleaseLock(); 
     Debug.Assert(!double.IsNaN(childStats.SumW));
 
     if (graphEnabled) // node Q values can only become desynchronized if graph mode enabled
@@ -339,11 +412,11 @@ public class MCGSSelect
       //     be applied to the parent node here (maintaining correctness of the pure Q).
 
       Debug.Assert(parentNode.N == childStats.SumN
-                || (Engine.Manager.ParamsSelect.CBGPUCTSelectActive && Engine.Manager.ParamsSelect.CBGPUCT_SelectCrossParentNEnabled));
+                || (paramsSelect.CBGPUCTSelectActive && paramsSelect.CBGPUCT_SelectCrossParentNEnabled));
 
       if (MCGSParamsFixed.RESET_Q_DURING_SELECT_PHASE_FROM_ALL_CHILDREN)
       {
-        if (Engine.Manager.ParamsSelect.CBGPUCTBackupActive)
+        if (paramsSelect.CBGPUCTBackupActive)
         {
           // No-op: under CBGPUCT, parent.Q is recomputed by ComputeVBar during BackupToNode,
           // and edge.QChild for multi-parent transposition edges is now refreshed proactively
@@ -363,12 +436,11 @@ public class MCGSSelect
 
     if (CapacityAbortNeeded(iterator, path, pathsSet))
     {
-      parentNode.ReleaseLock();
-      return;
+      return null;
     }
 
 #if DEBUG
-    if (Engine.Manager.ParamsSearch.VisitSuboptimalityRejectThreshold is null)
+    if (paramsSearch.VisitSuboptimalityRejectThreshold is null)
     {
       Debug.Assert(childVisitCounts[..numChildrenToConsider].ToArray().Sum(x => x) == numAttemptedVisits);
     }
@@ -382,23 +454,234 @@ public class MCGSSelect
     // Loop thru child slots and process any with nonzero visits.
     // Note that we must process visits to any not yet expanded children first,
     // before any possible subtasks are launched on already expanded children.
-    // This insures  updates to this node's edges/edge headers are complete before any concurrency.
+    // This ensures updates to this node's edges/edge headers are complete before any concurrency.
     int numVisitsRemaining = numAttemptedVisits;
 #if DEBUG // Temporarily using conditional compilation due to TensorPrimives versioning issue
     Debug.Assert(TensorPrimitives.Sum(childVisitCounts) == numVisitsRemaining);
 #endif
 
-    numVisitsRemaining = ProcessChildren(iterator, path, numAttemptedVisits, pathsSet,
-                                         parentNode, in parentPosMG, childVisitCounts,
-                                         numChildrenToConsider, numVisitsRemaining,
-                                         cpuctMultiplier);
+    return ProcessChildren(iterator, path, numAttemptedVisits, pathsSet,
+                           parentNode, in parentPosMG, childVisitCounts,
+                           numChildrenToConsider, numVisitsRemaining,
+                           cpuctMultiplier);
+  }
 
-    MCGSParamsFixed.Assert(path.TerminationReason != MCGSPathTerminationReason.NotYetTerminated, "NotYetTerminated");
+
+  /// <summary>
+  /// Builds a path that begins at the search root, forcibly descends to a specified inner node
+  /// (startNode) along the most-visited ancestor line (at each step choosing the highest-N parent
+  /// edge that is strictly closer to the search root), and then continues normal PUCT/CBGPUCT
+  /// selection from startNode to a leaf.
+  ///
+  /// Used by MCGSManager.DoSearchInnerNodes to run "deep rollouts" originating at inner nodes.
+  /// Because the resulting path spans searchRoot -> ... -> startNode -> ... -> leaf, the subsequent
+  /// backup propagates the leaf evaluation all the way up to the search root, and the neural network
+  /// history planes remain continuous (no special handling needed in the evaluator).
+  ///
+  /// startNode must be an already-evaluated, non-terminal, strict descendant of the search root
+  /// (the caller is responsible for filtering); the exploration multiplier in force during the
+  /// descent from startNode is iterator.CPUCTMultiplier.
+  /// </summary>
+  /// <param name="iterator"></param>
+  /// <param name="startNode"></param>
+  /// <param name="numAttemptedVisits"></param>
+  internal void ExtendPathFromInnerNode(MCGSIterator iterator, GNode startNode, int numAttemptedVisits)
+  {
+    Debug.Assert(numAttemptedVisits > 0);
+    Debug.Assert(!startNode.IsNull);
+    Debug.Assert(!startNode.IsSearchRoot, "ExtendPathFromInnerNode requires a strict descendant of the search root");
+
+    // Walk up from startNode to the search root, collecting node indices leaf-to-root. At each step
+    // follow the highest-N incoming (parent) edge, but only among parents that are strictly closer
+    // to the search root. Constraining to strictly-decreasing depth-from-search-root both guarantees
+    // we terminate at the search root and rules out cycles from transposition / repetition
+    // back-edges (a naive max-N walk could loop: e.g. A's busiest parent is B and B's is A). The
+    // acyclic tree parent always qualifies (it sits at depth-1), so a valid choice always exists.
+    const int MAX_DEPTH = 512;
+    Span<int> nodeIndicesLeafToRoot = stackalloc int[MAX_DEPTH];
+    int depth = 0;
+    GNode walk = startNode;
+    int walkDepth = DepthFromSearchRootOrNegative(startNode);
+    if (walkDepth < 0)
+    {
+      // The node's tree-parent chain does not pass through the search root. This legitimately
+      // occurs with transpositions when the search root sits below the graph root: the node is
+      // reachable from the search root via child edges, but its canonical tree parents trace a
+      // different line (or it lies deeper than the walk limit). Skip gracefully - the node
+      // simply receives no rollout this round.
+      return;
+    }
+    while (!walk.IsSearchRoot)
+    {
+      if (depth >= MAX_DEPTH)
+      {
+        // Start node lies too deep below the search root to build a rollout spine.
+        // This can happen after repeated deep-rollout passes push well-visited lines
+        // very deep. Skip the node gracefully (it receives no rollout this round);
+        // a Debug.Assert here would be compiled out in release and the write below
+        // would otherwise overflow the stack buffer.
+        return;
+      }
+      nodeIndicesLeafToRoot[depth++] = walk.Index.Index;
+
+      // Pick the highest-N parent edge whose parent is strictly closer to the search root.
+      GNode chosenParent = default;
+      int chosenParentN = -1;
+      int chosenParentDepth = walkDepth;
+      foreach (GEdge parentEdge in walk.ParentEdges)
+      {
+        GNode candidate = parentEdge.ParentNode;
+        int candidateDepth = DepthFromSearchRootOrNegative(candidate);
+        if (candidateDepth >= 0 && candidateDepth < walkDepth && parentEdge.N > chosenParentN)
+        {
+          chosenParent = candidate;
+          chosenParentN = parentEdge.N;
+          chosenParentDepth = candidateDepth;
+        }
+      }
+
+      if (chosenParentN < 0)
+      {
+        // No rootward parent found (should not happen, since the tree parent is always at depth-1);
+        // fall back to the acyclic tree parent.
+        chosenParent = Engine.Graph[walk.TreeParentNodeIndex];
+        chosenParentDepth = walkDepth - 1;
+      }
+
+      walk = chosenParent;
+      walkDepth = chosenParentDepth;
+    }
+
+    // Skip gracefully if the shared path-visit pool is already nearly exhausted
+    // (a deep spine below would otherwise fail its allocations mid-construction).
+    if (iterator.IsApproachingMaxPathCapacity)
+    {
+      return;
+    }
+
+    // Allocate the path and seed it with the search root context, pre-sizing the slots for
+    // the full (known-length) spine plus headroom: growing a segment leaks its old storage
+    MCGSPath path = iterator.AllocatedPath(depth + 1 + ArraySegmentPool<MCGSPathVisit>.GROWTH_QUANTUM);
+    path.InnerSearchStartNode = startNode;
+    path.InnerSearchStartDepth = depth;
+    path.RunningHash = Engine.SearchRootRunningHash;
+    if (Engine.NeedsPlySinceLastMove)
+    {
+      Engine.SearchRootPlySinceLastMove.AsSpan().CopyTo(path.PlySinceLastMove.SquarePlySince);
+    }
+
+    // Force descent from the search root down to startNode (root-to-leaf order), recording a
+    // single-visit slot for each step so that backup later propagates upward to the search root.
+    MGPosition parentPosMG = Engine.SearchRootPosMG;
+    GNode parentNode = Engine.SearchRootNode;
+    for (int i = depth - 1; i >= 0; i--)
+    {
+      GNode childNode = Engine.Graph[nodeIndicesLeafToRoot[i]];
+      int childIndex = parentNode.IndexOfChildInChildEdges(childNode.Index);
+      Debug.Assert(childIndex >= 0, "ExtendPathFromInnerNode: tree-parent child edge not found");
+      GEdge childEdge = parentNode.ChildEdgeAtIndex(childIndex);
+      AddForcedPrefixVisit(path, parentNode, childIndex, childEdge, ref parentPosMG);
+      parentNode = childNode;
+    }
+
+    Debug.Assert(path.NumVisitsInPath == depth);
+    Debug.Assert(path.LeafVisitRef.ParentChildEdge.ChildNode.Index == startNode.Index);
+
+    // Continue normal selection (PUCT/CBGPUCT) from startNode.
+    ExtendPathsRecursively(iterator, path, numAttemptedVisits);
+  }
+
+
+  /// <summary>
+  /// Returns the depth of a node from the search root (number of tree-parent edges to reach it),
+  /// or -1 if the node is not a descendant of the search root (its tree-parent chain reaches the
+  /// graph root first). Walking via the acyclic TreeParentEdge guarantees this terminates; it is
+  /// used to keep the inner-node prefix walk moving strictly toward the search root.
+  /// </summary>
+  /// <param name="node"></param>
+  /// <returns></returns>
+  private int DepthFromSearchRootOrNegative(GNode node)
+  {
+    const int MAX_DEPTH = 512;
+    int depth = 0;
+    GNode n = node;
+    while (!n.IsSearchRoot)
+    {
+      if (n.IsGraphRoot || depth >= MAX_DEPTH)
+      {
+        return -1;
+      }
+      n = Engine.Graph[n.TreeParentNodeIndex];
+      depth++;
+    }
+    return depth;
+  }
+
+
+  /// <summary>
+  /// Records a single forced (non-PUCT) visit along an already-expanded child edge while building
+  /// the search-root -> startNode prefix in ExtendPathFromInnerNode. Mirrors the per-visit
+  /// bookkeeping of the normal expanded-child descent (position, hashes, edge in-flight, running
+  /// hash, ply) but always assigns exactly one visit to the given child.
+  /// </summary>
+  private void AddForcedPrefixVisit(MCGSPath path, GNode parentNode, int childIndex,
+                                    GEdge childEdge, ref MGPosition parentPosMG)
+  {
+    Debug.Assert(childEdge.Type == GEdgeStruct.EdgeType.ChildEdge);
+
+    MGMove moveMG = ConverterMGMoveEncodedMove.EncodedMoveToMGChessMove(childEdge.Move, in parentPosMG);
+    MGPosition childPos = parentPosMG;
+    childPos.MakeMove(moveMG);
+    bool moveIrreversible = parentPosMG.IsIrreversibleMove(moveMG, in childPos);
+
+    PosHash64 childHash64 = MGPositionHashing.Hash64(in childPos);
+
+    // The 96-bit hash is needed only when the running multiset hash is consumed
+    // (PositionAndHistoryEquivalence mode); see ComputeChildPositionInfo.
+    bool historyHashNeeded = Engine.Manager.ParamsSearch.EnableGraph
+                          && path.PathMode == PathMode.PositionAndHistoryEquivalence;
+    PosHash96 childHash96 = historyHashNeeded ? MGPositionHashing.Hash96(in childPos) : default;
+
+    ref MCGSPathVisit visit = ref path.AddVisit(parentNode, childIndex, in childPos, 1, childHash64, moveIrreversible);
+    visit.ParentChildEdge = childEdge;
+    GNodeStruct.UpdateEdgeNInFlightForIterator(childEdge, path.IteratorID, 1);
+
+    // Maintain the running multiset hash and ply-since-last-move exactly as PossiblyBranched does
+    // for an ordinary descended visit (history resets on an irreversible move).
+    if (moveIrreversible)
+    {
+      path.RunningHash = default;
+    }
+    path.RunningHash.Add(childHash96);
+
+    if (Engine.NeedsPlySinceLastMove)
+    {
+      PlySinceLastMoveArray.ApplyMoveWithSwap(ref path.PlySinceLastMove, ref path.PlySinceLastMoveTemp, in moveMG);
+    }
+
+    parentPosMG = childPos;
   }
 
   private static bool CapacityAbortNeeded(MCGSIterator iterator, MCGSPath path, MCGSPathsSet pathsSet)
   {
-    if (iterator.IsApproachingMaxPathCapacity) // for example, when a prefetch operation has reached the target
+    // Deep rollouts: cap the descent below the start node. Rollout lines have no
+    // informational value at extreme depth, and unbounded paths exhaust the shared
+    // path-visit pool.
+    const int MAX_DEPTH_BELOW_START_DEEP_ROLLOUT = 384;
+    bool deepRolloutTooDeep = iterator.DisableTranspositionSufficiencyStop
+                           && !path.InnerSearchStartNode.IsNull
+                           && path.NumVisitsInPath - path.InnerSearchStartDepth >= MAX_DEPTH_BELOW_START_DEEP_ROLLOUT;
+
+    // Hard depth ceiling: the per-depth selection buffers in MCGSStrategyPUCT are sized
+    // MAX_PATH_DEPTH; a SelectChildren call at or beyond that depth would index out of
+    // range. Enforced here (one level early, with margin) so it holds for all descent
+    // shapes, including deep-rollout spines which start already hundreds of plies deep.
+    bool maxDepthReached = path.NumVisitsInPath >= MCGSStrategyPUCT.MAX_PATH_DEPTH - 4;
+
+    if (iterator.IsApproachingMaxPathCapacity // for example, when a prefetch operation has reached the target
+     || deepRolloutTooDeep
+     || maxDepthReached
+     || pathsSet.NNEvalBudgetExhausted) // fill-to-capacity pass has reached its NN slot budget
     {
       path.TerminationReason = MCGSPathTerminationReason.Abort;
       if (path.NumVisitsInPath > 0)
@@ -443,6 +726,115 @@ public class MCGSSelect
 
 
   /// <summary>
+  /// Installs the pseudotransposition (sibling) blend on a JUST-CREATED node
+  /// (N=0, values copied from a pseudo-twin, not yet backed up), so that the node's
+  /// first backup composes its copied V with the sibling-set Q exactly as the ordinary
+  /// PTB select-phase refresh would do one visit later. Uses the same donor statistics
+  /// (GetTranspositionStats: eligible donors with N strictly above the target's
+  /// effective N of 1) and the same maximum weight cap; this merely removes the
+  /// one-visit lag in the existing blending feature.
+  ///
+  /// The standard target-side eligibility checks are applied using the position
+  /// in hand (the node's own Move50Category/HasRepetitions context), and the install
+  /// is skipped on (rare) lock contention.
+  /// </summary>
+  private static void PossiblyInstallSiblingBlendAtCreation(GNode newNode, in MGPosition childPos, PosHash64 childHash64)
+  {
+    Debug.Assert(newNode.NodeRef.N == 0);
+
+    // Mirror IsEligibleForPseudoTranspositionContribution's target-side conditions
+    // (except N > 0, inapplicable at creation) using the position directly.
+    if (childPos.Move50Category != Move50CategoryEnum.LessThan75
+     || childPos.RepetitionCount != 0)
+    {
+      return;
+    }
+
+    // Same key convention as the standalone registration in InitializeNodeForPos.
+    PosHash64WithMove50AndReps key = MGPositionHashing.Hash64WithMove50AndRepsAdded(
+      childHash64, childPos.RepetitionCount, childPos.Move50Category);
+
+    // Effective target N is 1 (the pending first visit); donors therefore need N >= 2,
+    // and the standard cap arithmetic bounds the weight at SIBLING_WT_MAX_FRACTION.
+    (float extraN, double siblingAvgQ) = newNode.Graph.GetTranspositionStats(newNode, 1, key);
+
+    const float SCALING_TERM = (MCGSParamsFixed.SIBLING_WT_MAX_FRACTION / (1 - MCGSParamsFixed.SIBLING_WT_MAX_FRACTION));
+    extraN = Math.Min(extraN, SCALING_TERM * 1);
+
+    if (extraN <= 0)
+    {
+      return;
+    }
+
+    double weight = extraN / (1.0 + extraN);
+    if (weight < (1.0 / 255.0))
+    {
+      return; // would quantize to zero
+    }
+
+    // Install via the sibling-blend fields; the first backup (ResetNodeQUsingNewQPure
+    // with the copied V) reads these stored fields and produces the blended Q with
+    // exact-inversion bookkeeping, which then propagates up the path.
+    // Non-blocking lock (the caller holds the expansion parent's lock); on contention
+    // simply skip - the ordinary PTB refresh will install the blend a visit later anyway.
+    if (!newNode.TryAcquireLock())
+    {
+      return;
+    }
+    try
+    {
+      newNode.NodeRef.SiblingsQ = siblingAvgQ;
+      newNode.NodeRef.SiblingsQFrac = weight;
+    }
+    finally
+    {
+      newNode.ReleaseLock();
+    }
+  }
+
+
+  /// <summary>
+  /// Reconciles the at-creation sibling blend after a successful transposition auto-extension.
+  ///
+  /// PossiblyInstallSiblingBlendAtCreation installs the blend using an effective target N of 1
+  /// (the node's imminent first visit). When auto-extension then runs, it installs the node at a
+  /// higher N (typically 2), but composes only the EXISTING (N=1-weighted) sibling fields. For a
+  /// non-cap-saturated donor (e.g. a twin with N just above the target) the correct weight at the
+  /// post-extension N is smaller - so without this the node carries a transiently over-weighted
+  /// blend until its next ordinary select-phase refresh.
+  ///
+  /// This recomputes the blend at the node's true current N via the same path the ordinary refresh
+  /// uses (ResetNodeQUsingNewQPure with refreshSiblingContribution: true), recovering the exact pure
+  /// Q first (ComputeQPure inverts the stored N=1 blend) so only the sibling weighting changes.
+  /// Best-effort: a node carrying no installed blend (SiblingsQFrac == 0, e.g. no eligible donors or
+  /// the creation install lost its lock race) needs nothing, and on lock contention the install is
+  /// simply skipped - the ordinary refresh would correct it a visit later anyway.
+  /// </summary>
+  private static void ReconcileSiblingBlendAfterAutoExtension(GNode node)
+  {
+    if (node.NodeRef.SiblingsQFrac == 0)
+    {
+      // No blend was installed at creation; a higher target N can only reduce donor eligibility,
+      // so there is nothing to recompute.
+      return;
+    }
+
+    if (!node.TryAcquireLock())
+    {
+      return;
+    }
+    try
+    {
+      node.ResetNodeQUsingNewQPure(node.ComputeQPure(), refreshSiblingContribution: true);
+    }
+    finally
+    {
+      node.ReleaseLock();
+    }
+  }
+
+
+  /// <summary>
   /// Determines the dynamic threshold of visits to a child node,
   /// based off of the ParamsSearchExecution but possibly adjusted if the
   /// graph is large (since paths become longer and parallelism is more beneficial).
@@ -451,7 +843,7 @@ public class MCGSSelect
   {
     get
     {
-      int threshold = Engine.Manager.ParamsSearch.Execution.SelectOperationParallelThresholdNumVisits; ;// (bigGraph ? 15 : 20) : 9999;
+      int threshold = Engine.Manager.ParamsSearch.Execution.SelectOperationParallelThresholdNumVisits;
       if (threshold < int.MaxValue)
       {
         if (Engine.SearchRootNode.N > 50_000_000)
@@ -472,37 +864,68 @@ public class MCGSSelect
   }
 
 
-  private int ProcessChildren(MCGSIterator iterator,
-                              MCGSPath path,
-                              int numAttemptedVisits,
-                              MCGSPathsSet pathsSet,
-                              GNode parentNode,
-                              in MGPosition parentPosMG,
-                              Span<short> childVisitCounts,
-                              int numChildrenToConsider,
-                              int numVisitsRemaining,
-                              float cpuctMultiplier)
+  /// <summary>
+  /// Processes the per-child visit counts produced by selection: for each child with
+  /// nonzero visits, creates the path visit and dispatches to the appropriate handler
+  /// (terminate, defer descent, create node, etc.). Runs entirely under the parent lock
+  /// (held by the caller). Returns the deferred recursive descents for the caller to
+  /// dispatch after releasing the lock (null if none).
+  /// </summary>
+  private ListBounded<DeferredSubPath> ProcessChildren(MCGSIterator iterator,
+                                                       MCGSPath path,
+                                                       int numAttemptedVisits,
+                                                       MCGSPathsSet pathsSet,
+                                                       GNode parentNode,
+                                                       in MGPosition parentPosMG,
+                                                       Span<short> childVisitCounts,
+                                                       int numChildrenToConsider,
+                                                       int numVisitsRemaining,
+                                                       float cpuctMultiplier)
   {
     ParamsSearch paramsSearch = iterator.Engine.Manager.ParamsSearch;
     int minRepetitionCountForDraw = paramsSearch.TwofoldDrawEnabled ? 1 : 2;
     bool graphEnabled = paramsSearch.EnableGraph;
-    float transpositionStopMinSupportRatio = paramsSearch.PathTranspositionMode == PathMode.PositionAndHistoryEquivalence 
-                                           ? paramsSearch.TranspositionStopMinSupportRatioPositionAndHistoryMode 
+    float transpositionStopMinSupportRatio = paramsSearch.PathTranspositionMode == PathMode.PositionAndHistoryEquivalence
+                                           ? paramsSearch.TranspositionStopMinSupportRatioPositionAndHistoryMode
                                            : paramsSearch.TranspositionStopMinSupportRatioPositionMode;
+
+    // Optionally scale the redescent multiplier per transposed child by that child's leaf value
+    // volatility (applied within IsTranspositionSufficientN, where the child node is in hand).
+    bool scaleRedescentByChildVolatility = paramsSearch.RedescentScaleByVolatility && paramsSearch.TrackLeafValueVolatility;
     bool parallelEnabled = paramsSearch.Execution.SelectOperationParallelThresholdNumVisits < int.MaxValue;
     int THRESHOLD_PARALLEL = ParallelThresholdToUse;
 
-    bool multipass = numAttemptedVisits >= 3 * THRESHOLD_PARALLEL;
+    // Multipass (parallel-launch) scanning is only useful when enough visits flow
+    // through this node for at least one child to reach the parallel threshold
+    // (a parallel launch additionally requires ~0.5 * threshold visits left over,
+    // so this bound is conservative). Otherwise a single pass suffices, avoiding
+    // the second enumeration pass over visited children (whose iterations would
+    // all be skipped anyway since no child can reach the launch threshold).
+    bool multipass = parallelEnabled && numAttemptedVisits >= THRESHOLD_PARALLEL;
 
-    if (parallelEnabled)
-    {
-      multipass = true;
-    }
-
-    // Loop over child visits and preform first-level processing (create associated MCGSPathVisit, etc.).
-    // However do not initiate recursive descent yet, instead tarcking deferred subpaths to process later.
+    // Loop over child visits and perform first-level processing (create associated MCGSPathVisit, etc.).
+    // However do not initiate recursive descent yet, instead tracking deferred subpaths to process later.
     // This allows the parent lock to be released before commencing recursive descent.
     ListBounded<DeferredSubPath> deferredSubPaths = null;
+
+    // Enforce in-order edge expansion. The edge store requires unexpanded children to be expanded
+    // in strictly ascending index order (creating edge k derives its storage block from edge k-1).
+    // Compact the unexpanded children into contiguous slots beginning at NumEdgesExpanded, swapping both edge headers.
+    int scanLimit = Math.Min(numChildrenToConsider, childVisitCounts.Length);
+    int writeSlot = parentNode.NumEdgesExpanded;
+    for (int k = parentNode.NumEdgesExpanded; k < scanLimit; k++)
+    {
+      if (childVisitCounts[k] > 0)
+      {
+        if (k != writeSlot)
+        {
+          parentNode.SwapChildEdgeHeaders(writeSlot, k);
+          (childVisitCounts[writeSlot], childVisitCounts[k]) = (childVisitCounts[k], childVisitCounts[writeSlot]);
+        }
+        writeSlot++;
+      }
+    }
+
 
     SelectVisitsEnumerator childVisitScans = new(numChildrenToConsider, parentNode.NumEdgesExpanded, multipass);
     foreach ((SelectVisitsEnumerator.VisitsPhase phase, int childIndex) in childVisitScans)
@@ -523,11 +946,11 @@ public class MCGSSelect
         continue;
       }
 
-      if (phase == SelectVisitsEnumerator.VisitsPhase.MultiPassVisitedProcessNonParallel
-            && numVisitsThisChild >= THRESHOLD_PARALLEL)
-      {
-        //        continue; // TODO: can we safely restore this?
-      }
+      // N.B. A child with numVisitsThisChild >= THRESHOLD_PARALLEL may still legitimately
+      //      reach the NonParallel pass: the LaunchParallel pass skips it when
+      //      canLaunchParallel is false (insufficient remaining visits). A "continue" here
+      //      keyed on the threshold would silently drop such a child's visits (leaving
+      //      in-flight counts dangling and the path unterminated) - do not add one.
 
       bool isExpanded = childIndex < parentNode.NumEdgesExpanded;
 
@@ -559,24 +982,72 @@ public class MCGSSelect
         ProcessExpandedChild(iterator, path, pathsSet, parentNode, childEdge, childNode,
                              numVisitsToAssign, childVisitCounts, childIndex,
                              ref childPosInfo, graphEnabled,
-                             transpositionStopMinSupportRatio, numVisitsRemaining,
-                             canLaunchParallel, ref deferredSubPaths);
+                             transpositionStopMinSupportRatio, scaleRedescentByChildVolatility,
+                             numVisitsRemaining, canLaunchParallel, ref deferredSubPaths);
       }
       else // not expanded
       {
         Debug.Assert(!parentNode.EdgeHeadersSpan[childIndex].IsExpanded);
 
+        bool expansionBlocked = false;
         ProcessUnexpandedChild(iterator, path, pathsSet, parentNode, childIndex,
                                ref childPosInfo, childVisitCounts, numVisitsToAssign,
                                numVisitsRemaining, minRepetitionCountForDraw,
-                               graphEnabled, transpositionStopMinSupportRatio, canLaunchParallel, ref deferredSubPaths);
+                               graphEnabled, transpositionStopMinSupportRatio, scaleRedescentByChildVolatility,
+                               canLaunchParallel, ref deferredSubPaths, ref expansionBlocked);
+
+        if (expansionBlocked)
+        {
+          // Expansion of this child was blocked by (rare) lock contention on an existing
+          // transposition node. The edge store requires strictly in-order expansion, so
+          // none of the remaining unexpanded children can be expanded this round either
+          // (all later indices are unexpanded: expanded children sit at lower indices).
+          // Drop this child's and every later child's visits for this batch; the ledger
+          // backout is deferred to the backup phase (see ApplyDroppedVisits for why it
+          // cannot be performed here).
+          int numDropped = numVisitsThisChild;
+          childVisitCounts[childIndex] = 0;
+          for (int k = childIndex + 1; k < childVisitCounts.Length; k++)
+          {
+            if (childVisitCounts[k] > 0)
+            {
+              numDropped += childVisitCounts[k];
+              numVisitsRemaining -= childVisitCounts[k];
+              childVisitCounts[k] = 0;
+            }
+          }
+          pathsSet.RecordDroppedVisits(path, numDropped);
+
+          if (numVisitsRemaining == 0)
+          {
+            // Nothing remains to consume the path object (any already-processed children
+            // branched off their own paths). Mark Abort for consistency; the path is
+            // deliberately NOT added to the set - all of its pending visits are covered
+            // by the dropped-visits record above, so there is nothing else for the
+            // backup phase to process.
+            path.TerminationReason = MCGSPathTerminationReason.Abort;
+          }
+        }
       }
     }
 
-    parentNode.ReleaseLock();
+    return deferredSubPaths;
+  }
 
-    // Dispatch deferred recursive descents.
-    if (deferredSubPaths != null)
+
+  /// <summary>
+  /// Dispatches the deferred recursive descents collected during child processing,
+  /// either synchronously or via the worker pool. Must be called only after the
+  /// parent node's lock has been released. Returns the list to its pool.
+  /// </summary>
+  private void DispatchDeferredSubPaths(MCGSIterator iterator, ListBounded<DeferredSubPath> deferredSubPaths)
+  {
+    if (deferredSubPaths == null)
+    {
+      return;
+    }
+
+    try
     {
       foreach (DeferredSubPath deferredSubPath in deferredSubPaths)
       {
@@ -589,12 +1060,11 @@ public class MCGSSelect
           ExtendPathsRecursively(iterator, deferredSubPath.SubPath, deferredSubPath.NumVisits);
         }
       }
-
-      // Return to pool
+    }
+    finally
+    {
       ReturnDeferredSubPathsList(deferredSubPaths);
     }
-
-    return numVisitsRemaining;
   }
 
 
@@ -657,20 +1127,29 @@ public class MCGSSelect
     info.wasIrreversibleMove = parentPosMG.IsIrreversibleMove(moveMG, in info.childPos);
 
     info.childPositionHash64 = MGPositionHashing.Hash64(in info.childPos);
-    PosHash64WithMove50AndReps posHash64WithMove50AndReps = MGPositionHashing.Hash64WithMove50AndRepsAdded(
-      info.childPositionHash64, info.childPos.RepetitionCount, info.childPos.Move50Category);
-    info.childPositionHash96 = MGPositionHashing.Hash96(in info.childPos);
 
     if (graphEnabled && path.PathMode == PathMode.PositionAndHistoryEquivalence)
     {
+      // The 96-bit hash (a second full hash pass over the position) is needed only in
+      // this mode, where it keys nodes by position+history and feeds the path's running
+      // multiset hash. In the other modes it is left default: the running hash is never
+      // read there (repetition detection uses the 64-bit hash), and the consumers of
+      // childPositionHash96 (the Finalized below, TranspositionAutoExtension) only
+      // operate in this mode.
+      info.childPositionHash96 = MGPositionHashing.Hash96(in info.childPos);
+
       // Update running hash with this position (but resetting history if was irreversible).
+      // N.B. The epoch-start form must match the convention used by graph root initialization
+      //      and the GraphRewriter/GraphExtractor dictionary rebuilds (which compute
+      //      default.Finalized(hash)); a raw (High, Low) construction here would key the same
+      //      logical node differently and silently break transposition merging after extraction.
       info.childPositionAndSequenceHashFinalized = info.wasIrreversibleMove
-        ? new PosHash96MultisetFinalized(info.childPositionHash96.High, info.childPositionHash96.Low)
+        ? PosHash96MultisetRunning.EpochStartFinalized(info.childPositionHash96)
         : path.RunningHash.Finalized(info.childPositionHash96);
     }
     else
     {
-      // Replace hash code with standalone hash so a all edges map to shared node.
+      // Replace hash code with standalone hash so all edges map to a shared node.
       // Use extra available slot with another hash to reduce hash collision probability.
       int extraHash = HashCode.Combine(info.childPos.A, info.childPos.B, info.childPos.C, info.childPos.D);
       info.childPositionAndSequenceHashFinalized = new PosHash96MultisetFinalized((uint)extraHash, info.childPositionHash64.Hash);
@@ -686,14 +1165,15 @@ public class MCGSSelect
 
 
   /// <summary>
-  /// Processes an already-expanded child edge.
-  /// Returns true if handled (caller should continue to next child).
+  /// Processes an already-expanded child edge: terminates the path (terminal edge/node,
+  /// coalesce-mode repetition draw, sufficient-N transposition) or defers recursive descent.
   /// </summary>
   private void ProcessExpandedChild(MCGSIterator iterator, MCGSPath path, MCGSPathsSet pathsSet,
                                     GNode parentNode, GEdge childEdge, GNode childNode,
                                     int numVisitsThisChild, Span<short> childVisitCounts, int childIndex,
                                     ref ChildPositionInfo childPosInfo,
                                     bool graphEnabled, float transpositionStopMinSupportRatio,
+                                    bool scaleRedescentByChildVolatility,
                                     int numVisitsRemaining, bool canLaunchParallel,
                                     ref ListBounded<DeferredSubPath> deferredSubPaths)
   {
@@ -741,7 +1221,8 @@ public class MCGSSelect
                               childPosInfo.moveMG);
     }
     else if (IsTranspositionSufficientN(graphEnabled, transpositionStopMinSupportRatio,
-                                        childEdge.NInFlightForIterator(iterator.IteratorID), childEdge.N, childNode))
+                                        childEdge.NInFlightForIterator(iterator.IteratorID), childEdge.N, childNode,
+                                        iterator.DisableTranspositionSufficiencyStop, scaleRedescentByChildVolatility))
     {
       // Already expanded, connects to a transposition node with already sufficient N, stop descent.
       //  Revisit transposition node with sufficient visits --> extract evaluation, end descent.
@@ -792,18 +1273,23 @@ public class MCGSSelect
 
   /// <summary>
   /// Processes an unexpanded child (creating new node or terminal edge).
-  /// Returns true if handled (caller should continue to next child).
   /// </summary>
-  private bool ProcessUnexpandedChild(MCGSIterator iterator, MCGSPath path, MCGSPathsSet pathsSet,
+  private void ProcessUnexpandedChild(MCGSIterator iterator, MCGSPath path, MCGSPathsSet pathsSet,
                                       GNode parentNode, int childIndex,
                                       ref ChildPositionInfo childPosInfo,
                                       Span<short> childVisitCounts, int numVisitsThisChild,
                                       int numVisitsRemaining, int minRepetitionCountForDraw,
                                       bool graphEnabled, float transpositionStopMinSupportRatio,
+                                      bool scaleRedescentByChildVolatility,
                                       bool canLaunchParallel,
-                                      ref ListBounded<DeferredSubPath> deferredSubPaths)
+                                      ref ListBounded<DeferredSubPath> deferredSubPaths,
+                                      ref bool expansionBlocked)
   {
-    MGMoveList childMoves = MGMoveGen.GeneratedMoves(in childPosInfo.childPos);
+    // Generate into the thread-local scratch list (no allocation): most callees below only
+    // read the list, and the dominant outcomes (transposition link, collision piggyback)
+    // never retain it. The retention points (DoNewlyCreatedNode, via newVisit.MovesList)
+    // make their own exactly-sized copy.
+    MGMoveList childMoves = MGMoveGen.GeneratedMovesIntoThreadStaticScratch(in childPosInfo.childPos);
 
     // Determine if game result can be immediately determined (various mate and draw conditions).
     const bool possiblyUseTablebase = true;
@@ -814,24 +1300,26 @@ public class MCGSSelect
     // because other visits via other paths may not be draws.
     if (resultInfo.result != GameResult.Unknown && !childPosInfo.isDrawByRepetitionInCoalesceMode)
     {
-      return DoTerminalUnexpandedChild(path, pathsSet, parentNode, childIndex,
-                                       ref childPosInfo, childMoves, childVisitCounts,
-                                       numVisitsThisChild, numVisitsRemaining, resultInfo);
+      DoTerminalUnexpandedChild(path, pathsSet, parentNode, childIndex,
+                                ref childPosInfo, childMoves, childVisitCounts,
+                                numVisitsThisChild, numVisitsRemaining, resultInfo);
+      return;
     }
 
-    return DoNonTerminalUnexpandedChild(iterator, path, pathsSet, parentNode, childIndex,
-                                        ref childPosInfo, ref childMoves,
-                                        childVisitCounts, numVisitsThisChild,
-                                        childPosInfo.isDrawByRepetitionInCoalesceMode, numVisitsRemaining,
-                                        graphEnabled, transpositionStopMinSupportRatio,
-                                        canLaunchParallel, ref deferredSubPaths);
+    DoNonTerminalUnexpandedChild(iterator, path, pathsSet, parentNode, childIndex,
+                                 ref childPosInfo, ref childMoves,
+                                 childVisitCounts, numVisitsThisChild,
+                                 childPosInfo.isDrawByRepetitionInCoalesceMode, numVisitsRemaining,
+                                 graphEnabled, transpositionStopMinSupportRatio,
+                                 scaleRedescentByChildVolatility,
+                                 canLaunchParallel, ref deferredSubPaths, ref expansionBlocked);
   }
 
 
   /// <summary>
   /// Handles creation of terminal edge for unexpanded child.
   /// </summary>
-  private bool DoTerminalUnexpandedChild(MCGSPath path, MCGSPathsSet pathsSet, GNode parentNode,
+  private void DoTerminalUnexpandedChild(MCGSPath path, MCGSPathsSet pathsSet, GNode parentNode,
                                             int childIndex,
                                             ref ChildPositionInfo childPosInfo, MGMoveList childMoves,
                                             Span<short> childVisitCounts, int numVisitsThisChild,
@@ -848,8 +1336,13 @@ public class MCGSSelect
     // Create terminal edge (no associated child node).
 
     bool propagateAsDraw = resultInfo.v == 0;
+    // Repetition and 50-move-rule draws are history-sensitive (valid only for histories like
+    // the current one); record the kind on the edge. The result tuple alone cannot distinguish
+    // the rule50 case from stalemate, so classify here where the child position is in hand.
+    bool historySensitiveDraw = resultInfo.wasDrawByRepetition
+                             || (resultInfo.result == GameResult.Draw && childPosInfo.childPos.Rule50Count >= 100);
     GEdge newEdge = path.Graph.AddNewTerminalEdge(parentNode, childIndex, resultInfo.v, resultInfo.d,
-                                                   numVisitsThisChild, propagateAsDraw);
+                                                   numVisitsThisChild, propagateAsDraw, historySensitiveDraw);
     newVisit.ParentChildEdge = newEdge;
     GNodeStruct.UpdateEdgeNInFlightForIterator(newEdge, path.IteratorID, numVisitsThisChild);
 
@@ -858,34 +1351,54 @@ public class MCGSSelect
     MCGSPath newPath = path.PossiblyBranched(numVisitsRemaining, numVisitsThisChild,
                                              childPosInfo.childPositionHash96, childPosInfo.wasIrreversibleMove,
                                              childPosInfo.moveMG);
-    newVisit.MovesList = childMoves;
+    // MovesList deliberately left null: terminal-edge visits have no NN evaluation, and no
+    // consumer reads Moves for them (the lazy regeneration in MCGSPathVisit.Moves is the
+    // safety net if one ever does). childMoves is the shared scratch and must not be retained.
     pathsSet.AddPath(newPath, numVisitsThisChild);
     childVisitCounts[childIndex] = 0;
-    return true;
   }
 
 
   /// <summary>
   /// Handles creation of new node or link to existing transposition node.
   /// </summary>
-  private bool DoNonTerminalUnexpandedChild(MCGSIterator iterator, MCGSPath path, MCGSPathsSet pathsSet,
+  private void DoNonTerminalUnexpandedChild(MCGSIterator iterator, MCGSPath path, MCGSPathsSet pathsSet,
                                             GNode parentNode, int childIndex,
                                             ref ChildPositionInfo childPosInfo, ref MGMoveList childMoves,
                                             Span<short> childVisitCounts, int numVisitsThisChild,
                                             bool isDrawByRepetitionInCoalesceMode,
                                             int numVisitsRemaining, bool graphEnabled,
                                             float transpositionStopMinSupportRatio,
+                                            bool scaleRedescentByChildVolatility,
                                             bool canLaunchParallel,
-                                            ref ListBounded<DeferredSubPath> deferredSubPaths)
+                                            ref ListBounded<DeferredSubPath> deferredSubPaths,
+                                            ref bool expansionBlocked)
   {
-    // CASE 4b: create a new node, or link to existing
+    // CASE 4b: create a new node, or link to existing.
+    // The existing-node lock is acquired NON-blockingly: we hold the expansion parent's
+    // lock, and a blocking acquire of a second node lock can deadlock (position-keyed
+    // transposition links admit cycles in the lock-wait graph; see class remarks).
     (GEdge childEdge, bool wasCollision) =
       path.Graph.AddEdgeToNewOrExistingNode(parentNode, childIndex, in childPosInfo.childPos,
                                             childPosInfo.childPositionHash64,
                                             childPosInfo.childPositionAndSequenceHashFinalized,
                                             childMoves,
                                             out bool wasCreated, out GNode standaloneTranspositionNode,
-                                            true);
+                                            okToCreate: true,
+                                            nonBlockingExistingNodeLock: true);
+
+    if (childEdge.IsNull)
+    {
+      // Existing transposition node's lock contended (rare); nothing was created or
+      // changed, and no visit/edge exists for this child yet. Edges must be expanded
+      // in strictly ascending index order (the edge store derives edge k's storage
+      // from edge k-1), so with this slot unexpandable NO later unexpanded child may
+      // be expanded this round either. Signal the caller (ProcessChildren), which
+      // centrally backs the visits of this child and of all remaining unexpanded
+      // children out of the ancestor accounting and drops them for this batch.
+      expansionBlocked = true;
+      return;
+    }
 
     // CB-GPUCT: when CBGPUCT_CrossParentNFraction > 0, seed edge.QChild from child.Q
     // for transposition links so that ComputeVBar / ScoreCalc do not read an invalid
@@ -914,7 +1427,7 @@ public class MCGSSelect
                                            numVisitsThisChild, ref childPosInfo,
                                            childVisitCounts, childIndex);
 
-      return true;
+      return;
     }
 
     // Create a new visit entry in the path for this child.
@@ -931,7 +1444,7 @@ public class MCGSSelect
       pathsSet.AddPath(newPath, 1);
       GNodeStruct.UpdateEdgeNInFlightForIterator(childEdge, path.IteratorID, numVisitsThisChild);
       childVisitCounts[childIndex] = 0;
-      return true;
+      return;
     }
 
     Debug.Assert(!childPosInfo.positionDuplicate
@@ -944,16 +1457,16 @@ public class MCGSSelect
 
     if (wasCreated)
     {
-      return DoNewlyCreatedNode(path, pathsSet, childEdge, childNode, standaloneTranspositionNode,
-                                   ref newVisit.MovesList, ref childPosInfo, childMoves, childVisitCounts, childIndex,
-                                   numVisitsThisChild, numVisitsRemaining, isDrawByRepetitionInCoalesceMode);
+      DoNewlyCreatedNode(path, pathsSet, childEdge, childNode, standaloneTranspositionNode,
+                         ref newVisit.MovesList, ref childPosInfo, childMoves, childVisitCounts, childIndex,
+                         numVisitsThisChild, numVisitsRemaining, isDrawByRepetitionInCoalesceMode);
     }
     else
     {
       bool handled = DoTranspositionLink(iterator, path, pathsSet, childEdge, childNode,
                                          ref childPosInfo, childVisitCounts, childIndex,
                                          numVisitsThisChild, numVisitsRemaining, graphEnabled,
-                                         transpositionStopMinSupportRatio);
+                                         transpositionStopMinSupportRatio, scaleRedescentByChildVolatility);
 
       if (!handled)
       {
@@ -965,10 +1478,7 @@ public class MCGSSelect
         deferredSubPaths ??= GetDeferredSubPathsList();
         deferredSubPaths.Add(new DeferredSubPath(splitPath, numVisitsThisChild, canLaunchParallel));
         childVisitCounts[childIndex] = 0;
-        return true;
       }
-
-      return handled;
     }
   }
 
@@ -976,13 +1486,18 @@ public class MCGSSelect
   /// <summary>
   /// Handles a newly created node (either requiring NN eval or copying from transposition).
   /// </summary>
-  private bool DoNewlyCreatedNode(MCGSPath path, MCGSPathsSet pathsSet, GEdge childEdge,
+  private void DoNewlyCreatedNode(MCGSPath path, MCGSPathsSet pathsSet, GEdge childEdge,
                                      GNode childNode, GNode standaloneTranspositionNode,
                                      ref MGMoveList movesList, ref ChildPositionInfo childPosInfo, MGMoveList childMoves,
                                      Span<short> childVisitCounts, int childIndex,
                                      int numVisitsThisChild, int numVisitsRemaining,
                                      bool isDrawByRepetitionInCoalesceMode)
   {
+    // childMoves arrives as the shared thread-local scratch but is retained below (assigned
+    // into the path visit's MovesList, later read by NN batch assembly). Make the exactly-sized
+    // copy immediately - this also frees the scratch for reuse by TranspositionAutoExtension.
+    childMoves = new MGMoveList(childMoves);
+
     Debug.Assert(!(isDrawByRepetitionInCoalesceMode && childNode.Terminal.IsTerminal()));
 
     int numToAccept = (childNode.Terminal.IsTerminal() || isDrawByRepetitionInCoalesceMode) ? numVisitsThisChild : 1;
@@ -992,7 +1507,7 @@ public class MCGSSelect
      && standaloneTranspositionNode.IsEvaluated)
     {
       // The NN evaluation (value, policy, etc.) will later be copied from the standaloneTranspositionNode.
-      // TODO: This was arbitrarily choosen as first node, in the sibling set,
+      // TODO: This was arbitrarily chosen as first node in the sibling set;
       //       in theory we could pick any one which was evaluated
       //       or maybe take an average value/policy across them
       path.TerminationReason = MCGSPathTerminationReason.TranspositionCopyValues;
@@ -1002,6 +1517,50 @@ public class MCGSSelect
 
       bool copyPolicyImmediate = standaloneTranspositionNode.Graph != Engine.Graph;
       Engine.Graph.CopyNodeValues(0, standaloneTranspositionNode, childEdge.ChildNode, copyPolicyImmediate);
+
+      // Optionally install the pseudotransposition (sibling) blend immediately at creation
+      // rather than only from the node's later select-phase refreshes (removes the
+      // one-visit lag in the existing PTB feature: the first backed-up value is already
+      // the blend of the copied V with the sibling-set Q).
+      // N.B. must run BEFORE the auto-extension below: the extension performs the node's
+      //      first backups, whose ResetNodeQUsingNewQPure composes the stored sibling
+      //      blend with the (extension-improved) pure Q.
+      // The feature is meaningful only in PositionAndHistoryEquivalence mode: under
+      // PositionEquivalence same-position nodes are coalesced, so the donor set is empty
+      // (only self) and GetTranspositionStats can never contribute - gate it out so the
+      // work (and the call) is skipped entirely.
+      bool ptbAtCreationActive = Engine.Manager.ParamsSearch.EnablePseudoTranspositionBlendingAtCreation
+                              && Engine.Manager.ParamsSearch.EnablePseudoTranspositionBlending
+                              && Engine.Manager.ParamsSearch.PathTranspositionMode != PathMode.PositionEquivalence;
+      if (ptbAtCreationActive)
+      {
+        PossiblyInstallSiblingBlendAtCreation(childEdge.ChildNode,
+                                              in childPosInfo.childPos, childPosInfo.childPositionHash64);
+      }
+
+      // Optionally auto-extend: synchronously perform the deterministic next visit from the
+      // new node (its top-policy child), installing it with N=2 and the exact two-visit Q.
+      // On success the termination reason changes so the backup phase does not re-apply
+      // the leaf node update (the node is fully installed here).
+      if (Engine.Manager.ParamsSearch.EnableTranspositionAutoExtension
+       && TranspositionAutoExtension.TryExtend(Engine, path, childEdge.ChildNode,
+                                               standaloneTranspositionNode,
+                                               in childPosInfo.childPos, childPosInfo.childPositionHash96,
+                                               childPosInfo.wasIrreversibleMove))
+      {
+        path.TerminationReason = MCGSPathTerminationReason.TranspositionCopyValuesAutoExtended;
+
+        // Reconcile the at-creation blend with the post-extension visit count. The install
+        // above used an effective target N of 1 (the imminent first visit), but the extension
+        // has since installed the node at a higher N (typically 2). Recompute the blend at
+        // that true N - exactly the computation the ordinary select-phase refresh performs -
+        // so the stored weight is correct immediately rather than carrying the over-weighted
+        // N=1 value until the node's next select-phase refresh.
+        if (ptbAtCreationActive)
+        {
+          ReconcileSiblingBlendAfterAutoExtension(childEdge.ChildNode);
+        }
+      }
     }
     else
     {
@@ -1019,7 +1578,6 @@ public class MCGSSelect
     childVisitCounts[childIndex] = 0;
     movesList = childMoves;
     GNodeStruct.UpdateEdgeNInFlightForIterator(childEdge, path.IteratorID, numVisitsThisChild);
-    return true;
   }
 
 
@@ -1030,7 +1588,8 @@ public class MCGSSelect
                                    GEdge childEdge, GNode childNode, ref ChildPositionInfo childPosInfo,
                                    Span<short> childVisitCounts, int childIndex,
                                    int numVisitsThisChild, int numVisitsRemaining,
-                                   bool graphEnabled, float transpositionStopMinSupportRatio)
+                                   bool graphEnabled, float transpositionStopMinSupportRatio,
+                                   bool scaleRedescentByChildVolatility)
   {
     GNodeStruct.UpdateEdgeNInFlightForIterator(childEdge, path.IteratorID, numVisitsThisChild);
 
@@ -1052,7 +1611,9 @@ public class MCGSSelect
       pathsSet.AddPath(newVisitPiggy, numVisitsToAccept);
     }
     else if (IsTranspositionSufficientN(graphEnabled, transpositionStopMinSupportRatio,
-                                       childEdge.NInFlightForIterator(iterator.IteratorID), childEdge.N, childNode))
+                                        childEdge.NInFlightForIterator(iterator.IteratorID),
+                                        childEdge.N, childNode, iterator.DisableTranspositionSufficiencyStop,
+                                        scaleRedescentByChildVolatility))
     {
       // Sufficient visit transposition node --> create edge, extract evaluation, end descent.
       // It must have nonzero visits and thus be able to satisfy our needs without going deeper
@@ -1104,7 +1665,6 @@ public class MCGSSelect
                                                     Span<short> childVisitCounts,
                                                     int childIndex)
   {
-    //ConsoleUtils.WriteLineColored(ConsoleColor.Yellow, $"Draw by repetition detected in coalesce mode on edge {childEdge}");
     ref MCGSPathVisit newVisit = ref AddVisitFromChildPosInfo(path, childEdge.ParentNode, childIndex,
                                                               ref childPosInfo, numVisitsThisChild);
     newVisit.ParentChildEdge = childEdge;
@@ -1138,8 +1698,8 @@ public class MCGSSelect
     else if (childEdge.ChildNode.IsEvaluated)
     {
       // Node found already evaluated, possibly due to:
-      //   - a TranspsitionCopyValues from another node
-      //   - like due to a prior prefetch operation.
+      //   - a TranspositionCopyValues from another node
+      //   - a prior prefetch operation.
       // We just use this evaluation without scheduling an NN evaluation.
       terminationReason = MCGSPathTerminationReason.AlreadyNNEvaluated;
       numVisitsToAccept = childEdge.ChildNode.Terminal.IsTerminal() ? numVisitsThisPath : 1;
@@ -1147,14 +1707,23 @@ public class MCGSSelect
     else
     {
       // This node must be in the process of being evaluated along a different parent edge.
-      // NOTE: this assumption holds because MCGS search never gratituous expands edges.
-      (int numInFlightAllEdgesAllIterators, int numInFlightAllEdgesThisIterator) = NumInFlightAllEdgesToNode(iterator.IteratorID, childEdge.ChildNode);
+      // NOTE: this assumption holds because MCGS search never gratuitously expands edges.
+      if (!TryGetNumInFlightAllEdgesToNode(iterator.IteratorID, childEdge.ChildNode,
+                                           out int numInFlightAllEdgesAllIterators,
+                                           out int numInFlightAllEdgesThisIterator))
+      {
+        // Child node lock contended (we hold the expansion parent's lock and must not
+        // block; see class remarks). Conservatively abort, as in the other-iterator case.
+        terminationReason = MCGSPathTerminationReason.Abort;
+        numVisitsToAccept = 0;
+        return;
+      }
       int numInFlightAllEdgesNotThisIterator = numInFlightAllEdgesAllIterators - numInFlightAllEdgesThisIterator;
 
       if (numInFlightAllEdgesNotThisIterator > 0)
       {
-        // If the other iterator is the one that triggered the valuation
-        // then it is not safe to piggyback becuase we cannot be sure
+        // If the other iterator is the one that triggered the evaluation
+        // then it is not safe to piggyback because we cannot be sure
         // the evaluation will be complete by the time we do our backup.
         // Therefore abort.
         terminationReason = MCGSPathTerminationReason.Abort;
@@ -1174,7 +1743,7 @@ public class MCGSSelect
 
 
   /// <summary>
-  /// Returns if a visit to a transposition node has N sufficienty large to be
+  /// Returns if a visit to a transposition node has N sufficiently large to be
   /// used as the immediate backup value (suppressing further descent).
   /// 
   /// Note that sufficiency is judged relative to a target which includes
@@ -1184,31 +1753,50 @@ public class MCGSSelect
   /// This target may then be scaled by a multiplier to encourage deeper exploration
   /// of frequently visited nodes.
   /// </summary>
-  /// <param name="numVisits"></param>
-  /// <param name="transpositionStopMinSupportRatio"></param>
-  /// <param name="numVisitsTotalThisIterator"></param>
-  /// <param name="edgeN"></param>
-  /// <param name="childN"></param>
   /// <returns></returns>
-  static bool IsTranspositionSufficientN(bool graphEnabled, float transpositionStopMinSupportRatio, int numVisitsTotalThisIterator, int edgeN, GNode childNode)
+  static bool IsTranspositionSufficientN(bool graphEnabled, float transpositionStopMinSupportRatio,
+                                         int numVisitsTotalThisIterator, int edgeN, GNode childNode,
+                                         bool disableTranspositionSufficiencyStop,
+                                         bool scaleRedescentByChildVolatility)
   {
+    if (disableTranspositionSufficiencyStop)
+    {
+      // Inner-node deep rollouts bypass the sufficiency stop so descent continues through
+      // well-visited transposition nodes to a true frontier leaf or terminal.
+      return false;
+    }
+
     if (graphEnabled)
     {
       // This could be a transposition node.
       // In graph mode we hope/expect the subtrees can often reflect more visits
-      // than direclty requested from each individaul node (since serach effort is shared).
+      // than directly requested from each individual node (since search effort is shared).
       // Based on some configurable scaling factor we decide if this subtree is
       // "already big enough" that we can stop descent here and just use the subtree value as is.
+      if (scaleRedescentByChildVolatility && childNode.N > 50)
+      {
+        // Scale the redescent multiplier by this transposed child's leaf value volatility:
+        // clamp volatility (RMS deviation about Q) to [0, 0.4] and map linearly to a factor
+        // running from 0.25 (volatility 0) to 1.0 (volatility 0.4).
+        // A volatile (still-unsettled) child keeps the full support requirement (descend, send it more visits);
+        // a settled, low-volatility child has its requirement reduced (trust the cached value, stop sooner).
+        // NOTE: we don't bother calling the debiased version of RunningStdDev because at childNode.N > 50 it differs little
+        const float VOL_CLAMP_MAX = 0.4f;
+        const float MIN_VOL_MULTIPLIER = 0.25f;
+        float volClamped = Math.Clamp((float)childNode.NodeRef.LeafValueVolatility.RunningStdDev, 0f, VOL_CLAMP_MAX);
+        float volMultiplier = MIN_VOL_MULTIPLIER + (1.0f - MIN_VOL_MULTIPLIER) * (volClamped / VOL_CLAMP_MAX);
+        transpositionStopMinSupportRatio *= volMultiplier;
+      }
+
       int scaledTargetN = (int)MathF.Round(transpositionStopMinSupportRatio * (edgeN + numVisitsTotalThisIterator));
 
-      if (MCGSParamsFixed.REDESCENT_MUTIPLIER_ADJUST)
+      if (MCGSParamsFixed.REDESCENT_MUTIPLIER_ADJUST && childNode.N < 30)
       {
-        //double adjTarget = 2.5f * scaledTargetN / 3f;
         // Adjust scaling so that for smaller absolute N we require a higher redescent mutiplier,
         // reflecting that absolute uncertainty is higher for smaller N.
         const double REDESCENT_MULTIPLIER_ADJ_FACTOR = 2;
         double scale = 1.0f + (REDESCENT_MULTIPLIER_ADJ_FACTOR / Math.Sqrt(childNode.N));
-        scaledTargetN = (int)(scaledTargetN * scale + 0.5); // simple rounding
+        scaledTargetN = (int)(scaledTargetN * scale);
       }
 
       return childNode.N > scaledTargetN;
@@ -1259,24 +1847,31 @@ public class MCGSSelect
 
   internal const bool RPO_CHOOSES_NEW_CHILDREN = false;
 
-  public static int NumExploratory = 0;
-
-
-  bool haveWarnedDuplicate = false; // TODO: remove after debugging complete?
+  // Warn-once guard for the (internal error) duplicate-position diagnostic below.
+  // Written without synchronization; a duplicate warning under a race is benign.
+  bool haveWarnedDuplicate = false;
 
   internal static readonly LiveStats statsReject = MCGSParamsFixed.LOG_LIVE_STATS ? new("PUCTRejects", 4f) : null;
 
   /// <summary>
-  /// If the child edge is in the process of being evaluated by this iterator in this batch.
+  /// Computes the number of in-flight visits across all parent edges into a node
+  /// (total over both iterators, and for the specified iterator). Returns false without
+  /// computing if the node's lock (needed to safely enumerate its parent edges) could
+  /// not be acquired; the acquisition is non-blocking because callers hold the
+  /// expansion parent's lock (see lock-ordering remarks on the class).
   /// </summary>
-  /// <param name="iteratorID"></param>
-  /// <param name="childEdge"></param>
-  /// <returns></returns>
-  private static (int numInFlightAllIterators, int numInFlightThisIterator) NumInFlightAllEdgesToNode(int iteratorID, GNode node)
+  private static bool TryGetNumInFlightAllEdgesToNode(int iteratorID, GNode node,
+                                                      out int numInFlightAllIterators,
+                                                      out int numInFlightThisIterator)
   {
-    int numInFlightAllIterators = 0;
-    int numInFlightThisIterator = 0;
-    using (new NodeLockBlock(node))
+    numInFlightAllIterators = 0;
+    numInFlightThisIterator = 0;
+
+    if (!node.TryAcquireLock())
+    {
+      return false;
+    }
+    try
     {
       foreach (GEdge parentEdge in node.ParentEdges)
       {
@@ -1285,14 +1880,18 @@ public class MCGSSelect
                                  + parentEdge.NInFlightForIterator(1);
       }
     }
+    finally
+    {
+      node.ReleaseLock();
+    }
 
-    return (numInFlightAllIterators, numInFlightThisIterator);
+    return true;
   }
 
 
 
 
-  private static int ApplyPUCTSuboptimalityThreshold(MCGSPath path,
+  private static int ApplyPUCTSuboptimalityThreshold(MCGSPath path, MCGSPathsSet pathsSet,
                                                     int numAttemptedVisits,
                                                     int numAcceptedVisits, Span<short> childVisitCounts)
   {
@@ -1310,22 +1909,43 @@ public class MCGSSelect
 
       statsReject?.Add(numAttemptedVisits, numAttemptedVisits - numAcceptedVisits);
 
-      if (numAcceptedVisits < numAttemptedVisits)// && path.numSlotsUsed > 0)
+      if (numAcceptedVisits < numAttemptedVisits)
       {
-        // Backout the number of visits that were not selected of the path visits above.
-        int delta = numAcceptedVisits - numAttemptedVisits;
-        foreach (MCGSPathVisitMember pp in path.PathVisitsLeafToRoot)
-        {
-          ref MCGSPathVisit pathVisit = ref pp.PathVisitRef;
-          Interlocked.Add(ref pathVisit.NumVisitsAttemptedPendingBackup, delta);
-          Interlocked.Add(ref pathVisit.NumVisitsAttempted, delta);
-          GNodeStruct.UpdateEdgeNInFlightForIterator(pathVisit.ParentChildEdge, path.IteratorID, delta);
-        }
+        // Drop the visits that were not selected; the ledger backout for the path
+        // visits above is deferred to the backup phase (see ApplyDroppedVisits).
+        pathsSet.RecordDroppedVisits(path, numAttemptedVisits - numAcceptedVisits);
         numAttemptedVisits = numAcceptedVisits;
       }
     }
 
     return numAttemptedVisits;
+  }
+
+
+  /// <summary>
+  /// Applies the ledger backout for visits which were assigned down a path but abandoned
+  /// mid-frame during select (suboptimality rejection, lock-contention expansion block):
+  /// every visit from the path's position at the time of the drop (numSlotsAtDrop) up to
+  /// the root has its attempted/pending-backup counters and its edge in-flight count
+  /// reduced. Without this the backup-phase merge counters (see MCGSBackupReduced) would
+  /// never reach zero at the shared ancestor visits and the ancestor updates (and edge
+  /// in-flight decrements) would be silently lost.
+  ///
+  /// MUST be called only from the (quiescent) backup phase, via the deferred records in
+  /// MCGSPathsSet.PendingDroppedVisits: the walk touches ancestor path-segment slots,
+  /// which during select may be concurrently reallocated (ArraySegmentRef.EnsureSize)
+  /// by other select workers extending the same path objects.
+  /// </summary>
+  internal static void ApplyDroppedVisits(MCGSPath path, int numSlotsAtDrop, int numVisits)
+  {
+    int delta = -numVisits;
+    foreach (MCGSPathVisitMember pp in new MCGSPathLeafToRootEnumerable(path, numSlotsAtDrop))
+    {
+      ref MCGSPathVisit pathVisit = ref pp.PathVisitRef;
+      Interlocked.Add(ref pathVisit.NumVisitsAttemptedPendingBackup, delta);
+      Interlocked.Add(ref pathVisit.NumVisitsAttempted, delta);
+      GNodeStruct.UpdateEdgeNInFlightForIterator(pathVisit.ParentChildEdge, path.IteratorID, delta);
+    }
   }
 
   internal static readonly LiveStats fiftyMoveCounterDraw = MCGSParamsFixed.LOG_LIVE_STATS ? new LiveStats("50 move rule, draw(99)", 1) : null;

@@ -226,6 +226,24 @@ public partial class MCGSManager : IDisposable
 
 
   /// <summary>
+  /// Replaces this move's search limit after the manager was constructed.
+  /// Used when a reused graph is abandoned after the initial (warm) time/node allocation:
+  /// the search will actually run from a cold (empty) graph, so the budget is recomputed
+  /// with a cold-start input and installed here.
+  /// </summary>
+  internal void OverrideSearchLimit(SearchLimit newLimit,
+                                    ManagerGameLimitInputs gameLimitInputs,
+                                    ManagerGameLimitOutputs gameLimitOutputs)
+  {
+    SearchLimit = newLimit;
+    SearchLimitInitial = newLimit;
+    LastSearchLimit = newLimit;
+    LastGameLimitInputs = gameLimitInputs;
+    LastGameLimitOutputs = gameLimitOutputs;
+  }
+
+
+  /// <summary>
   /// Constructor.
   /// </summary>
   /// <param name="evaluatorSet"></param>

@@ -73,7 +73,25 @@ public partial class MCGSEngine
   // New PhaseCoordinator to manage ordered execution of select and backup phases.
   internal readonly PhaseCoordinator Coordinator = new();
 
+  /// <summary>
+  /// Helper used to optionally perform an (experimental) full bottom-up recomputation
+  /// of all node Q values after each batch is backed up (ParamsSearch.PostBackupQMode == FullRecompute).
+  /// Shared across iterators; invoked only from within the (mutually exclusive) backup lock.
+  /// </summary>
+  public readonly BottomUpQRecalculator QRecalculator;
+
+  /// <summary>
+  /// Helper used to optionally perform selective, amortized upward Q propagation after each batch
+  /// is backed up (enabled via ParamsSearch.PostBackupQMode == StaleDrain).
+  /// Shared across iterators; invoked only from within the (mutually exclusive) backup lock.
+  /// </summary>
+  public readonly SelectiveQPropagator QPropagator;
+
   internal int numVisitsInFlight = 0;
+
+  // Evaluator metadata (constant for a search) used to bound batch sizes by network size and device count.
+  readonly int cachedNumDevicesInEvaluator;
+  readonly long cachedNetFileSizeBytes;
 
 
   /// <summary>
@@ -126,9 +144,18 @@ public partial class MCGSEngine
                     GraphRootToSearchRootNodeInfo[] searchRootPathFromGraphRoot)
   {
     Manager = manager;
+
+    // Cache evaluator metadata (constant for the search) used to bound batch sizes.
+    NNEvaluator evaluator0 = Manager.NNEvaluator0;
+    cachedNumDevicesInEvaluator = evaluator0?.NumDevices ?? 1;
+    cachedNetFileSizeBytes = evaluator0?.Info?.NetworkFileSizeBytes ?? -1;
+
     Graph = graph;
+    Graph.PTBMaxRepDrawFraction = manager.ParamsSearch.PseudoTranspositionBlendingMaxRepDrawFraction;
     Strategy = new MCGSStrategyPUCT(this);
     SelectWorkerPools = selectWorkerPools;
+    QRecalculator = new BottomUpQRecalculator(this);
+    QPropagator = new SelectiveQPropagator(this);
 
     const bool DEBUG_DUMP = false;
     if (DEBUG_DUMP)
@@ -460,13 +487,260 @@ public partial class MCGSEngine
     int targetBatchSize = OptimalBatchSizeCalculator.CalcOptimalBatchSize(numVisitsNeededRemaining, SearchRootNode.N,
                                                                           paramsSearch.Execution.DualOverlappedIterators,
                                                                           paramsSearch.Execution.MaxBatchSize, paramsSearch.BatchSizeMultiplier,
-                                                                          paramsSearch.EnableEarlySmallBatchSizes);
+                                                                          paramsSearch.EnableEarlySmallBatchSizes,
+                                                                          cachedNumDevicesInEvaluator, cachedNetFileSizeBytes);
 
     targetBatchSize = Math.Min(numVisitsNeededRemaining, targetBatchSize);
     targetBatchSize = Math.Min(targetBatchSize, Manager.MaxBatchSizeDueToPossibleNearTimeExhaustion);
 
     //    Debug.Assert(targetBatchSize > 0);
     return targetBatchSize;
+  }
+
+
+  /// <summary>
+  /// Runs "deep rollout" visits that begin at the specified inner nodes (rather than the search
+  /// root), growing the existing graph. Each round sends exactly one visit to each still-active
+  /// node; rollouts are aggregated into shared NN batches and backed up (propagating each value up
+  /// to the search root). The exploration term in selection is scaled by explorationMultiplier
+  /// (CPUCT for PUCT, CBGPUCT_SelectLambdaC for CBGPUCT). When stopNodeVisitsIfTerminalReached is
+  /// true, a node whose rollout reaches a terminal leaf is dropped from subsequent rounds.
+  ///
+  /// startNodes must already be filtered to evaluated, non-terminal, strict descendants of the
+  /// search root (see MCGSManager.DoSearchInnerNodes).
+  /// </summary>
+  /// <param name="startNodes"></param>
+  /// <param name="numVisitsEachNode"></param>
+  /// <param name="explorationMultiplier"></param>
+  /// <param name="stopNodeVisitsIfTerminalReached"></param>
+  /// <param name="preBackupCallback">If not null, invoked with each round's constructed PathsSet just before backup.</param>
+  /// <param name="postBackupCallback">If not null, invoked with each round's PathsSet just after backup.</param>
+  /// <param name="deepRollout">
+  /// If true, configures the rollout for greedy depth extension to a true frontier / terminal:
+  /// bypasses the transposition-sufficiency stop and applies a pessimistic FPU (Absolute, 1.0) for
+  /// the duration (the shared ParamsSelect FPU is snapshotted and restored afterwards).
+  /// </param>
+  /// <param name="deadline">Optional wall-clock deadline; remaining rounds are abandoned once passed.</param>
+  /// <param name="dryUpRounds">
+  /// If positive, a node is dropped from subsequent rounds once this many consecutive rounds
+  /// produced no new distinct line below it (its descents have dried up).
+  /// </param>
+  /// <returns>Per-start-node accumulated rollout statistics, keyed by node index.</returns>
+  internal Dictionary<NodeIndex, InnerNodeRolloutStats> RunFromInnerNodes(GNode[] startNodes, int numVisitsEachNode,
+                                                                          float explorationMultiplier, bool stopNodeVisitsIfTerminalReached,
+                                                                          bool deepRollout,
+                                                                          Action<MCGSPathsSet> preBackupCallback = null,
+                                                                          Action<MCGSPathsSet> postBackupCallback = null,
+                                                                          DateTime? deadline = null,
+                                                                          int dryUpRounds = 0)
+  {
+    Dictionary<NodeIndex, InnerNodeRolloutStats> stats = new();
+    if (startNodes.Length == 0 || numVisitsEachNode <= 0)
+    {
+      return stats;
+    }
+
+    int maxBatchSize = Manager.ParamsSearch.Execution.MaxBatchSize;
+
+    // For deep rollouts, force a pessimistic Absolute FPU so the greedy descent commits to the best
+    // explored line instead of fanning out across unexpanded siblings. Snapshot and restore so the
+    // shared ParamsSelect is unaffected after the call.
+    ParamsSelect.FPUType savedFPUMode = Manager.ParamsSelect.FPUMode;
+    float savedFPUValue = Manager.ParamsSelect.FPUValue;
+    if (deepRollout)
+    {
+      Manager.ParamsSelect.FPUMode = ParamsSelect.FPUType.Absolute;
+      Manager.ParamsSelect.FPUValue = 1.0f;
+    }
+
+    MCGSIterator iterator = null;
+    try
+    {
+      // Fresh evaluator wrapper over the (still-alive) underlying NNEvaluator: a prior search's
+      // RunLoop disposes its iterator (and thus Manager.EvaluatorNN0's batch / pooled buffers), but
+      // the underlying NNEvaluator itself is left intact and reusable.
+      MCGSEvaluatorNeuralNet evaluatorNN = new MCGSEvaluatorNeuralNet(
+        Manager.EvaluatorsSet.EvaluatorDef, Manager.NNEvaluator0, null,
+        Manager.ParamsSearch.HistoryFillIn,
+        Math.Min(Manager.NNEvaluator0.MaxBatchSize, maxBatchSize),
+        false, Manager.ParamsSearch.ValueTemperature, Manager.ParamsSearch.EnableState,
+        null, null, Manager.EvaluatorNN0.EngineIsWhite);
+
+      iterator = new MCGSIterator(this, 0, evaluatorNN);
+      iterator.CPUCTMultiplier = explorationMultiplier;
+      iterator.DisableTranspositionSufficiencyStop = deepRollout;
+
+      List<GNode> activeNodes = new(startNodes.Length);
+      activeNodes.AddRange(startNodes);
+
+      List<GNode> chunk = new(Math.Min(maxBatchSize, startNodes.Length));
+      Dictionary<NodeIndex, int> dryRoundCounts = dryUpRounds > 0 ? new Dictionary<NodeIndex, int>() : null;
+      Dictionary<NodeIndex, int> noResultRoundCounts = new();
+      HashSet<NodeIndex> producedResultThisRound = new();
+
+      for (int round = 0; round < numVisitsEachNode && activeNodes.Count > 0; round++)
+      {
+        if (Manager.ExternalStopRequested || (deadline.HasValue && DateTime.Now >= deadline.Value))
+        {
+          break;
+        }
+
+        HashSet<NodeIndex> droppedThisRound = stopNodeVisitsIfTerminalReached || dryUpRounds > 0
+                                                ? new HashSet<NodeIndex>() : null;
+        producedResultThisRound.Clear();
+
+        // Process the active nodes in chunks no larger than the NN max batch size, so each chunk's
+        // leaves are aggregated into a single NN batch.
+        for (int chunkStart = 0; chunkStart < activeNodes.Count && !Manager.ExternalStopRequested; chunkStart += maxBatchSize)
+        {
+          chunk.Clear();
+          int chunkEnd = Math.Min(chunkStart + maxBatchSize, activeNodes.Count);
+          for (int i = chunkStart; i < chunkEnd; i++)
+          {
+            chunk.Add(activeNodes[i]);
+          }
+
+          foreach ((NodeIndex node, int depthBelow, int terminalKind, double leafQFromStart, NodeIndex[] sequence)
+                     in iterator.RunOnceFromNodes(chunk, preBackupCallback, postBackupCallback))
+          {
+            producedResultThisRound.Add(node);
+
+            if (!stats.TryGetValue(node, out InnerNodeRolloutStats nodeStats))
+            {
+              nodeStats = new InnerNodeRolloutStats();
+              stats[node] = nodeStats;
+            }
+
+            nodeStats.NumVisits++;
+            nodeStats.SumLeafQAllPaths += leafQFromStart;
+            if (depthBelow > nodeStats.MaxDepthBelowNode)
+            {
+              nodeStats.MaxDepthBelowNode = depthBelow;
+            }
+
+            // Accumulate the distinct rollout lines (drop fully-overlapping repeats). The maximal
+            // (tip) subset is derived from these when the result tuple is built.
+            bool isNewDistinctLine = !ContainsSequence(nodeStats.DistinctSequences, sequence);
+            if (isNewDistinctLine)
+            {
+              nodeStats.DistinctSequences.Add(sequence);
+              nodeStats.DistinctLeafQ.Add(leafQFromStart);
+            }
+
+            if (dryRoundCounts != null)
+            {
+              // Each node receives exactly one rollout per round, so this per-rollout update
+              // is the per-round dry-up accounting for the node.
+              if (isNewDistinctLine)
+              {
+                dryRoundCounts[node] = 0;
+              }
+              else
+              {
+                dryRoundCounts.TryGetValue(node, out int dryCount);
+                dryRoundCounts[node] = ++dryCount;
+                if (dryCount >= dryUpRounds)
+                {
+                  nodeStats.DroppedDryUp = true;
+                  droppedThisRound.Add(node);
+                }
+              }
+            }
+
+            switch (terminalKind)
+            {
+              case 1:
+                nodeStats.NumTerminalWin++;
+                break;
+              case 2:
+                nodeStats.NumTerminalDraw++;
+                break;
+              case 3:
+                nodeStats.NumTerminalLoss++;
+                break;
+            }
+
+            if (terminalKind != 0 && stopNodeVisitsIfTerminalReached)
+            {
+              nodeStats.DroppedTerminal = true;
+              droppedThisRound.Add(node);
+            }
+          }
+        }
+
+        // Drop nodes whose rollouts repeatedly produce no result (e.g. systematically aborted
+        // by the path capacity / deep-rollout depth guards) - they would otherwise spin
+        // unproductively for all remaining rounds.
+        const int MAX_CONSECUTIVE_NO_RESULT_ROUNDS = 3;
+        foreach (GNode activeNode in activeNodes)
+        {
+          if (producedResultThisRound.Contains(activeNode.Index))
+          {
+            noResultRoundCounts.Remove(activeNode.Index);
+          }
+          else
+          {
+            noResultRoundCounts.TryGetValue(activeNode.Index, out int noResultCount);
+            noResultRoundCounts[activeNode.Index] = ++noResultCount;
+            if (noResultCount >= MAX_CONSECUTIVE_NO_RESULT_ROUNDS)
+            {
+              droppedThisRound ??= new HashSet<NodeIndex>();
+              droppedThisRound.Add(activeNode.Index);
+            }
+          }
+        }
+
+        if (droppedThisRound != null && droppedThisRound.Count > 0)
+        {
+          activeNodes.RemoveAll(node => droppedThisRound.Contains(node.Index));
+        }
+      }
+    }
+    finally
+    {
+      iterator?.Dispose();
+      Manager.ParamsSelect.FPUMode = savedFPUMode;
+      Manager.ParamsSelect.FPUValue = savedFPUValue;
+    }
+
+    return stats;
+  }
+
+
+  /// <summary>
+  /// Returns whether a node-index sequence equal (same length and same elements) to the candidate
+  /// is already present in the list. Used to keep maximalPathsNodes free of fully-overlapping
+  /// duplicate lines.
+  /// </summary>
+  /// <param name="sequences"></param>
+  /// <param name="candidate"></param>
+  /// <returns></returns>
+  private static bool ContainsSequence(List<NodeIndex[]> sequences, NodeIndex[] candidate)
+  {
+    foreach (NodeIndex[] existing in sequences)
+    {
+      if (existing.Length != candidate.Length)
+      {
+        continue;
+      }
+
+      bool equal = true;
+      for (int i = 0; i < candidate.Length; i++)
+      {
+        if (existing[i].Index != candidate[i].Index)
+        {
+          equal = false;
+          break;
+        }
+      }
+
+      if (equal)
+      {
+        return true;
+      }
+    }
+
+    return false;
   }
 
 

@@ -784,6 +784,81 @@ public static unsafe class GraphRewriter
 
 
   /// <summary>
+  /// Finalizes a freshly built (copied) graph by running the shared rewrite tail phases
+  /// (parent store rebuild, N/Q/D recomputation, root/history setup, dictionary and sibling
+  /// rebuild, and final cleanup/validation).
+  ///
+  /// This is the integration point used by <see cref="GraphExtractor"/>: after the extractor
+  /// has copied the reachable subgraph into a new Graph's stores at contiguous indices
+  /// [1..numReachable] (the same compacted layout that Phases 2-4 produce in place), all of the
+  /// derived state is rebuilt here using the exact same code paths as the in-place rewrite,
+  /// so correctness is shared rather than reimplemented.
+  ///
+  /// PRECONDITIONS (caller, i.e. the extractor, must establish):
+  ///   - graph.NodesStore.nextFreeIndex == numReachable + 1 (null node at 0, root at 1).
+  ///   - Each retained node's GNodeStruct fields are copied (eval/hash/terminal/pieces/etc.).
+  ///   - Each retained node's edge headers are allocated in graph's own EdgeHeadersStore and
+  ///     expanded edges point (via ForceSetEdgeBlockIndex) to edge blocks in graph's own
+  ///     EdgesStore, with child indices already remapped to the new [1..numReachable] space.
+  ///   - ParentsHeader may be left arbitrary (it is fully rebuilt here).
+  /// The graph must be quiescent (no in-flight visits, nothing locked).
+  /// </summary>
+  /// <summary>
+  /// Per-phase timing breakdown (seconds) for the shared finalize tail, returned by
+  /// <see cref="FinalizeAfterCopy"/> for diagnostics.
+  /// </summary>
+  public record FinalizePhaseTimings(double Phase5Parents, double Phase5aNodeN, double Phase5bRoot,
+                                     double Phase6Dicts, double Phase6cSiblings, double Phase7Cleanup);
+
+
+  internal static FinalizePhaseTimings FinalizeAfterCopy(Graph graph, int numReachable, PositionWithHistory newPriorMoves)
+  {
+    // Lazily create and size the scratch buffers on THIS (new) graph.
+    // Pass small sizes (numReachable+1) for both: the tail phases only use the retained-sized
+    // buffers (incomingN/visited/positions/runningHashes); OldToNew is unused here, so there is
+    // no O(old graph) zeroing cost.
+    int numTotalRetained = numReachable + 1;
+    graph.RewriterScratchBuffers ??= new GraphRewriterScratchBuffers();
+    GraphRewriterScratchBuffers scratch = graph.RewriterScratchBuffers;
+    scratch.EnsureCapacity(numTotalRetained, numTotalRetained);
+
+    // Bypass lock assertions during exclusive (single-threaded, quiescent) graph construction.
+    graph.Store.IsRewriting = true;
+
+    Stopwatch sw = Stopwatch.StartNew();
+
+    // Phase 5: Rebuild parent store from edges (also accumulates incoming edge.N into scratch.GeneralA).
+    Phase5RebuildParentStore(graph, numReachable, scratch);
+    double t1 = sw.Elapsed.TotalSeconds;
+
+    // Phase 5a: Recalculate node N (from incoming edge N) and Q/D (bottom-up from edges).
+    Phase5aRecalculateNodeN(graph, numReachable, scratch.GeneralAPtr);
+    double t2 = sw.Elapsed.TotalSeconds;
+
+    // Phase 5b: Set root flags / cached pointers / history.
+    Phase5bSetupRootState(graph, newPriorMoves);
+    double t3 = sw.Elapsed.TotalSeconds;
+
+    // Phase 6: Rebuild transposition dictionaries and NodeIndexSet store.
+    Phase6RebuildDictionaries(graph, numReachable, scratch, out _, out _);
+    double t4 = sw.Elapsed.TotalSeconds;
+
+    // Phase 6c: Reconstruct pseudo-transposition sibling contributions (no-op in PositionEquivalence mode).
+    Phase6cPossiblyReconstructSiblingContributions(graph, numReachable);
+    double t5 = sw.Elapsed.TotalSeconds;
+
+    // Phase 7: Final cleanup (reset counters, resize stores to current usage, DEBUG validate).
+    Phase7FinalCleanup(graph);
+    double t6 = sw.Elapsed.TotalSeconds;
+
+    graph.Store.IsRewriting = false;
+
+    // Phase 5 timing includes the (small) scratch EnsureCapacity zeroing performed above.
+    return new FinalizePhaseTimings(t1, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t6 - t5);
+  }
+
+
+  /// <summary>
   /// Phase 0: Materialize deferred policy copies on reachable nodes only.
   /// Deferred nodes are always leaf nodes (no expanded edges), so Phase 1 BFS
   /// can safely run first to determine reachability.

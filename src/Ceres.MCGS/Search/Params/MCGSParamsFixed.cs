@@ -37,6 +37,8 @@ public static class MCGSParamsFixed
   /// </summary>
   public const bool GRAPH_REWRITE_DUMP_REUSE_DIAGNOSTICS = true;
 
+  public const bool DUMP_EARLY_SMOOTHING_BOOST = false;
+
   public const bool LOG_LIVE_STATS = false;
 
   /// <summary>
@@ -69,7 +71,7 @@ public static class MCGSParamsFixed
   /// This limits incurring the performance cost to only situations where there is a
   /// large potential benefit from immediate propagation.
   /// </summary>
-  public const double PROPAGATE_OFF_VISIT_PARENTS_MIN_Q_DELTA = 0.01;
+  public const double PROPAGATE_OFF_VISIT_PARENTS_MIN_Q_DELTA = 0.005;
 
 
   /// <summary>
@@ -77,6 +79,7 @@ public static class MCGSParamsFixed
   /// are used to compute and apply an updated Q value to the parent node.
   /// This propagates Q updates to other children (off the current visit path)
   /// that may have happened since the parent node was last visited.
+  /// Tests confirm this reset very beneficial. 
   /// </summary>
   public const bool RESET_Q_DURING_SELECT_PHASE_FROM_ALL_CHILDREN = true;
 
@@ -101,7 +104,13 @@ public static class MCGSParamsFixed
   public const bool USE_PSEUDOTRANSPOSITION_MAX_N_NODE_ONLY = false;
 
   public const float SIBLING_POWER_SHRINK_SIBLING_N = 1;
-  public const float SIBLING_WT_MAX_FRACTION = 0.65f;
+
+  /// <summary>
+  ///  The fraction of weight used for sibling values when in 
+  ///  PositionAndHistory mode.
+  ///  Suite tests suggested values less than 0.65 are better, for example 0.4 or 0.5.
+  /// </summary>
+  public const float SIBLING_WT_MAX_FRACTION = 0.50f;
 
   public const float MOVE_ORDERING_MIN_RATIO_POLICY = 0.15f;
 
@@ -119,7 +128,6 @@ public static class MCGSParamsFixed
   public const bool ENABLE_DRAW_KNOWN_TO_EXIST = true; // possibly small benefit? (+3 Elo at 3k nodes)
 
   public const bool FIX_DRP_NEEDS_3_BEFORE_ROOT = true;
-  public const bool FIX_REUSE_GRAPH_DRAW_AT_ROOT = true;
 
   /// <summary>
   /// If the redescent multiplier should be adjusted higher
@@ -139,6 +147,14 @@ public static class MCGSParamsFixed
   public const bool LARGE_HARDWARE_CONFIG = true;
 
   public const bool TRACK_NODE_EDGE_UNCERTAINTY = false; // methodology is problematic due to aggregated backups
+
+  /// <summary>
+  /// If true, after every search completes the engine automatically emits the full search
+  /// information dump (identical to issuing the UCI "dump-info" command) followed by a
+  /// revaluation analysis (identical to "revalue-root N" with N = root N / 20), without being
+  /// explicitly requested. Intended as a debugging/analysis convenience.
+  /// </summary>
+  public const bool ALWAYS_DUMP_SEARCH_INFO = false;
 
   /// <summary>
   /// Minimum probability threshold for top policy move to be considered for PV auto-extension.

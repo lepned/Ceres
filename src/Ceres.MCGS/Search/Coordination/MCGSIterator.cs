@@ -112,6 +112,13 @@ public class MCGSIterator : IDisposable
   /// </summary>
   internal float CPUCTMultiplier = 1.0f;
 
+  /// <summary>
+  /// When true, the transposition-sufficiency stop (MCGSSelect.IsTranspositionSufficientN) is
+  /// bypassed during selection, so descents continue through well-visited transposition nodes to a
+  /// true frontier leaf or terminal. Used by inner-node "deep rollouts" (DoSearchInnerNodes).
+  /// </summary>
+  internal bool DisableTranspositionSufficiencyStop = false;
+
   internal int numAllocatedPaths = 0;
 
   const bool ENABLE_LOGGING = false;
@@ -171,7 +178,7 @@ public class MCGSIterator : IDisposable
 
     int maxBatchSize = Engine.Manager.ParamsSearch.Execution.MaxBatchSize;
     PathsSet = new(this, maxBatchSize);
-    paths = new MCGSPath[maxBatchSize];
+    paths = new MCGSPath[maxBatchSize + 5];
 
     pathVisitPool = new ArraySegmentPool<MCGSPathVisit>();
   }
@@ -339,6 +346,8 @@ public class MCGSIterator : IDisposable
 
     RunSelectionPhase(batchSize);
 
+    UpdateNNYieldEstimate(batchSize);
+
     PossiblyRunSecondSelectionForNNBatchSizePadding(batchSize, hardMaxRootN);
 
     LogWrite(() => $"End select batch {batchSequenceNum} with {PathsSet.Paths.Count} paths");
@@ -347,6 +356,10 @@ public class MCGSIterator : IDisposable
 
     if (PathsSet.Paths.Count == 0)
     {
+      // No paths to evaluate/backup, but any visits dropped during select still need
+      // their deferred ledger backout applied (otherwise their edge in-flight counts
+      // and ancestor visit counters would leak).
+      ApplyPendingDroppedVisits();
       return;
     }
 
@@ -405,7 +418,7 @@ public class MCGSIterator : IDisposable
       {
         foreach (MCGSPathVisitMember visit in path.PathVisitsLeafToRoot)
         {
-          if (visit.PathVisitRef.NumVisitsAttemptedPendingBackup > 0)
+          if (visit.PathVisitRef.NumVisitsAttemptedPendingBackup != 0) // negative would indicate over-decrement
           {
             ConsoleUtils.WriteLineColored(ConsoleColor.Yellow, $"Found pending backup visits = {visit.PathVisitRef.NumVisitsAttemptedPendingBackup} after backup phase on iterator {IteratorID} for path {path.PathID} visit {visit.PathVisitRef} (root N: {Engine.SearchRootNode.N})");
             foundError = true;
@@ -449,23 +462,230 @@ public class MCGSIterator : IDisposable
       ConsoleUtils.WriteLineColored(ConsoleColor.Yellow, "Validated graph " + Engine.SearchRootNode.N);
     }
 
+    // Optionally perform a full bottom-up recomputation of all node Q values
+    // (experimental, enabled via ParamsSearch.TestFlag). This is done here while we still
+    // hold the backup lock and the graph is quiescent (no other iterator is concurrently
+    // in its select or backup phase).
+    PostBackupRecomputeQIfEnabled();
+
     // Possibly invoke the callback
     // At this point we hold the select/backup lock
     // and graph is quiescent.
     Engine.PossiblyInvokeCallback();
+
+    Engine.Manager.TerminationManager.ApplySearchMovesIfNeeded();
+
+    Manager.RunPeriodicMaintenance(batchSequenceNum);
+    batchSequenceNum++;
 
     LogWrite(() => $"End backup with mode {BackupMode}");
     Engine.Coordinator.ExitBackup(IteratorID, thisBatchID);
 
     LogFlush();
 
-    // Apply search moves as soon as possible (need the root to have been evaluated).
-    Engine.Manager.TerminationManager.ApplySearchMovesIfNeeded();
+    Engine.PossiblySynchronizeIterators(this);
+  }
 
-    Manager.RunPeriodicMaintenance(batchSequenceNum);
+
+  /// <summary>
+  /// Variant of RunOnce used by MCGSManager.DoSearchInnerNodes. Instead of selecting a batch of
+  /// visits beginning at the search root, it sends exactly one visit to each specified inner node:
+  /// each rollout is a full path searchRoot -> node -> ... -> leaf (built by
+  /// MCGSSelect.ExtendPathFromInnerNode), all leaves are evaluated in a single aggregated NN batch,
+  /// and all rollouts are backed up (propagating each value up to the search root).
+  ///
+  /// Returns one record per non-aborted rollout this round: the originating start node, the depth
+  /// descended below it, a terminal classification (0 = not terminal, 1 = win, 2 = draw, 3 = loss),
+  /// the leaf Q, and the sequence of node indices from the start node (index 0) down to the leaf.
+  /// The terminal classification and leaf Q are both from the start node's side-to-move perspective.
+  /// The exploration multiplier applied during the descent below each start node is the current
+  /// CPUCTMultiplier (set by the caller).
+  ///
+  /// startNodes.Count must not exceed the configured max batch size (the caller chunks if needed).
+  /// </summary>
+  /// <param name="startNodes"></param>
+  /// <param name="preBackupCallback">If not null, invoked with the constructed PathsSet just before it is backed up.</param>
+  /// <param name="postBackupCallback">If not null, invoked with the PathsSet just after it is backed up.</param>
+  /// <returns></returns>
+  internal List<(NodeIndex node, int depthBelow, int terminalKind, double leafQFromStart, NodeIndex[] sequence)> RunOnceFromNodes(
+                                                                                      IReadOnlyList<GNode> startNodes,
+                                                                                      Action<MCGSPathsSet> preBackupCallback,
+                                                                                      Action<MCGSPathsSet> postBackupCallback)
+  {
+    Debug.Assert(startNodes.Count <= Manager.ParamsSearch.Execution.MaxBatchSize);
+
+    int thisBatchID = Interlocked.Add(ref Engine.nextBatchID, 1) - 1;
+
+    PathsSet.Reset();
+    ResetPaths();
+    pathVisitPool.Clear(false);
+
+    BackupMode = Engine.Backup.BackupModeToUse();
+
+    // STEP 1: Build one single-visit rollout path per start node.
+    Engine.Coordinator.EnterSelect(IteratorID, thisBatchID);
+    for (int i = 0; i < startNodes.Count; i++)
+    {
+      Engine.Select.ExtendPathFromInnerNode(this, startNodes[i], 1);
+    }
+    Engine.SelectWorkerPools[IteratorID]?.WaitAll();
+    Engine.Coordinator.ExitSelect(IteratorID, thisBatchID);
+
+    if (PathsSet.Paths.Count == 0)
+    {
+      // Apply any deferred ledger backouts for visits dropped during select.
+      ApplyPendingDroppedVisits();
+      return new List<(NodeIndex node, int depthBelow, int terminalKind, double leafQFromStart, NodeIndex[] sequence)>(0);
+    }
+
+    // STEP 2: Evaluate any leaves needing the neural network (single aggregated batch).
+    Engine.Coordinator.EnterEvaluate(IteratorID, thisBatchID);
+    RunNNEvaluationPhase(deferRetrieveResults: false);
+    Engine.Coordinator.ExitEvaluate(IteratorID, thisBatchID);
+
+    // STEP 3: Backup the rollouts (propagates each leaf value up to the search root).
+    Engine.Coordinator.EnterBackup(IteratorID, thisBatchID);
+
+    // The PathsSet is fully constructed (and its leaves evaluated) but not yet backed up.
+    preBackupCallback?.Invoke(PathsSet);
+
+    // Snapshot the completed paths: the multi-threaded reduction backup (used once the root N
+    // exceeds its threshold) consumes (dequeues) PathsSet.Paths, which would otherwise leave
+    // nothing for the post-backup callback or for building the per-rollout result records below.
+    MCGSPath[] completedPaths = PathsSet.Paths.ToArray();
+
+    RunBackupPhase();
+
+    // Restore the queue if the backup drained it (multi-threaded reduction mode).
+    if (PathsSet.Paths.IsEmpty)
+    {
+      foreach (MCGSPath completedPath in completedPaths)
+      {
+        PathsSet.Paths.Enqueue(completedPath);
+      }
+    }
+
+    postBackupCallback?.Invoke(PathsSet);
+
+    Engine.PossiblyInvokeCallback();
+    Engine.Coordinator.ExitBackup(IteratorID, thisBatchID);
+
     batchSequenceNum++;
 
-    Engine.PossiblySynchronizeIterators(this);
+    // Build one result record per non-aborted rollout: depth below the start node, terminal
+    // classification, leaf Q (from the start node's perspective), and the node-index sequence
+    // from the start node (index 0) down to the leaf.
+    List<(NodeIndex node, int depthBelow, int terminalKind, double leafQFromStart, NodeIndex[] sequence)> results = new();
+    foreach (MCGSPath path in completedPaths)
+    {
+      if (path.InnerSearchStartNode.IsNull
+       || path.TerminationReason == MCGSPathTerminationReason.Abort)
+      {
+        continue;
+      }
+
+      int depthBelow = path.NumVisitsInPath - path.InnerSearchStartDepth;
+      (double leafQFromStart, int terminalKind) = LeafResultFromStart(path, depthBelow);
+      NodeIndex[] sequence = BuildNodeSequenceBelowStart(path);
+      results.Add((path.InnerSearchStartNode.Index, depthBelow, terminalKind, leafQFromStart, sequence));
+    }
+
+    return results;
+  }
+
+
+  /// <summary>
+  /// Returns the leaf value and terminal classification of an inner-node rollout, both expressed
+  /// from the perspective of the side to move at the start node (the leaf's own value is converted
+  /// using the parity of the depth descended below the start node). terminalKind: 0 = not terminal,
+  /// 1 = win, 2 = draw, 3 = loss. Non-terminal leaves return the leaf node's Q with terminalKind 0.
+  /// </summary>
+  /// <param name="path"></param>
+  /// <param name="depthBelow"></param>
+  /// <returns></returns>
+  private static (double leafQFromStart, int terminalKind) LeafResultFromStart(MCGSPath path, int depthBelow)
+  {
+    GEdge leafEdge = path.LeafVisitRef.ParentChildEdge;
+    bool isTerminal = path.TerminationReason == MCGSPathTerminationReason.Terminal
+                   || path.TerminationReason == MCGSPathTerminationReason.TerminalEdge;
+
+    // Leaf value in the leaf's own side-to-move perspective (0 for draws / repetition stops).
+    double leafVLeaf;
+    bool isDraw = false;
+    if (path.TerminationReason == MCGSPathTerminationReason.DrawByRepetitionInCoalesceMode
+     || leafEdge.Type == GEdgeStruct.EdgeType.TerminalEdgeDrawn)
+    {
+      leafVLeaf = 0.0;
+      isDraw = leafEdge.Type == GEdgeStruct.EdgeType.TerminalEdgeDrawn;
+    }
+    else if (leafEdge.Type == GEdgeStruct.EdgeType.ChildEdge)
+    {
+      double q = leafEdge.ChildNode.Q;
+      leafVLeaf = double.IsNaN(q) ? 0.0 : q;
+      isDraw = isTerminal && leafEdge.ChildNode.Terminal == GameResult.Draw;
+    }
+    else
+    {
+      // Decisive terminal edge (checkmate / tablebase win or loss).
+      leafVLeaf = leafEdge.Q;
+    }
+
+    double leafQFromStart = (depthBelow % 2 == 0) ? leafVLeaf : -leafVLeaf;
+
+    int terminalKind = 0;
+    if (isTerminal)
+    {
+      const double EPS = 1e-6;
+      terminalKind = isDraw ? 2
+                            : (leafQFromStart > EPS ? 1 : (leafQFromStart < -EPS ? 3 : 2));
+    }
+
+    return (leafQFromStart, terminalKind);
+  }
+
+
+  /// <summary>
+  /// Builds the sequence of node indices for an inner-node rollout, from the start node (index 0)
+  /// down to the leaf. The root-to-start-node prefix is excluded. A terminal-edge leaf contributes
+  /// no node (a terminal edge has no child node), so such a sequence ends at the deepest real node.
+  /// </summary>
+  /// <param name="path"></param>
+  /// <returns></returns>
+  private static NodeIndex[] BuildNodeSequenceBelowStart(MCGSPath path)
+  {
+    int startDepth = path.InnerSearchStartDepth;
+    List<NodeIndex> seq = new(Math.Max(1, path.numSlotsUsed - startDepth + 1));
+    seq.Add(path.InnerSearchStartNode.Index);   // index 0 is the start node itself
+    for (int i = startDepth; i < path.numSlotsUsed; i++)
+    {
+      GEdge edge = path.slots[i].ParentChildEdge;
+      if (edge.Type == GEdgeStruct.EdgeType.ChildEdge)
+      {
+        seq.Add(edge.ChildNode.Index);
+      }
+    }
+    return seq.ToArray();
+  }
+
+
+  /// <summary>
+  /// Invoked after each batch has been backed up, while this iterator still holds the
+  /// backup lock (so the graph is quiescent). When ParamsSearch.TestFlag is enabled,
+  /// performs a full bottom-up recomputation of every node's Q value and aggregates
+  /// statistics about the magnitude of the changes (see BottomUpQRecalculator).
+  /// </summary>
+  private void PostBackupRecomputeQIfEnabled()
+  {
+    switch (Manager.ParamsSearch.PostBackupQMode)
+    {
+      case ParamsSearch.PostBackupQModeType.FullRecompute:
+        Engine.QRecalculator.RunPass();
+        break;
+
+      case ParamsSearch.PostBackupQModeType.StaleDrain:
+        Engine.QPropagator.RunPass(PathsSet);
+        break;
+    }
   }
 
 
@@ -478,6 +698,12 @@ public class MCGSIterator : IDisposable
   /// <param name="hardMaxRootN"></param>
   private void PossiblyRunSecondSelectionForNNBatchSizePadding(int batchSize, int hardMaxRootN)
   {
+    if (Manager.ParamsSearch.Execution.NNBatchSizeFillToEvaluatorCapacity
+     && PossiblyRunSecondSelectionToFillEvaluatorCapacity(batchSize, hardMaxRootN))
+    {
+      return;
+    }
+
     int nnBatchSizeAlignmentTarget = Manager.ParamsSearch.Execution.NNBatchSizeAlignmentTarget;
 
     if (nnBatchSizeAlignmentTarget > 0)
@@ -520,6 +746,117 @@ public class MCGSIterator : IDisposable
         }
       }
     }
+  }
+
+
+  /// <summary>
+  /// Exponential moving average of the fraction of requested visits which result in a
+  /// path requiring NN evaluation (the remainder end in transpositions, terminals,
+  /// collisions etc.). Used to oversize the fill-to-capacity selection pass.
+  /// </summary>
+  float emaNNYieldPerVisit = 1.0f;
+
+  /// <summary>
+  /// Updates the running estimate of NN evaluations yielded per requested visit
+  /// (based on the outcome of the just-completed primary selection pass).
+  /// </summary>
+  /// <param name="numVisitsRequested"></param>
+  private void UpdateNNYieldEstimate(int numVisitsRequested)
+  {
+    const int MIN_BATCH_SIZE_FOR_ESTIMATE = 8; // tiny batches are too noisy
+    if (numVisitsRequested >= MIN_BATCH_SIZE_FOR_ESTIMATE)
+    {
+      const float EMA_ALPHA = 0.25f; // average over roughly the last few batches
+      float yield = Math.Clamp((float)PathsSet.NNPaths.Count / numVisitsRequested, 0.05f, 1.0f);
+      emaNNYieldPerVisit = (1.0f - EMA_ALPHA) * emaNNYieldPerVisit + EMA_ALPHA * yield;
+    }
+  }
+
+
+  /// <summary>
+  /// Possibly runs another selection pass thru the graph to top up the batch so the
+  /// number of positions sent to the NN evaluator fills the evaluator's padded batch
+  /// capacity (see NNEvaluator.PaddedBatchCapacity). The padding slots are computed by
+  /// the device regardless, so filling them with real positions is (nearly) free.
+  ///
+  /// Because some of the requested visits will not yield an NN evaluation (transpositions,
+  /// terminals, collisions), the request is oversized by the tracked NN yield ratio
+  /// (slightly conservatively). Overshoot beyond the evaluator capacity is prevented by
+  /// arming PathsSet.NNEvalSlotLimit: once the budget is reached, further descents
+  /// are aborted (in MCGSSelect.CapacityAbortNeeded) before any new node is expanded.
+  ///
+  /// Returns true if this method handled the batch (fill performed or not needed),
+  /// or false if the evaluator reported no padding (so the caller may fall back to
+  /// the divisor-based alignment logic).
+  /// </summary>
+  /// <param name="batchSize"></param>
+  /// <param name="hardMaxRootN"></param>
+  private bool PossiblyRunSecondSelectionToFillEvaluatorCapacity(int batchSize, int hardMaxRootN)
+  {
+    int numNNPaths = PathsSet.NNPaths.Count;
+    if (numNNPaths == 0 || IsApproachingMaxPathCapacity)
+    {
+      return true;
+    }
+
+    int capacity = EvaluatorNN.Evaluator.PaddedBatchCapacity(numNNPaths);
+    int numFiller = capacity - numNNPaths;
+    if (numFiller <= 0)
+    {
+      // Either already exactly at capacity or evaluator does not report padding.
+      return false;
+    }
+
+    int rootN = Engine.SearchRootNode.N;
+
+    // Quality guard: only fill when the tree is large relative to the filled batch
+    // (otherwise the extra visits would degrade selection quality via collisions).
+    if (rootN < 100 * capacity)
+    {
+      return true;
+    }
+
+    // Don't bother if the absolute number of filler positions is small
+    const int MIN_FILLER_FOR_EXTRA_SELECTION_PASS = 8;
+    if (numFiller < MIN_FILLER_FOR_EXTRA_SELECTION_PASS)
+    {
+      return true;
+    } 
+
+    // Oversize the request to compensate for visits which will not yield an NN evaluation,
+    // slightly conservatively (favor a small undershoot over overshoot).
+    const float OVERSIZE_CONSERVATISM = 0.75f;
+    const float MAX_OVERSIZE_MULTIPLIER = 2.5f;
+    float multiplier = Math.Clamp(OVERSIZE_CONSERVATISM / emaNNYieldPerVisit, 1.0f, MAX_OVERSIZE_MULTIPLIER);
+    int numVisitsToRequest = (int)(numFiller * multiplier);
+
+    // Respect the remaining node budget of the search.
+    int positionsBeforeHardBatchLimit = hardMaxRootN - (rootN + batchSize + Engine.numVisitsInFlight);
+    numVisitsToRequest = Math.Min(numVisitsToRequest, positionsBeforeHardBatchLimit);
+
+    // Respect maximum batch size (in terms of allocated paths).
+    numVisitsToRequest = Math.Min(numVisitsToRequest, Engine.Manager.ParamsSearch.Execution.MaxBatchSize - numAllocatedPaths);
+
+    if (numVisitsToRequest <= 0)
+    {
+      return true;
+    }
+
+    //Console.WriteLine(rootN + " " + batchSize + " " + numVisitsToRequest + " " + emaNNYieldPerVisit);
+
+    // Arm the NN slot budget so the oversized request cannot overshoot the capacity
+    // (descents are aborted once NNPaths reaches the limit), then run the fill pass.
+    PathsSet.NNEvalSlotLimit = capacity;
+    try
+    {
+      RunSelectionPhase(numAllocatedPaths + numVisitsToRequest);
+    }
+    finally
+    {
+      PathsSet.NNEvalSlotLimit = int.MaxValue;
+    }
+
+    return true;
   }
 
 
@@ -720,10 +1057,26 @@ public class MCGSIterator : IDisposable
 
 
   /// <summary>
-  /// Executes the backup phase for the current set of paths using the specified backup mode. 
+  /// Applies the deferred ledger backouts for visits dropped during the select phase
+  /// (see MCGSPathsSet.PendingDroppedVisits). Must run before any path backup so the
+  /// merge counters at shared ancestor visits reflect only the visits actually carried.
+  /// </summary>
+  internal void ApplyPendingDroppedVisits()
+  {
+    while (PathsSet.PendingDroppedVisits.TryDequeue(out (MCGSPath path, int numSlotsUsed, int numVisits) drop))
+    {
+      MCGSSelect.ApplyDroppedVisits(drop.path, drop.numSlotsUsed, drop.numVisits);
+    }
+  }
+
+
+  /// <summary>
+  /// Executes the backup phase for the current set of paths using the specified backup mode.
   /// </summary>
   void RunBackupPhase()
   {
+    ApplyPendingDroppedVisits();
+
 #if DEBUG
     foreach (MCGSPath path in PathsSet.Paths)
     {

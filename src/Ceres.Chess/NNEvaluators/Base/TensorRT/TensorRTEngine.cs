@@ -220,6 +220,31 @@ public sealed class TensorRTEngine : IDisposable
 
 
   /// <summary>
+  /// Creates a new TensorRTEngine whose execution context SHARES the already-deserialized
+  /// native engine (weights) owned by <paramref name="reference"/>, rather than deserializing
+  /// the engine again. The clone gets its own execution context / streams / GPU buffers, so it
+  /// can be used concurrently with the reference. The underlying engine is ref-counted natively
+  /// and freed only once the reference and all clones are disposed (disposal order independent).
+  /// </summary>
+  public static TensorRTEngine CloneSharingEngine(TensorRTEngine reference, int deviceId)
+  {
+    if (reference == null)
+    {
+      throw new ArgumentNullException(nameof(reference));
+    }
+
+    int result = TensorRTNative.CloneContextSharingEngine(reference.handle, deviceId, out IntPtr newHandle);
+    if (result != 0 || newHandle == IntPtr.Zero)
+    {
+      string error = TensorRTNative.GetLastErrorString();
+      throw new InvalidOperationException($"Failed to clone shared engine context ({result}): {error ?? "unknown error"}");
+    }
+
+    return new TensorRTEngine(newHandle, reference.BatchSize, reference.SourcePath, wasLoadedFromCache: true);
+  }
+
+
+  /// <summary>
   /// Load a pre-built multi-profile engine file (.engine) directly.
   /// Deserializes the engine and creates N execution contexts, one per batch size.
   /// Bypasses ONNX parsing and cache validation — useful for loading
@@ -809,9 +834,14 @@ public sealed class TensorRTEngine : IDisposable
   /// Synchronizes the specified CUDA stream, blocking until all operations complete.
   /// </summary>
   /// <param name="streamIdx">Stream index (0 or 1)</param>
-  public void SyncStream(int streamIdx)
+  /// <summary>
+  /// Waits for the given stream's work to complete. <paramref name="count"/> is the per-GPU
+  /// batch size being synced; the native layer uses it to pick spin vs block sync in "auto"
+  /// mode (spin for small batches where the wakeup latency dominates, block otherwise).
+  /// </summary>
+  public void SyncStream(int streamIdx, int count)
   {
-    int result = TensorRTNative.SyncStreamIdx(handle, streamIdx);
+    int result = TensorRTNative.SyncStreamIdx(handle, streamIdx, count);
     if (result != 0)
     {
       throw new InvalidOperationException($"SyncStreamIdx failed on stream {streamIdx}");

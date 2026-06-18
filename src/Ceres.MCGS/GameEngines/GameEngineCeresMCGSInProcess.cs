@@ -35,6 +35,7 @@ using Ceres.Chess.Positions;
 using Ceres.Chess.SearchResultVerboseMoveInfo;
 using Ceres.Chess.UserSettings;
 
+using Ceres.MCGS.Analysis;
 using Ceres.MCGS.UCI;
 
 using Ceres.MCGS.Graphs;
@@ -84,6 +85,11 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   /// Search in progress or last concluded, if any.
   /// </summary>
   public MCGSSearch Search;
+
+  /// <summary>
+  /// The result of the most recently completed search (used for post-hoc diagnostic dumps).
+  /// </summary>
+  public GameEngineSearchResultCeresMCGS LastSearchResult { get; private set; }
 
   /// <summary>
   /// Optional name of file to which detailed log information 
@@ -136,8 +142,6 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   /// </summary>
   public NNEvaluatorSet Evaluators { get; private set; }
 
-
-  readonly BestMoveInfoMCGS lastBestMoveInfo;
 
   readonly Action<string> InfoLogger;
 
@@ -406,9 +410,11 @@ public class GameEngineCeresMCGSInProcess : GameEngine
     // TODO is the RootNWhenSearchStarted correct because we may be following a continuation (BestMoveRoot)
     string moveStr = bestMoveMG.MoveStr(MGMoveNotationStyle.Coordinates);
     scoreCeresCP = (int)MathF.Round(EncodedEvalLogistic.WinLossToCentipawn(bestMoveInfo.QOfBest), 0);
-    int eps = 0;
+    // Evaluations per second (neural network position evaluations) made during this search.
+    int eps = searchTimingStats.ElapsedTimeSecs > 0
+            ? (int)MathF.Round(Search.Manager.NumEvalsThisSearch / (float)searchTimingStats.ElapsedTimeSecs)
+            : 0;
     int depth = 0;
-    //this..NumEvalsThisSearch / elapsedTimeSeconds; // positions evaluated per second
 
     GameEngineSearchResultCeresMCGS result = new(Search, moveStr, bestMoveMG, (float)Search.Manager.Engine.SearchRootNode.Q, bestMoveInfo.QOfBest,
                                                  scoreCeresCP, 0,
@@ -416,6 +422,32 @@ public class GameEngineCeresMCGSInProcess : GameEngine
                                                  Search.StartSearchN, Search.Manager.Engine.SearchRootNode.N,
                                                  eps, depth,
                                                  bestMoveInfo, Search.Manager.Engine.Graph.RatioVisitsToNodes);
+
+    // Retain the most recent search result so diagnostics can be dumped post-hoc (e.g. blunder analysis).
+    LastSearchResult = result;
+
+    // If configured, always emit the full search info dump after every completed search. This lives
+    // at the GameEngine level (below UCI) so it happens for ALL callers -- UCI, tournaments, suites,
+    // and direct programmatic searches -- exactly as if the "dump-info" command had been issued.
+    if (MCGSParamsFixed.ALWAYS_DUMP_SEARCH_INFO)
+    {
+      result.Search.Manager.DumpFullInfo(result, Console.Out, "AUTO");
+
+      // Also run and display a revaluation analysis, exactly as if a "revalue-root N" command
+      // had been issued with N scaled to the search size. Analysis only (the best move above is
+      // already final); note the rollout visits do grow the graph, like any deep-rollout command.
+      MCGSManager revalManager = result.Search.Manager;
+      int revalRoundsPerStage = Math.Max(1, revalManager.Engine.SearchRootNode.N / 20);
+      PrincipalRevaluationResult reval = PrincipalRevaluation.Run(revalManager, revalRoundsPerStage);
+      PrincipalRevaluationDumper.DumpToConsole(reval, bestMoveMG);
+
+      // Purely informational: report whether the rollout evidence would prefer a different move.
+      RevaluationSwitchDecision revalDecision = PrincipalRevaluation.CalcBlendedQSwitchDecision(
+          revalManager, revalManager.Engine.SearchRootNode, bestMoveInfo, reval);
+      Console.WriteLine(revalDecision.WouldSwitch
+        ? $"info string reval decision: rollout evidence would prefer {revalDecision.CandidateMove} over {revalDecision.BaselineMove} ({revalDecision.Description})"
+        : $"info string reval decision: rollout evidence keeps {revalDecision.BaselineMove} ({revalDecision.Description})");
+    }
 
     // Append search result information to log file (if any).
     StringWriter dumpInfo = new();
@@ -432,7 +464,7 @@ public class GameEngineCeresMCGSInProcess : GameEngine
 
     if (GatherVerboseMoveStats)
     {
-      result.VerboseMoveStats = GetVerboseMoveStats();
+      result.VerboseMoveStats = GetVerboseMoveStats(result.BestMoveInfo);
     }
 
     if (OutputVerboseMoveStats)
@@ -442,6 +474,23 @@ public class GameEngineCeresMCGSInProcess : GameEngine
     }
 
     return result;
+  }
+
+
+  /// <summary>
+  /// Dumps detailed diagnostics about the most recently completed search to the specified writer.
+  /// Returns false if no search has yet completed for this engine.
+  /// </summary>
+  public override bool TryDumpLastSearchDiagnostics(TextWriter writer, string description)
+  {
+    GameEngineSearchResultCeresMCGS result = LastSearchResult;
+    if (result?.Search?.Manager == null)
+    {
+      return false;
+    }
+
+    result.Search.Manager.DumpFullInfo(result, writer, description);
+    return true;
   }
 
 
@@ -599,14 +648,14 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   /// Returns list of verbose move statistics pertaining to current search root node.
   /// </summary>
   /// <returns></returns>
-  public List<VerboseMoveStat> GetVerboseMoveStats()
+  public List<VerboseMoveStat> GetVerboseMoveStats(BestMoveInfoMCGS bestMoveInfo)
   {
     if (Search == null)
     {
       throw new Exception("GetVerboseMoveStats cannot return search statistics because no search has run yet.");
     }
 
-    return VerboseMoveStatsFromMCGSNode.BuildStats(Search.Manager, lastBestMoveInfo);
+    return VerboseMoveStatsFromMCGSNode.BuildStats(Search.Manager, bestMoveInfo);
   }
 
 

@@ -16,6 +16,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Numerics;
 using System.Runtime.InteropServices;
@@ -98,9 +99,15 @@ namespace Ceres.Chess.NNEvaluators
       /// </summary>
       public readonly long NumParameters;
 
-      public EvaluatorInfo(long numParameters)
+      /// <summary>
+      /// Size in bytes of the underlying network file (0 if unknown).
+      /// </summary>
+      public readonly long NetworkFileSizeBytes;
+
+      public EvaluatorInfo(long numParameters, long networkFileSizeBytes = 0)
       {
         NumParameters = numParameters;
+        NetworkFileSizeBytes = networkFileSizeBytes;
       }
     }
 
@@ -252,6 +259,16 @@ namespace Ceres.Chess.NNEvaluators
     public abstract int MaxBatchSize { get; }
 
     /// <summary>
+    /// Returns the total number of position slots that would actually be computed
+    /// (including any internal padding up to fixed engine batch sizes) when evaluating
+    /// a batch with the specified number of positions.
+    /// Since padding slots are computed regardless, callers can fill them with
+    /// additional real positions at no additional evaluation cost.
+    /// Default implementation returns numPositions (no padding).
+    /// </summary>
+    public virtual int PaddedBatchCapacity(int numPositions) => numPositions;
+
+    /// <summary>
     /// When true and playing using SearchLimit of BestValueMove, engine using this evaluator 
     /// will slightly adjust evaluation when repetitions are nonzero to prefer repetitions/draws
     /// when seemingly losing and disfavor when seemingly winning.
@@ -268,6 +285,18 @@ namespace Ceres.Chess.NNEvaluators
     /// Miscellaneous information about the evaluator.
     /// </summary>
     public virtual EvaluatorInfo Info => null;
+
+    /// <summary>
+    /// Number of distinct compute devices over which this evaluator's work is spread.
+    /// </summary>
+    public virtual int NumDevices => 1;
+
+    /// <summary>
+    /// Returns the size in bytes of the specified file,
+    /// or 0 if the path is null or the file does not exist.
+    /// </summary>
+    protected static long FileSizeBytesOrZero(string fileName)
+      => fileName != null && File.Exists(fileName) ? new FileInfo(fileName).Length : 0;
 
     /// <summary>
     /// If the raw neural network outputs should be retained.

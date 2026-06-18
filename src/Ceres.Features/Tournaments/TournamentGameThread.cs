@@ -31,6 +31,8 @@ using Ceres.MCTS.Iteration;
 using Ceres.Chess.MoveGen;
 using Ceres.Chess.MoveGen.Converters;
 using Ceres.MCTS.GameEngines;
+using Ceres.Base.Misc;
+using Ceres.Features.Tournaments.Streaming;
 
 #endregion
 
@@ -73,7 +75,20 @@ namespace Ceres.Features.Tournaments
       }
 
       Run = new TournamentGameRunner(Def);
+
+      // Register with the (per-tournament) shared stats object so that all sibling threads
+      // can be polled for their pair-completion state when deciding whether to emit "*".
+      lock (parentTestResults.GameThreads) parentTestResults.GameThreads.Add(this);
     }
+
+
+    /// <summary>
+    /// True if this thread's most recently output game was the second (completing) game of a
+    /// pair. Written and read only while holding outputLockObj, which serializes all game-result
+    /// output across threads. Used to flag the moments when every thread is simultaneously at a
+    /// pair boundary (see OutputGameResultInfo).
+    /// </summary>
+    bool lastOutputCompletedPair = false;
 
 
     static PositionsWithHistory openings = new PositionsWithHistory();
@@ -91,9 +106,32 @@ namespace Ceres.Features.Tournaments
 
     public TournamentGameRunner Run;
 
+    /// <summary>
+    /// Stable 0-based index identifying this game thread within the tournament (used to tag
+    /// live streaming events so subscribers can watch a specific concurrent game thread).
+    /// </summary>
+    public int ThreadIndex { get; private set; }
+
     public void RunGameTests(int runnerIndex, Func<int, int> getGamePairToProcess,
                              Action<TournamentGameInfo, TournamentGameInfo> doneGamePairCallback = null)
     {
+      ThreadIndex = runnerIndex;
+
+      // Verbose move-stat gathering (needed for per-move WDL and top-move/TopQ data) carries some
+      // overhead, so only enable it once a client is actually watching: register a callback that the
+      // streaming publisher invokes on the first client connection (and never, if no one connects).
+      // When streaming is disabled the Observer is null and this is a no-op (zero overhead).
+      Def.parentDef.Observer?.RegisterOnFirstClient(() =>
+      {
+        foreach (GameEngine engine in Run.Engines)
+        {
+          if (engine is GameEngineCeresInProcess ceresEngine)
+          {
+            ceresEngine.GatherVerboseMoveStats = true;
+          }
+        }
+      });
+
       // Create a file name that will be common to all threads in tournament.
       string pgnFileName;
       if (Run.Engines.Length > 2)
@@ -397,9 +435,40 @@ namespace Ceres.Features.Tournaments
       string engine1ID = engine2White ? thisResult.PlayerBlack : thisResult.PlayerWhite;
       string engine2ID = engine2White ? thisResult.PlayerWhite : thisResult.PlayerBlack;
 
+      bool shutDownRequested = false;
+
+      // Pentanomial (paired-game) result for the running display, computed under the statistics
+      // lock since the underlying accumulation arrays are mutated by other threads under that lock.
+      // Perspective matches OutputGameResultInfo's 'player' (the engine playing White this game).
+      PentanomialResult penta;
       lock (ParentStats)
       {
         ParentStats.UpdateTournamentStats(thisResult, engine1ID, engine2ID);
+
+        // Record this game in the overall list (performed under the lock since
+        // multiple threads may be recording game results concurrently).
+        ParentStats.GameInfos.Add(thisResult);
+
+        penta = ParentStats.PentanomialFor(thisResult.PlayerWhite, thisResult.PlayerBlack);
+
+        // Notify any registered per-game callback that a game has been processed,
+        // passing the results accumulated so far. The callback runs while holding the
+        // statistics lock so the stats it observes remain stable for the duration of the call.
+        // A return value of true requests that the tournament begin an orderly shutdown.
+        Func<TournamentResultStats, bool> perGameCallback = Def.parentDef.PerGameCallback;
+        if (perGameCallback != null)
+        {
+          shutDownRequested = perGameCallback(ParentStats);
+        }
+      }
+
+      // Notify any live-streaming observer that this game has finished (drives the per-thread
+      // end frame and the tournament-global result used for standings/crosstable).
+      Def.parentDef.Observer?.OnGameEnd(ThreadIndex, DtoMappers.ToGameEnd(thisResult));
+
+      if (shutDownRequested)
+      {
+        Def.parentDef.ShouldShutDown = true;
       }
 
       // Only show headers first time for first thread
@@ -408,30 +477,104 @@ namespace Ceres.Features.Tournaments
         OutputHeaders(pgnFileName);
       }
 
-      OutputGameResultInfo(engine2White, openingIndex, gameSequenceNum, engine1ID, engine2ID, thisResult);
+      OutputGameResultInfo(engine2White, openingIndex, gameSequenceNum, engine1ID, engine2ID, thisResult, penta);
     }
+
+
+    /// <summary>
+    /// Returns true if the three most recent moves indicate the opponent blundered: the moving
+    /// engine's evaluation improved by more than cpThreshold since its prior move, and the node
+    /// counts (N) of the moving engine's current and prior moves and the intervening opponent
+    /// move are all at least thresholdN.
+    /// </summary>
+    /// <param name="cur">Moving engine's current move.</param>
+    /// <param name="opp">Opponent's intervening move.</param>
+    /// <param name="prev">Moving engine's prior move.</param>
+    /// <param name="thresholdN">Minimum N required for all three moves.</param>
+    /// <param name="cpThreshold">Minimum centipawn improvement required to trigger.</param>
+    /// <param name="improvement">Centipawn improvement since the moving engine's prior move.</param>
+    internal static bool IsBlunderCondition(GameMoveStat cur, GameMoveStat opp, GameMoveStat prev,
+                                            int thresholdN, float cpThreshold, out float improvement)
+    {
+      // cur and prev are both by the moving engine (same color), so their evaluations
+      // (each from the moving engine's perspective) are directly comparable.
+      improvement = cur.ScoreCentipawns - prev.ScoreCentipawns;
+      return improvement > cpThreshold
+          && cur.FinalN >= thresholdN
+          && prev.FinalN >= thresholdN
+          && opp.FinalN >= thresholdN;
+    }
+
+    /// <summary>
+    /// Checks whether the opponent just blundered (based on the moving engine's evaluation swing
+    /// and the search depths of the relevant moves) and, if so and the opponent is a Ceres MCGS
+    /// in-process engine, dumps the opponent's search graph diagnostics to a "blunder_info_NNN.txt"
+    /// file in the current working directory (overwriting any existing file of the same name).
+    /// </summary>
+    private void CheckForBlunderDump(int gameSequenceNum, List<GameMoveStat> gameMoveHistory, GameEngine movingEngine,
+                                     GameEngine opponentEngine, string opponentBlunderMoveStr)
+    {
+      if (gameMoveHistory.Count < 3)
+      {
+        return;
+      }
+
+      GameMoveStat cur = gameMoveHistory[^1];   // moving engine's current move
+      GameMoveStat opp = gameMoveHistory[^2];   // opponent's intervening move
+      GameMoveStat prev = gameMoveHistory[^3];  // moving engine's prior move
+
+      if (!IsBlunderCondition(cur, opp, prev, Def.BlunderDumpThresholdN, Def.BlunderDumpThresholdCentipawns, out float improvement))
+      {
+        return;
+      }
+
+      string header = $"Engine {movingEngine.ID} detected {improvement:F0}cp improvement since last move, "
+                    + $"diagnostic dump of opponent engine {opponentEngine.ID} follows "
+                    + $"(move actually played was {opponentBlunderMoveStr}) in game {gameSequenceNum}.";
+
+      // Buffer the dump first so nothing is written for opponents that cannot be dumped
+      // (e.g. not a Ceres MCGS in-process engine, or no completed search yet).
+      StringWriter dump = new StringWriter();
+      if (!opponentEngine.TryDumpLastSearchDiagnostics(dump, "UCI"))
+      {
+        return;
+      }
+
+      string fileName = $"blunder_info_{Random.Shared.Next(1000):000}.txt";
+      string fullPath = Path.Combine(Directory.GetCurrentDirectory(), fileName);
+      File.WriteAllText(fullPath, header + Environment.NewLine + Environment.NewLine + dump.ToString());
+
+      ConsoleUtils.WriteLineColored(ConsoleColor.Red, $"BLUNDER: engine {opponentEngine.ID} position worse by {improvement:F0}cp, dumped to {fullPath}");
+    }
+
 
     private void OutputGameResultInfo(bool engine2White, int openingIndex, int gameSequenceNum,
                                       string engineID, string opponentID,
-                                      TournamentGameInfo thisResult)
+                                      TournamentGameInfo thisResult, PentanomialResult penta)
     {
       string engine1ID = engine2White ? thisResult.PlayerBlack : thisResult.PlayerWhite;
       string engine2ID = engine2White ? thisResult.PlayerWhite : thisResult.PlayerBlack;
 
-      ParentStats.GameInfos.Add(thisResult);
+      // Note: thisResult was already added to ParentStats.GameInfos (under the statistics lock)
+      // in UpdateStatsAndOutputSummaryFromGameResult before this method was called.
 
       PlayerStat player = engine2White ?
         ParentStats.GetPlayer(opponentID, engineID) :
         ParentStats.GetPlayer(engineID, opponentID);
 
       float gNumber = NumGames + 1;
-      (float eloMin, float eloAvg, float eloMax) = EloCalculator.EloConfidenceInterval(player.PlayerWins, player.Draws, player.PlayerLosses);
-      float eloSD = eloMax - eloAvg;
-      float los = EloCalculator.LikelihoodSuperiority(player.PlayerWins, player.Draws, player.PlayerLosses);
+      // Elo point estimate from the trinomial mean (identical to the pentanomial mean);
+      // the +/- error bar and LOS shown below use pentanomial (paired-game) analysis.
+      (_, float eloAvg, _) = EloCalculator.EloConfidenceInterval(player.PlayerWins, player.Draws, player.PlayerLosses);
+
+      // Pentanomial +/- and LOS are undefined until the first pair completes (they advance
+      // on the second game of each pair); show a placeholder until then.
+      string pentaErrStr = penta.NumPairs == 0 ? "----" : penta.EloErrorMargin.ToString("0");
+      string pentaLOSStr = penta.NumPairs == 0 ? "----" : (100.0f * penta.LOS).ToString("0");
 
       string wdlStr = $"{player.PlayerWins,3} {player.Draws,3} {player.PlayerLosses,3}";
 
-      // Show a either = or ! (same game or differing moves) after the opening index
+      // Show either = or ! (same game or differing moves) after the opening index
       // if this was the second of the pair of games played.
       string openingPlayedBothWaysStr = " ";
       bool wasSecondOfPair = gameSequenceNum % 2 == 1
@@ -490,6 +633,27 @@ namespace Ceres.Features.Tournaments
 
       lock (outputLockObj)
       {
+        // Update this thread's pair-completion state, then (if this game completed a pair) check
+        // whether every participating thread's most recently output game also completed a pair.
+        // If so, all threads are simultaneously at a pair boundary -- a point at which the running
+        // Elo reflects only fully completed pairs -- so flag it with "*" in the dedicated column
+        // immediately to the right of the ELO column (the "="/"!" OP# marker is left untouched).
+        // All reads/writes of lastOutputCompletedPair are serialized by outputLockObj (held here).
+        lastOutputCompletedPair = wasSecondOfPair;
+        string allThreadsPairBoundaryStr = " ";
+        if (wasSecondOfPair)
+        {
+          bool allThreadsAtPairBoundary;
+          lock (ParentStats.GameThreads)
+          {
+            allThreadsAtPairBoundary = ParentStats.GameThreads.TrueForAll(t => t.lastOutputCompletedPair);
+          }
+          if (allThreadsAtPairBoundary)
+          {
+            allThreadsPairBoundaryStr = "*";
+          }
+        }
+
         string checkEnginePlyDifferent = thisResult.NumEngine2MovesDifferentFromCheckEngine == 0 ? "   " : $"{thisResult.NumEngine2MovesDifferentFromCheckEngine,3:N0}";
         if (Def.ShowGameMoves) Def.Logger.WriteLine();
         if (engine2White)
@@ -500,19 +664,25 @@ namespace Ceres.Features.Tournaments
         {
           Def.Logger.Write($" {TrimmedIfNeeded(engine1ID, 10),-10} {TrimmedIfNeeded(engine2ID, 10),-10}");
         }
-        Def.Logger.Write($"{eloAvg,4:0} {eloSD,4:0} {100.0f * los,5:0}  ");
+        Def.Logger.Write($"{eloAvg,4:0} {allThreadsPairBoundaryStr,1} {pentaErrStr,4} {pentaLOSStr,5}  ");
         Def.Logger.Write($"{gNumber,5} {DateTime.Now.ToString().Split(" ")[1],10}  {gameSequenceNum,7:F0}  {openingIndex,7:F0} {openingPlayedBothWaysStr} ");
 
         // TODO: these averages are inexact, one player may have 1 ply more than thisResult.PlyCount/2
         int avgNodesPerMovePlayer1 = (int)MathF.Round(thisResult.TotalNodesEngine1 / (thisResult.PlyCount / 2), 0);
         int avgNodesPerMovePlayer2 = (int)MathF.Round(thisResult.TotalNodesEngine2 / (thisResult.PlyCount / 2), 0);
+
+        // Evaluations per second for each player this game (blank when the engine did not report EPS).
+        string epsPlayer1Str = (thisResult.TotalEvaluationsEngine1 > 0 && thisResult.TotalTimeEngine1 > 0)
+                             ? MathF.Round(thisResult.TotalEvaluationsEngine1 / thisResult.TotalTimeEngine1).ToString("N0") : "";
+        string epsPlayer2Str = (thisResult.TotalEvaluationsEngine2 > 0 && thisResult.TotalTimeEngine2 > 0)
+                             ? MathF.Round(thisResult.TotalEvaluationsEngine2 / thisResult.TotalTimeEngine2).ToString("N0") : "";
         if (engine2White)
         {
           Def.Logger.Write($"{thisResult.TotalTimeEngine2,8:F2}{player2ForfeitChar}{thisResult.RemainingTimeEngine2,7:F2} ");
           Def.Logger.Write($"{thisResult.TotalTimeEngine1,8:F2}{player1ForfeitChar}{thisResult.RemainingTimeEngine1,7:F2}  ");
           // Def.Logger.Write($"{thisResult.TotalTimeEngine2,8:F2}{player2ForfeitChar}{thisResult.RemainingTimeEngine2,7:F2}  {thisResult.TimeAggressivenessRatio(true),5:F2} ");
           // Def.Logger.Write($"{thisResult.TotalTimeEngine1,8:F2}{player1ForfeitChar}{thisResult.RemainingTimeEngine1,7:F2}  {thisResult.TimeAggressivenessRatio(false),5:F2}  ");
-          Def.Logger.Write($"{avgNodesPerMovePlayer2,12:N0} {avgNodesPerMovePlayer1,12:N0}   ");
+          Def.Logger.Write($"{avgNodesPerMovePlayer2,12:N0} {avgNodesPerMovePlayer1,12:N0}  {epsPlayer2Str,7} {epsPlayer1Str,7}   ");
         }
         else
         {
@@ -521,7 +691,7 @@ namespace Ceres.Features.Tournaments
           // Def.Logger.Write($"{thisResult.TotalTimeEngine1,8:F2}{player1ForfeitChar}{thisResult.RemainingTimeEngine1,7:F2}  {thisResult.TimeAggressivenessRatio(true),5:F2} ");
           // Def.Logger.Write($"{thisResult.TotalTimeEngine2,8:F2}{player2ForfeitChar}{thisResult.RemainingTimeEngine2,7:F2}  {thisResult.TimeAggressivenessRatio(false),5:F2}  ");
 
-          Def.Logger.Write($"{avgNodesPerMovePlayer1,12:N0} {avgNodesPerMovePlayer2,12:N0}   ");
+          Def.Logger.Write($"{avgNodesPerMovePlayer1,12:N0} {avgNodesPerMovePlayer2,12:N0}  {epsPlayer1Str,7} {epsPlayer2Str,7}   ");
         }
 
 
@@ -592,17 +762,48 @@ namespace Ceres.Features.Tournaments
       Def.Logger.WriteLine();
       Def.Logger.WriteLine($"Games will be incrementally written to file: {pgnFileName}");
       Def.Logger.WriteLine("Result codes: C=checkmate S=stalemate T=tablebase M=insufficient material E=excessive moves R=draw by repetition A=adjudicate eval agreement F=time forfeit");
+      Def.Logger.WriteLine("Note: the +/- and LOS columns use pentanomial (paired-game) analysis (shown once each game pair completes).");
+      Def.Logger.WriteLine("Pair marker (after OP#): = pair completed with identical moves, ! pair completed with differing moves.");
+      Def.Logger.WriteLine("The * column (immediately right of ELO) marks games output at the instant every thread is simultaneously at a completed-pair boundary (a fair Elo evaluation point).");
       Def.Logger.WriteLine();
+
+      // Build the header (and dashed underline) so each label sits over its data column
+      // (the field widths/separators here mirror exactly those emitted in OutputGameResultInfo).
+      // The prefix through the EPS2 column is identical for both variants; only the PLY/DIF/RES
+      // portion of the tail differs (the check variant adds the DIF column).
+      static string Dsh(int n) => new string('-', n);
+
+      string headerPrefix =
+          $" {"Player1",-10} {"Player2",-10}" +
+          $"{"ELO",4} {"*",1} {"+/-",4} {"LOS",5}  " +
+          $"{"GAME#",5} {"TIME",10}  {"TH#",7}  {"OP#",7} {"",1} " +
+          $"{"TIME1",8} {"REM1",7} " +
+          $"{"TIME2",8} {"REM2",7}  " +
+          $"{"AVG NODE1",12} {"AVG NODE2",12}  {"EPS1",7} {"EPS2",7}   ";
+      string headerTail =
+          $" {"R",1}   {"ENDCP",5}  " +
+          $" {"W",3} {"D",3} {"L",3}   FEN";
+
+      string dashPrefix =
+          $" {Dsh(10),-10} {Dsh(10),-10}" +
+          $"{Dsh(4),4} {Dsh(1),1} {Dsh(4),4} {Dsh(5),5}  " +
+          $"{Dsh(5),5} {Dsh(10),10}  {Dsh(7),7}  {Dsh(7),7} {Dsh(1),1} " +
+          $"{Dsh(8),8} {Dsh(7),7} " +
+          $"{Dsh(8),8} {Dsh(7),7}  " +
+          $"{Dsh(12),12} {Dsh(12),12}  {Dsh(7),7} {Dsh(7),7}   ";
+      string dashTail =
+          $" {Dsh(1),1}   {Dsh(5),5}  " +
+          $" {Dsh(3),3} {Dsh(3),3} {Dsh(3),3}   {Dsh(51)}";
 
       if (Def.CheckPlayer2Def != null)
       {
-        Def.Logger.WriteLine(" Player1     Player2    ELO  +/-   LOS  GAME#       TIME      TH#      OP#     TIME1    REM1    TIME2    REM2    AVG NODE2    PLY  DIF  RES   R   ENDCP     W   D   L   FEN");
-        Def.Logger.WriteLine(" ----------  ---------- ---- ---- ----- -----  ----------  -------  -------  -------- ------- -------- -------  ------------  ---- ---  ----  -   -----     -   -   -   ---------------------------------------------------");
+        Def.Logger.WriteLine(headerPrefix + $"{"PLY",4}  {"DIF",3}  {"RES",4}  " + headerTail);
+        Def.Logger.WriteLine(dashPrefix + $"{Dsh(4),4}  {Dsh(3),3}  {Dsh(4),4}  " + dashTail);
       }
       else
       {
-        Def.Logger.WriteLine(" Player1     Player2    ELO  +/-   LOS  GAME#       TIME      TH#      OP#     TIME1    REM1    TIME2    REM2     AVG NODE1     AVG NODE2   PLY  RES   R   ENDCP     W   D   L   FEN");
-        Def.Logger.WriteLine(" ----------  ---------- ---- ---- ----- -----  ----------  -------  -------  -------- ------- -------- -------   ------------  ------------  ----  ----  -   -----     -   -   -   ---------------------------------------------------");
+        Def.Logger.WriteLine(headerPrefix + $"{"PLY",4}  {"RES",4}  " + headerTail);
+        Def.Logger.WriteLine(dashPrefix + $"{Dsh(4),4}  {Dsh(4),4}  " + dashTail);
       }
       havePrintedHeaders = true;
     }
@@ -659,6 +860,11 @@ namespace Ceres.Features.Tournaments
         pgnWriter.WriteMove(MGMoveConverter.MGMoveFromPosAndMove(in move.Position, move.Move), in move.Position);
       }
 
+      // Notify any live-streaming observer that a new game has started on this thread.
+      Def.parentDef.Observer?.OnGameStart(ThreadIndex,
+          DtoMappers.ToGameStart(gameSequenceNum, openingIndex, engine1, engine2, engine2IsWhite,
+                                 searchLimitEngine1, searchLimitEngine2, startFEN, curPositionAndMoves, null));
+
       GameMoveConsoleInfo info = new GameMoveConsoleInfo();
 
       int plyCount = 1;
@@ -668,11 +874,16 @@ namespace Ceres.Features.Tournaments
       long visitsEngine2Tot = 0;
       long nodesEngine1Tot = 0;
       long nodesEngine2Tot = 0;
+      long evalsEngine1Tot = 0;
+      long evalsEngine2Tot = 0;
       int movesEngine1 = 0;
       int movesEngine2 = 0;
       bool engine1ShouldHaveForfieted = false;
       bool engine2ShouldHaveForfieted = false;
       int numNodesForcedDeterministic = 0;
+
+      // Most recent move string played (used by blunder detection to report the opponent's prior move).
+      string lastPlayedMoveStr = null;
       int numEngine2MovesDifferentFromCheckEngine = 0;
 
       List<float> scoresEngine1 = new List<float>();
@@ -708,6 +919,8 @@ namespace Ceres.Features.Tournaments
           TotalTimeEngine2 = timeEngine2Tot,
           TotalNodesEngine1 = nodesEngine1Tot,
           TotalNodesEngine2 = nodesEngine2Tot,
+          TotalEvaluationsEngine1 = evalsEngine1Tot,
+          TotalEvaluationsEngine2 = evalsEngine2Tot,
           NumMovesForcedDeterministic = numNodesForcedDeterministic,
           RemainingTimeEngine1 = RemainingTime(searchLimitEngine1, movesEngine1, timeEngine1Tot),
           RemainingTimeEngine2 = RemainingTime(searchLimitEngine2, movesEngine2, timeEngine2Tot),
@@ -815,7 +1028,7 @@ namespace Ceres.Features.Tournaments
         {
           info = DoMove(engine2, engineCheckAgainstEngine2,
                         gameMoveHistory, searchLimitWithIncrementsEngine2, scoresEngine2,
-                        ref nodesEngine2Tot, ref visitsEngine2Tot, ref timeEngine2Tot, ref numNodesForcedDeterministic);
+                        ref nodesEngine2Tot, ref visitsEngine2Tot, ref timeEngine2Tot, ref evalsEngine2Tot, ref numNodesForcedDeterministic);
           movesEngine2++;
 
           if (engine2IsWhite)
@@ -833,7 +1046,7 @@ namespace Ceres.Features.Tournaments
         {
           info = DoMove(engine1, null,
                         gameMoveHistory, searchLimitWithIncrementsEngine1, scoresEngine1,
-                        ref nodesEngine1Tot, ref visitsEngine1Tot, ref timeEngine1Tot, ref numNodesForcedDeterministic);
+                        ref nodesEngine1Tot, ref visitsEngine1Tot, ref timeEngine1Tot, ref evalsEngine1Tot, ref numNodesForcedDeterministic);
           movesEngine1++;
           if (engine2IsWhite)
           {
@@ -850,6 +1063,16 @@ namespace Ceres.Features.Tournaments
         moveStat.Id = engine2ToMove ? engine2.ID : engine1.ID;
         gameMoveHistory.Add(moveStat);
 
+        // Possibly detect a blunder by the opponent (whose move was the prior ply) and dump its
+        // search graph for diagnosis. lastPlayedMoveStr currently holds the opponent's prior move.
+        if (Def.BlunderDumpThresholdN != 0)
+        {
+          GameEngine movingEngine = engine2ToMove ? engine2 : engine1;
+          GameEngine opponentEngine = engine2ToMove ? engine1 : engine2;
+          CheckForBlunderDump(gameSequenceNum, gameMoveHistory, movingEngine, opponentEngine, lastPlayedMoveStr);
+        }
+        lastPlayedMoveStr = moveStat.Side == SideType.White ? info.WhiteMoveStr : info.BlackMoveStr;
+
         engine2ToMove = !engine2ToMove;
         if (plyCount % 2 == 1)
         {
@@ -864,6 +1087,7 @@ namespace Ceres.Features.Tournaments
                                  List<GameMoveStat> gameMoveHistory,
                                  SearchLimit searchLimit, List<float> scoresCP,
                                  ref long totalNodesUsed, ref long totalVisitsUsed, ref float totalTimeUsed,
+                                 ref long totalEvalsUsed,
                                  ref int numNodesForcedDeterministic)
       {
         SearchLimit thisMoveSearchLimit = searchLimit.Type switch
@@ -978,6 +1202,13 @@ namespace Ceres.Features.Tournaments
         totalNodesUsed += engineMove.FinalN;
         totalVisitsUsed += engineMove.Visits;
         totalTimeUsed += engineTime;
+
+        // Accumulate neural network evaluations for this move (only where the engine reports EPS).
+        // EPS is a per-move rate, so total evaluations are reconstructed as rate * elapsed time.
+        if (engineMove.EPS > 0)
+        {
+          totalEvalsUsed += (long)MathF.Round(engineMove.EPS * engineTime);
+        }
         if (isWhite)
         {
           info.WhiteMoveStr = moveStr;
@@ -1012,6 +1243,12 @@ namespace Ceres.Features.Tournaments
           info.BlackShouldHaveForfeitedOnLimit = shouldHaveForfeited;
           info.BlackDepth = moveDepth;
         }
+
+        // Notify any live-streaming observer of this completed half-move.
+        Def.parentDef.Observer?.OnMove(ThreadIndex,
+            DtoMappers.ToMove(plyCount, isWhite, moveStr, newPosition.FinalPosition.FEN,
+                              moveScoreCentipawns, moveScoreQ, moveMAvg, moveDepth,
+                              engineMove, engineTime, thisMoveSearchLimit, newPosition.FinalPosition.PieceCount));
 
         if (showMoves)
         {

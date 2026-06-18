@@ -14,7 +14,6 @@
 #region Using directives
 
 using System;
-using System.Buffers;
 using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
 
@@ -40,14 +39,35 @@ namespace Ceres.MCGS.Search.RPO;
 ///   ForwardKLSoftmax   y(a) proportional to mu(a) * exp(q(a) / lambda)
 ///   ForwardKL inverse  q(a) = lambda * log(mu(a)) + C(s),   C(s) set by anchor
 ///
-/// No outside Ceres.MCGS dependencies.  Stack-allocates scratch when the action set
-/// is small; rents from ArrayPool otherwise.  TensorPrimitives are used where they
-/// vectorize naturally; bisection of alpha is scalar.
+/// No outside Ceres.MCGS dependencies.  Scratch lives in per-thread reusable buffers
+/// (the action set is bounded by MAX_ACTIONS, so nothing is ever heap-rented per call);
+/// TensorPrimitives are used where they vectorize naturally; bisection of alpha is scalar.
 /// </summary>
 public static class RegularizedPolicyOptimum
 {
-  /// <summary>Threshold below which scratch buffers are stack-allocated.</summary>
-  private const int STACKALLOC_MAX = 64;
+  /// <summary>
+  /// Maximum number of actions (children) the solver ever sees in a single call.
+  /// Equal to the engine's MAX_CHILDREN; the per-thread scratch buffers below are
+  /// sized to this so the live action set always fits without renting.
+  /// </summary>
+  private const int MAX_ACTIONS = 64;
+
+  // Per-thread scratch reused across Solve calls in place of per-call stackalloc/ArrayPool.
+  // Each buffer is lazily allocated once per thread to MAX_ACTIONS and then sliced to the
+  // live action count n on every call.  [ThreadStatic] gives each search thread its own set
+  // (no cross-thread sharing), mirroring CBGPUCTScoreCalc / PUCTScoreCalcVector.  The reverse-
+  // and forward-KL paths never run concurrently on one thread, so the three buffers they share
+  // (muNorm, qFill, y) are safe to reuse between them.  Correctness note: every element in
+  // [0, n) is fully written before it is read on each call, so the loss of stackalloc's implicit
+  // zero-initialization is immaterial; slicing to exactly n also preserves the length validations
+  // and the vStar dot-product semantics.
+  [ThreadStatic] private static double[] bufferMuNorm;
+  [ThreadStatic] private static double[] bufferQFill;
+  [ThreadStatic] private static double[] bufferCoeff;
+  [ThreadStatic] private static double[] bufferY;
+  [ThreadStatic] private static double[] bufferNewtD;
+  [ThreadStatic] private static double[] bufferNewtRatio;
+  [ThreadStatic] private static double[] bufferLogMu;
 
 
   /// <summary>
@@ -55,7 +75,7 @@ public static class RegularizedPolicyOptimum
   /// </summary>
   /// <param name="mu">Prior policy probabilities (length n).  Need not sum to 1.</param>
   /// <param name="q">Per-action values (length n).  NaN entries are imputed.</param>
-  /// <param name="lambda">Regularization strength.  Must be greater than or equal to 0 for reverse KL, greater than 0 for forward KL.</param>
+  /// <param name="lambda">Regularization strength (scalar).  Must be greater than or equal to 0 for reverse KL, greater than 0 for forward KL.</param>
   /// <param name="anchor">Determines the free intercept C(s) for forward-KL imputation.  Must be None for reverse KL.</param>
   /// <param name="regularization">ReverseKL (Grill) or ForwardKLSoftmax (Boltzmann).</param>
   /// <param name="yOut">Output buffer for y* (length greater than or equal to n).  May be empty if y* is not needed.</param>
@@ -63,6 +83,7 @@ public static class RegularizedPolicyOptimum
   /// <param name="vStarOut">Output: v* = sum_a y*(a) q_fill(a).</param>
   /// <param name="options">Tuning knobs.  If the BisectionIterations field is 0, RPOOptions.Default is used.</param>
   /// <param name="nanFallbackQ">Fallback value used for NaN entries in q under reverse KL.  If itself NaN, the mean of the finite q's is used.</param>
+  /// <param name="lambdaPerChild">Optional per-action lambda vector (length n).  When non-empty, replaces the scalar lambda in the per-action coefficient: coeff[i] = lambdaPerChild[i] * mu[i].  When empty, scalar lambda is used.  REVERSE-KL ONLY (forward-KL closed form does not generalize naturally to per-child lambda; an empty span is enforced there).</param>
   public static void Solve(ReadOnlySpan<double> mu,
                            ReadOnlySpan<double> q,
                            double lambda,
@@ -72,7 +93,8 @@ public static class RegularizedPolicyOptimum
                            Span<double> qFillOut,
                            out double vStarOut,
                            RPOOptions options = default,
-                           double nanFallbackQ = double.NaN)
+                           double nanFallbackQ = double.NaN,
+                           ReadOnlySpan<double> lambdaPerChild = default)
   {
     if (mu.Length != q.Length)
     {
@@ -85,6 +107,10 @@ public static class RegularizedPolicyOptimum
     if (!qFillOut.IsEmpty && qFillOut.Length < mu.Length)
     {
       throw new ArgumentException("qFillOut is shorter than mu.");
+    }
+    if (!lambdaPerChild.IsEmpty && lambdaPerChild.Length < mu.Length)
+    {
+      throw new ArgumentException("lambdaPerChild is shorter than mu.");
     }
 
     RPOOptions opts = options.BisectionIterations <= 0 ? RPOOptions.Default : options;
@@ -103,14 +129,18 @@ public static class RegularizedPolicyOptimum
         {
           throw new ArgumentException("Reverse KL solve requires anchor mode = None (the closed form has no intercept freedom).");
         }
-        if (!(lambda >= 0.0))
+        if (lambdaPerChild.IsEmpty && !(lambda >= 0.0))
         {
           throw new ArgumentOutOfRangeException(nameof(lambda), "Reverse KL requires lambda >= 0.");
         }
-        SolveReverseKL(mu, q, lambda, yOut, qFillOut, out vStarOut, opts, nanFallbackQ);
+        SolveReverseKL(mu, q, lambda, lambdaPerChild, yOut, qFillOut, out vStarOut, opts, nanFallbackQ);
         return;
 
       case RPORegularization.ForwardKLSoftmax:
+        if (!lambdaPerChild.IsEmpty)
+        {
+          throw new ArgumentException("ForwardKLSoftmax does not support lambdaPerChild (must be empty).");
+        }
         if (!(lambda > 0.0))
         {
           throw new ArgumentOutOfRangeException(nameof(lambda), "Forward KL requires lambda > 0.");
@@ -131,6 +161,7 @@ public static class RegularizedPolicyOptimum
   private static void SolveReverseKL(ReadOnlySpan<double> mu,
                                      ReadOnlySpan<double> q,
                                      double lambda,
+                                     ReadOnlySpan<double> lambdaPerChild,
                                      Span<double> yOut,
                                      Span<double> qFillOut,
                                      out double vStarOut,
@@ -138,133 +169,127 @@ public static class RegularizedPolicyOptimum
                                      double nanFallbackQ)
   {
     int n = mu.Length;
+    bool perChild = !lambdaPerChild.IsEmpty;
 
-    // Scratch buffers: muNorm, qFill, coeff, y (always needed even if outputs are empty).
-    double[] rentedMuNorm = null;
-    double[] rentedQFill = null;
-    double[] rentedCoeff = null;
-    double[] rentedY = null;
+    // Per-thread scratch (see field declarations): always needed even if outputs are empty.
+    Span<double> muNorm = (bufferMuNorm ??= new double[MAX_ACTIONS]).AsSpan(0, n);
+    Span<double> qFill = (bufferQFill ??= new double[MAX_ACTIONS]).AsSpan(0, n);
+    Span<double> coeff = (bufferCoeff ??= new double[MAX_ACTIONS]).AsSpan(0, n);
+    Span<double> yLocal = (bufferY ??= new double[MAX_ACTIONS]).AsSpan(0, n);
 
-    Span<double> muNorm = n <= STACKALLOC_MAX ? stackalloc double[n] : (rentedMuNorm = ArrayPool<double>.Shared.Rent(n)).AsSpan(0, n);
-    Span<double> qFill  = n <= STACKALLOC_MAX ? stackalloc double[n] : (rentedQFill  = ArrayPool<double>.Shared.Rent(n)).AsSpan(0, n);
-    Span<double> coeff  = n <= STACKALLOC_MAX ? stackalloc double[n] : (rentedCoeff  = ArrayPool<double>.Shared.Rent(n)).AsSpan(0, n);
-    Span<double> yLocal = n <= STACKALLOC_MAX ? stackalloc double[n] : (rentedY      = ArrayPool<double>.Shared.Rent(n)).AsSpan(0, n);
+    // Scratch for the vectorized Newton evaluator (TrySolveAlphaNewton / EvalSumAndDeriv).
+    Span<double> newtD = (bufferNewtD ??= new double[MAX_ACTIONS]).AsSpan(0, n);
+    Span<double> newtRatio = (bufferNewtRatio ??= new double[MAX_ACTIONS]).AsSpan(0, n);
 
-    try
+    NormalizeMu(mu, muNorm, opts.MinPriorProbability);
+
+    // Pre-pass: determine fallback for NaN q entries.
+    double fallback = ResolveFallback(q, nanFallbackQ, opts.ClampQ);
+
+    double maxQEff = double.NegativeInfinity;
+    bool anyPositiveCoeff = false;
+    double maxLambdaEff = 0.0;
+    for (int i = 0; i < n; i++)
     {
-      NormalizeMu(mu, muNorm, opts.MinPriorProbability);
+      double qi = q[i];
+      if (!IsFinite(qi))
+      {
+        qi = fallback;
+      }
+      if (opts.ClampQ)
+      { 
+        qi = Clamp(qi, -1.2, 1.2);
+      }
+      qFill[i] = qi;
 
-      // Pre-pass: determine fallback for NaN q entries.
-      double fallback = ResolveFallback(q, nanFallbackQ, opts.ClampQToUnitInterval);
+      // Per-action lambda when supplied; otherwise scalar lambda for all.
+      double lambdaI = perChild ? lambdaPerChild[i] : lambda;
+      if (lambdaI < 0.0 || !IsFinite(lambdaI))
+      {
+        lambdaI = 0.0;
+      }
+      if (lambdaI > maxLambdaEff) maxLambdaEff = lambdaI;
 
-      double maxQEff = double.NegativeInfinity;
-      bool anyPositiveCoeff = false;
+      double c = lambdaI * muNorm[i];
+      if (c < 0.0 || !IsFinite(c))
+      {
+        c = 0.0;
+      }
+      coeff[i] = c;
+
+      if (c > 0.0)
+      {
+        anyPositiveCoeff = true;
+        if (qi > maxQEff)
+        {
+          maxQEff = qi;
+        }
+      }
+    }
+
+    // Degenerate cases: greedy on q if no positive coefficient or every lambda is tiny.
+    // In per-child mode, the gate is on max(lambdaPerChild); otherwise the scalar lambda.
+    double lambdaForDegen = perChild ? maxLambdaEff : lambda;
+    if (!anyPositiveCoeff || lambdaForDegen <= 1e-12)
+    {
+      GreedyOnQ(qFill, yLocal);
+    }
+    else if (!TrySolveAlphaNewton(coeff, qFill, maxQEff, opts.BisectionIterations,
+                                  opts.BisectionResidualTol, newtD, newtRatio, out double alpha))
+    {
+      // Root-find failed to bracket: fall back to normalized prior (closest to greedy-prior choice).
+      WriteNormalizedPrior(muNorm, yLocal);
+    }
+    else
+    {
+      double sumY = 0.0;
       for (int i = 0; i < n; i++)
       {
-        double qi = q[i];
-        if (!IsFinite(qi))
+        double denom = alpha - qFill[i];
+        double yi = denom > 0.0 ? coeff[i] / denom : 0.0;
+        if (!IsFinite(yi) || yi < 0.0)
         {
-          qi = fallback;
+          yi = 0.0;
         }
-        if (opts.ClampQToUnitInterval)
-        {
-          qi = Clamp(qi, -1.0, 1.0);
-        }
-        qFill[i] = qi;
-
-        double c = lambda * muNorm[i];
-        if (c < 0.0 || !IsFinite(c))
-        {
-          c = 0.0;
-        }
-        coeff[i] = c;
-
-        if (c > 0.0)
-        {
-          anyPositiveCoeff = true;
-          if (qi > maxQEff)
-          {
-            maxQEff = qi;
-          }
-        }
+        yLocal[i] = yi;
+        sumY += yi;
       }
-
-      // Degenerate cases: greedy on q if lambda is 0 or all coefficients are 0.
-      if (!anyPositiveCoeff || lambda <= 1e-12)
+      if (!(sumY > 0.0) || !IsFinite(sumY))
       {
-        GreedyOnQ(qFill, yLocal);
-      }
-      else if (!TrySolveAlphaBisection(coeff, qFill, maxQEff, opts.BisectionIterations,
-                                       opts.BisectionResidualTol, out double alpha))
-      {
-        // Bisection failed: fall back to normalized prior (closest to greedy-prior choice).
         WriteNormalizedPrior(muNorm, yLocal);
       }
       else
       {
-        double sumY = 0.0;
+        // Two-pass renormalization to reduce drift (matches legacy ComputePosterior).
+        double inv = 1.0 / sumY;
+        double sumRenorm = 0.0;
         for (int i = 0; i < n; i++)
         {
-          double denom = alpha - qFill[i];
-          double yi = denom > 0.0 ? coeff[i] / denom : 0.0;
-          if (!IsFinite(yi) || yi < 0.0)
+          double v = yLocal[i] * inv;
+          if (!IsFinite(v) || v < 0.0)
           {
-            yi = 0.0;
+            v = 0.0;
           }
-          yLocal[i] = yi;
-          sumY += yi;
+          yLocal[i] = v;
+          sumRenorm += v;
         }
-        if (!(sumY > 0.0) || !IsFinite(sumY))
+        if (sumRenorm > 0.0 && IsFinite(sumRenorm))
         {
-          WriteNormalizedPrior(muNorm, yLocal);
+          double invRenorm = 1.0 / sumRenorm;
+          TensorPrimitives.Multiply(yLocal, invRenorm, yLocal);
         }
-        else
-        {
-          // Two-pass renormalization to reduce drift (matches legacy ComputePosterior).
-          double inv = 1.0 / sumY;
-          double sumRenorm = 0.0;
-          for (int i = 0; i < n; i++)
-          {
-            double v = yLocal[i] * inv;
-            if (!IsFinite(v) || v < 0.0)
-            {
-              v = 0.0;
-            }
-            yLocal[i] = v;
-            sumRenorm += v;
-          }
-          if (sumRenorm > 0.0 && IsFinite(sumRenorm))
-          {
-            double invRenorm = 1.0 / sumRenorm;
-            for (int i = 0; i < n; i++)
-            {
-              yLocal[i] *= invRenorm;
-            }
-          }
-        }
-      }
-
-      // Copy outputs and compute vStar.
-      vStarOut = 0.0;
-      for (int i = 0; i < n; i++)
-      {
-        vStarOut += yLocal[i] * qFill[i];
-      }
-      if (!yOut.IsEmpty)
-      {
-        yLocal.CopyTo(yOut);
-      }
-      if (!qFillOut.IsEmpty)
-      {
-        qFill.CopyTo(qFillOut);
       }
     }
-    finally
+
+    // Copy outputs and compute vStar = sum_i y_i * qFill_i (vectorized dot product).
+    vStarOut = TensorPrimitives.Dot(yLocal, qFill);
+    if (!yOut.IsEmpty)
     {
-      if (rentedMuNorm != null) ArrayPool<double>.Shared.Return(rentedMuNorm);
-      if (rentedQFill  != null) ArrayPool<double>.Shared.Return(rentedQFill);
-      if (rentedCoeff  != null) ArrayPool<double>.Shared.Return(rentedCoeff);
-      if (rentedY      != null) ArrayPool<double>.Shared.Return(rentedY);
+      yLocal.CopyTo(yOut);
+    }
+    if (!qFillOut.IsEmpty)
+    {
+      qFill.CopyTo(qFillOut);
     }
   }
 
@@ -284,101 +309,73 @@ public static class RegularizedPolicyOptimum
   {
     int n = mu.Length;
 
-    double[] rentedMuNorm = null;
-    double[] rentedLogMu  = null;
-    double[] rentedQFill  = null;
-    double[] rentedY      = null;
+    // Per-thread scratch (see field declarations).
+    Span<double> muNorm = (bufferMuNorm ??= new double[MAX_ACTIONS]).AsSpan(0, n);
+    Span<double> logMu = (bufferLogMu ??= new double[MAX_ACTIONS]).AsSpan(0, n);
+    Span<double> qFill = (bufferQFill ??= new double[MAX_ACTIONS]).AsSpan(0, n);
+    Span<double> yLocal = (bufferY ??= new double[MAX_ACTIONS]).AsSpan(0, n);
 
-    Span<double> muNorm = n <= STACKALLOC_MAX ? stackalloc double[n] : (rentedMuNorm = ArrayPool<double>.Shared.Rent(n)).AsSpan(0, n);
-    Span<double> logMu  = n <= STACKALLOC_MAX ? stackalloc double[n] : (rentedLogMu  = ArrayPool<double>.Shared.Rent(n)).AsSpan(0, n);
-    Span<double> qFill  = n <= STACKALLOC_MAX ? stackalloc double[n] : (rentedQFill  = ArrayPool<double>.Shared.Rent(n)).AsSpan(0, n);
-    Span<double> yLocal = n <= STACKALLOC_MAX ? stackalloc double[n] : (rentedY      = ArrayPool<double>.Shared.Rent(n)).AsSpan(0, n);
+    // Normalize and floor mu (also enforce a hard floor so log is well-defined).
+    const double LOG_FLOOR = 1e-10;
+    double minPrior = opts.MinPriorProbability;
+    double effectiveFloor = minPrior > LOG_FLOOR ? minPrior : LOG_FLOOR;
+    NormalizeMu(mu, muNorm, effectiveFloor);
 
-    try
+    // Vectorized log of mu.
+    TensorPrimitives.Log(muNorm, logMu);
+
+    // Determine C(s) from the anchor.
+    double cIntercept = ResolveForwardKLIntercept(muNorm, logMu, anchor, lambda);
+
+    // Build q_fill: preserve finite q, impute NaN via  q_i = lambda * log(mu_i) + C(s).
+    for (int i = 0; i < n; i++)
     {
-      // Normalize and floor mu (also enforce a hard floor so log is well-defined).
-      const double LOG_FLOOR = 1e-10;
-      double minPrior = opts.MinPriorProbability;
-      double effectiveFloor = minPrior > LOG_FLOOR ? minPrior : LOG_FLOOR;
-      NormalizeMu(mu, muNorm, effectiveFloor);
-
-      // Vectorized log of mu.
-      TensorPrimitives.Log(muNorm, logMu);
-
-      // Determine C(s) from the anchor.
-      double cIntercept = ResolveForwardKLIntercept(muNorm, logMu, anchor, lambda);
-
-      // Build q_fill: preserve finite q, impute NaN via  q_i = lambda * log(mu_i) + C(s).
-      for (int i = 0; i < n; i++)
+      double qi = q[i];
+      if (!IsFinite(qi))
       {
-        double qi = q[i];
-        if (!IsFinite(qi))
-        {
-          qi = lambda * logMu[i] + cIntercept;
-        }
-        if (opts.ClampQToUnitInterval)
-        {
-          qi = Clamp(qi, -1.0, 1.0);
-        }
-        qFill[i] = qi;
+        qi = lambda * logMu[i] + cIntercept;
       }
-
-      // Compute y_i proportional to mu_i * exp(q_i / lambda) with numerically-stable shift.
-      // exp((q - qMax) / lambda) stays in [0, 1], avoiding overflow when lambda is small.
-      double maxQ = double.NegativeInfinity;
-      for (int i = 0; i < n; i++)
+      if (opts.ClampQ)
       {
-        if (qFill[i] > maxQ)
-        {
-          maxQ = qFill[i];
-        }
+        qi = Clamp(qi, -1.0, 1.0);
       }
-      double invLambda = 1.0 / lambda;
-      double sumW = 0.0;
-      for (int i = 0; i < n; i++)
-      {
-        double w = muNorm[i] * Math.Exp((qFill[i] - maxQ) * invLambda);
-        if (!IsFinite(w) || w < 0.0)
-        {
-          w = 0.0;
-        }
-        yLocal[i] = w;
-        sumW += w;
-      }
-      if (sumW > 0.0 && IsFinite(sumW))
-      {
-        double inv = 1.0 / sumW;
-        for (int i = 0; i < n; i++)
-        {
-          yLocal[i] *= inv;
-        }
-      }
-      else
-      {
-        WriteNormalizedPrior(muNorm, yLocal);
-      }
-
-      vStarOut = 0.0;
-      for (int i = 0; i < n; i++)
-      {
-        vStarOut += yLocal[i] * qFill[i];
-      }
-
-      if (!yOut.IsEmpty)
-      {
-        yLocal.CopyTo(yOut);
-      }
-      if (!qFillOut.IsEmpty)
-      {
-        qFill.CopyTo(qFillOut);
-      }
+      qFill[i] = qi;
     }
-    finally
+
+    // Compute y_i proportional to mu_i * exp(q_i / lambda) with numerically-stable shift.
+    // exp((q - qMax) / lambda) stays in [0, 1], avoiding overflow when lambda is small.
+    double maxQ = TensorPrimitives.Max(qFill);
+    double invLambda = 1.0 / lambda;
+    double sumW = 0.0;
+    for (int i = 0; i < n; i++)
     {
-      if (rentedMuNorm != null) ArrayPool<double>.Shared.Return(rentedMuNorm);
-      if (rentedLogMu  != null) ArrayPool<double>.Shared.Return(rentedLogMu);
-      if (rentedQFill  != null) ArrayPool<double>.Shared.Return(rentedQFill);
-      if (rentedY      != null) ArrayPool<double>.Shared.Return(rentedY);
+      double w = muNorm[i] * Math.Exp((qFill[i] - maxQ) * invLambda);
+      if (!IsFinite(w) || w < 0.0)
+      {
+        w = 0.0;
+      }
+      yLocal[i] = w;
+      sumW += w;
+    }
+    if (sumW > 0.0 && IsFinite(sumW))
+    {
+      double inv = 1.0 / sumW;
+      TensorPrimitives.Multiply(yLocal, inv, yLocal);
+    }
+    else
+    {
+      WriteNormalizedPrior(muNorm, yLocal);
+    }
+
+    vStarOut = TensorPrimitives.Dot(yLocal, qFill);
+
+    if (!yOut.IsEmpty)
+    {
+      yLocal.CopyTo(yOut);
+    }
+    if (!qFillOut.IsEmpty)
+    {
+      qFill.CopyTo(qFillOut);
     }
   }
 
@@ -398,23 +395,20 @@ public static class RegularizedPolicyOptimum
     switch (anchor.Mode)
     {
       case RPOAnchorMode.MatchValue:
-      {
-        double entropy = 0.0;
-        for (int i = 0; i < muNorm.Length; i++)
         {
-          entropy -= muNorm[i] * logMu[i];
+          // entropy = -E_mu[log mu] = -sum_i muNorm_i * logMu_i  (vectorized dot product).
+          double entropy = -TensorPrimitives.Dot(muNorm, logMu);
+          return anchor.Value + lambda * entropy;
         }
-        return anchor.Value + lambda * entropy;
-      }
 
       case RPOAnchorMode.MatchChild:
-      {
-        if ((uint)anchor.Index >= (uint)muNorm.Length)
         {
-          throw new ArgumentOutOfRangeException(nameof(anchor), "MatchChild anchor index is out of range.");
+          if ((uint)anchor.Index >= (uint)muNorm.Length)
+          {
+            throw new ArgumentOutOfRangeException(nameof(anchor), "MatchChild anchor index is out of range.");
+          }
+          return anchor.Value - lambda * logMu[anchor.Index];
         }
-        return anchor.Value - lambda * logMu[anchor.Index];
-      }
 
       case RPOAnchorMode.None:
         // Caller has not specified an intercept.  Imputed slots (if any) will collapse
@@ -457,18 +451,12 @@ public static class RegularizedPolicyOptimum
     if (sum > 0.0 && IsFinite(sum))
     {
       double inv = 1.0 / sum;
-      for (int i = 0; i < n; i++)
-      {
-        muNorm[i] *= inv;
-      }
+      TensorPrimitives.Multiply(muNorm, inv, muNorm);
     }
     else
     {
       double uni = 1.0 / n;
-      for (int i = 0; i < n; i++)
-      {
-        muNorm[i] = uni;
-      }
+      muNorm.Fill(uni);
     }
   }
 
@@ -504,89 +492,159 @@ public static class RegularizedPolicyOptimum
 
 
   /// <summary>
-  /// Solves  sum_i coeff_i / (alpha - qEff_i) = 1  for alpha &gt; maxQEff via bisection.
-  /// Returns true on success.  Halts early once the residual |sum - 1| is below
-  /// residualTol or once the iteration cap is reached.
+  /// Solves  S(alpha) = sum_i coeff_i / (alpha - qEff_i) = 1  for alpha &gt; maxQEff using a
+  /// safeguarded Newton iteration, exiting as soon as the residual |S(alpha) - 1| falls below
+  /// residualTol (or the iteration cap maxIterations is reached).  Returns true on success.
+  ///
+  /// On (maxQEff, +inf) the objective S is smooth, strictly decreasing, and convex, so Newton
+  /// converges quadratically - typically in a handful of steps versus the ~20 a bisection to the
+  /// same tolerance needs.  This is the Numerical-Recipes "rtsafe" hybrid working on the strictly
+  /// increasing g(a) = 1 - S(a): a Newton step is taken only when it stays inside the maintained
+  /// bracket [xl, xh] AND would at least halve the previous step; otherwise a bisection step is
+  /// taken.  That second guard is what makes convergence provably no slower than pure bisection
+  /// (a plain "Newton-in-bracket-else-bisect" loop can accept tiny Newton steps and end up worse
+  /// than bisection at a fixed iteration budget).
+  ///
+  /// d and ratio are caller-provided scratch buffers (length n) consumed by the vectorized
+  /// evaluator EvalSumAndDeriv.
   /// </summary>
-  private static bool TrySolveAlphaBisection(ReadOnlySpan<double> coeff,
-                                             ReadOnlySpan<double> qEff,
-                                             double maxQEff,
-                                             int iterations,
-                                             double residualTol,
-                                             out double alpha)
+  private static bool TrySolveAlphaNewton(ReadOnlySpan<double> coeff,
+                                          ReadOnlySpan<double> qEff,
+                                          double maxQEff,
+                                          int maxIterations,
+                                          double residualTol,
+                                          Span<double> d,
+                                          Span<double> ratio,
+                                          out double alpha)
   {
     const double EPS = 1e-12;
-    double aLo = maxQEff + EPS;
-    double aHi = maxQEff + 1.0;
-    if (!(aHi > aLo))
+    const double STEP_TOL = 1e-13;     // alpha-resolution at which further refinement is pointless
+
+    // Bracket [xl, xh] for the strictly-increasing g(a) = 1 - S(a):
+    //   xl just above the largest active qEff, where S -> +inf  => g(xl) < 0
+    //   xh grown (doubling the span above maxQEff) until S(xh) < 1 => g(xh) > 0
+    double xl = maxQEff + EPS;
+    double xh = maxQEff + 1.0;
+    if (!(xh > xl))
     {
-      aHi = aLo + 1.0;
+      xh = xl + 1.0;
     }
 
-    // Expand aHi until sum at aHi is below 1.
-    double sumAtHi = SumCoeffOverAlphaMinusQ(coeff, qEff, aHi);
+    EvalSumAndDeriv(coeff, qEff, xh, d, ratio, out double sHi, out _);
     int expand = 0;
-    while (sumAtHi > 1.0 && expand < 64 && IsFinite(aHi))
+    while (sHi > 1.0 && expand < 64 && IsFinite(xh))
     {
-      double span = aHi - maxQEff;
+      double span = xh - maxQEff;
       if (!(span > 0.0) || !IsFinite(span))
       {
         span = 1.0;
       }
-      aHi = maxQEff + (span * 2.0);
-      sumAtHi = SumCoeffOverAlphaMinusQ(coeff, qEff, aHi);
+      xh = maxQEff + (span * 2.0);
+      EvalSumAndDeriv(coeff, qEff, xh, d, ratio, out sHi, out _);
       expand++;
     }
-    if (!(sumAtHi < 1.0) || !IsFinite(sumAtHi) || !IsFinite(aHi))
+    if (!(sHi < 1.0) || !IsFinite(sHi) || !IsFinite(xh))
     {
       alpha = 0.0;
       return false;
     }
 
-    // Bisect.
-    for (int it = 0; it < iterations; it++)
+    // rtsafe on g(a) = 1 - S(a), g'(a) = -S'(a) > 0, seeded at the bracket midpoint.
+    // Eval-first ordering (evaluate rts, fold it into the bracket, then step) means K iterations
+    // perform K bracket halvings in the worst case - exactly matching pure bisection, so the
+    // hybrid is never slower - while Newton acceleration kicks in wherever the function is tame.
+    double rts = 0.5 * (xl + xh);
+    double dx = xh - xl;
+    double dxOld = dx;
+
+    for (int it = 0; it < maxIterations; it++)
     {
-      double mid = 0.5 * (aLo + aHi);
-      double s = SumCoeffOverAlphaMinusQ(coeff, qEff, mid);
-      if (!IsFinite(s))
+      EvalSumAndDeriv(coeff, qEff, rts, d, ratio, out double s, out double sPrime);
+      double g = 1.0 - s;
+      double gp = -sPrime;
+
+      // Fold this evaluation into the bracket (g increasing: g < 0 -> raise xl, else lower xh),
+      // then exit if the residual is within tolerance.
+      if (IsFinite(g))
       {
-        aLo = mid;
-        continue;
+        if (g < 0.0)
+        {
+          xl = rts;
+        }
+        else
+        {
+          xh = rts;
+        }
+
+        if (Math.Abs(g) < residualTol)
+        {
+          alpha = rts;
+          return rts > maxQEff && IsFinite(rts);
+        }
       }
-      if (Math.Abs(s - 1.0) < residualTol)
+
+      // Choose the next iterate: a Newton step only when it stays inside [xl, xh] AND would at
+      // least halve the prior step; otherwise a bisection step (which always makes progress).
+      bool useBisection =
+           !IsFinite(g) || !IsFinite(gp)
+        || (((rts - xh) * gp - g) * ((rts - xl) * gp - g) > 0.0)
+        || (Math.Abs(2.0 * g) > Math.Abs(dxOld * gp));
+
+      dxOld = dx;
+      double prev = rts;
+      bool noProgress;
+      if (useBisection)
       {
-        alpha = mid;
-        return alpha > maxQEff && IsFinite(alpha);
-      }
-      if (s > 1.0)
-      {
-        aLo = mid;
+        dx = 0.5 * (xh - xl);
+        rts = xl + dx;
+        noProgress = (rts == xl);     // bracket collapsed to a point
       }
       else
       {
-        aHi = mid;
+        dx = g / gp;
+        rts = prev - dx;
+        noProgress = (rts == prev);   // Newton step underflowed (no change in alpha)
+      }
+
+      if (noProgress || Math.Abs(dx) < STEP_TOL)
+      {
+        alpha = rts;
+        return rts > maxQEff && IsFinite(rts);
       }
     }
 
-    alpha = aHi;
-    return alpha > maxQEff && IsFinite(alpha);
+    // Iteration cap reached: rts is still bracketed and finite, so return it as the estimate.
+    alpha = rts;
+    return rts > maxQEff && IsFinite(rts);
   }
 
 
   /// <summary>
-  /// Scalar evaluation of  sum_i coeff_i / (alpha - qEff_i).  Assumes all coeff &gt;= 0
-  /// and alpha &gt; max(qEff) so denominators are positive.
+  /// Evaluates, at a given alpha, both the constraint LHS and its derivative:
+  ///   S(alpha)  =  sum_i coeff_i / (alpha - qEff_i)
+  ///   S'(alpha) = -sum_i coeff_i / (alpha - qEff_i)^2
+  /// Vectorized with TensorPrimitives.  Assumes coeff_i &gt;= 0 and alpha &gt; max(qEff_i : coeff_i &gt; 0)
+  /// so that every active denominator is positive (entries with coeff_i == 0 contribute 0).
+  ///
+  /// Works in terms of d_i = qEff_i - alpha (= -(alpha - qEff_i)) so the scalar-minus-vector can
+  /// use the available Subtract(span, scalar) overload; the sign is folded into the two reductions.
+  /// Because (alpha - qEff_i)^2 == d_i^2, the derivative needs no extra sign handling.
   /// </summary>
   [MethodImpl(MethodImplOptions.AggressiveInlining)]
-  private static double SumCoeffOverAlphaMinusQ(ReadOnlySpan<double> coeff, ReadOnlySpan<double> qEff, double alpha)
+  private static void EvalSumAndDeriv(ReadOnlySpan<double> coeff, ReadOnlySpan<double> qEff, double alpha,
+                                      Span<double> d, Span<double> ratio,
+                                      out double s, out double sPrime)
   {
-    double sum = 0.0;
-    int n = coeff.Length;
-    for (int i = 0; i < n; i++)
-    {
-      sum += coeff[i] / (alpha - qEff[i]);
-    }
-    return sum;
+    // d_i = qEff_i - alpha
+    TensorPrimitives.Subtract(qEff, alpha, d);
+
+    // ratio_i = coeff_i / d_i ;  S = sum_i coeff_i/(alpha - qEff_i) = -sum_i ratio_i
+    TensorPrimitives.Divide(coeff, d, ratio);
+    s = -TensorPrimitives.Sum(ratio);
+
+    // ratio_i <- ratio_i / d_i = coeff_i / d_i^2 = coeff_i/(alpha - qEff_i)^2 ;  S' = -sum_i ratio_i
+    TensorPrimitives.Divide(ratio, d, ratio);
+    sPrime = -TensorPrimitives.Sum(ratio);
   }
 
 

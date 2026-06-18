@@ -86,11 +86,20 @@ public sealed class MCGSStrategyPUCT : MCGSSelectBackupStrategyBase
     FPURunningStats.EnsureEvaluatorDef(engine.Manager.EvaluatorDef);
   }
 
+  /// <summary>
+  /// Maximum supported path depth (NumVisitsInPath) for a SelectChildren call.
+  /// Must exceed the deepest reachable path: deep rollouts allow a spine of up to 512
+  /// (MCGSSelect.ExtendPathFromInnerNode) plus 384 below the start node; the limit is
+  /// enforced centrally by the depth guard in MCGSSelect.CapacityAbortNeeded.
+  /// Only the (cheap) outer pointer arrays are sized to this; the per-depth rows
+  /// remain lazily allocated, so depths never reached cost nothing.
+  /// </summary>
+  internal const int MAX_PATH_DEPTH = 1024;
+
   private static void CheckThreadStaticsInitialized()
   {
     if (childVisitCountsArray == null)
     {
-      const int MAX_PATH_DEPTH = 255;
       childVisitCountsArray = new short[MAX_PATH_DEPTH][];
       childScoresArray = new double[MAX_PATH_DEPTH][];
     }
@@ -605,19 +614,55 @@ public sealed class MCGSStrategyPUCT : MCGSSelectBackupStrategyBase
 
 
   /// <summary>
+  /// Per-thread xorshift64* state for the stochastic rounding of the single-byte
+  /// RepDrawFraction running average (see GNodeStruct.UpdateRepDrawFractionStochastic).
+  /// </summary>
+  [ThreadStatic]
+  static ulong repDrawRandState;
+
+  /// <summary>
+  /// Returns a uniform random double in [0, 1) from a cheap per-thread xorshift64* generator.
+  /// </summary>
+  static double NextRandUniform()
+  {
+    ulong x = repDrawRandState;
+    if (x == 0)
+    {
+      // Seed lazily from the thread id (must be nonzero for xorshift).
+      x = (ulong)System.Environment.CurrentManagedThreadId * 0x9E3779B97F4A7C15UL + 0x2545F4914F6CDD1DUL;
+    }
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    repDrawRandState = x;
+    return ((x * 0x2545F4914F6CDD1DUL) >> 11) * (1.0 / (1UL << 53));
+  }
+
+
+  /// <summary>
   /// Backs up the value of a newly evaluated leaf node to a specified node.
   /// </summary>
   /// <param name="node"></param>
   /// <param name="deltaN"></param>
   /// <param name="deltaW"></param>
   /// <param name="deltaD"></param>
-  /// <param name="refreshSiblingContribution"></param>
-  public override void BackupToNode(GNode node, int deltaN, double deltaW, double deltaD)
+  /// <param name="deltaR">Sum over the visits of the per-visit fraction (in [0, deltaN]) which
+  /// terminated at a history-sensitive (repetition/50-move) terminal draw edge; accumulated
+  /// into the node's RepDrawFraction running average (mirroring D's plumbing).</param>
+  public override void BackupToNode(GNode node, int deltaN, double deltaW, double deltaD, double deltaR = 0)
   {
     int startN = node.N;
 
     // Increment N.
     node.NodeRef.N += deltaN;
+
+    // Update the repetition-draw mass fraction (stochastically rounded single byte).
+    // Note this must run even when deltaR == 0 so that R correctly DECAYS as clean
+    // visits accumulate.
+    if (deltaN > 0)
+    {
+      node.NodeRef.UpdateRepDrawFractionStochastic(startN, deltaN, deltaR, NextRandUniform());
+    }
 
     if (node.CheckmateKnownToExistAmongChildren)
     {
@@ -669,7 +714,7 @@ public sealed class MCGSStrategyPUCT : MCGSSelectBackupStrategyBase
     }
     else
     {
-      double oldWPure = node.ComputeQPure() * startN;
+      double oldWPure = startN == 0 ? 0 : node.ComputeQPure() * startN;
       double newWPure = oldWPure + deltaW;
       double newQPure = newWPure / (startN + deltaN);
 
@@ -695,7 +740,7 @@ public sealed class MCGSStrategyPUCT : MCGSSelectBackupStrategyBase
         count += node.ChildEdgeAtIndex(i).N;
       }
       int expected = count + (node.NodeRef.Terminal.IsTerminal() ? node.N : 1);
-      if (ParamsSelect.CBGPUCT_CrossParentNEnabled)
+      if (ParamsSelect.CBGPUCT_SelectCrossParentNEnabled)
       {
         Debug.Assert(node.N >= expected);
       }
@@ -745,6 +790,16 @@ public sealed class MCGSStrategyPUCT : MCGSSelectBackupStrategyBase
     // no longer overwrite edge.N with child.N in graph-aware mode.
     edge.N += deltaN;
     edge.QChild = newQChild;
+
+    // Maintain the history-sensitive-draw kind sentinel in tandem with N on terminal
+    // drawn edges (NDrawByRepetition was set nonzero at creation for repetition/50-move
+    // draws). Keeps NDrawByRepetition == N so the field doubles as the draw-visit mass.
+    // No-op for history-free drawn terminals (stalemate/material/tablebase, NDR == 0)
+    // and unrelated to the Position-mode coalesce NDR maintenance (ChildEdge type).
+    if (edge.Type == GEdgeStruct.EdgeType.TerminalEdgeDrawn && edge.NDrawByRepetition > 0)
+    {
+      edge.NDrawByRepetition = edge.N;
+    }
 
     // Note that the assertion on edge N and child N
     // does not apply in coalesce mode because in that case one node appears twice in the path
@@ -803,8 +858,8 @@ public sealed class MCGSStrategyPUCT : MCGSSelectBackupStrategyBase
           }
           else
           {
-            // Update the parent node with the delta
-            double deltaW = edgeDeltaQ * edge.N;
+            // Update the parent node with the delta.
+            double deltaW = -edgeDeltaQ * edge.N;
             double deltaD = 0; // TODO: implement this.
             BackupToNode(edge.ParentNode, 0, deltaW, deltaD);
 

@@ -36,6 +36,10 @@ using System.Collections.Concurrent;
 using Ceres.Base.Math;
 using Ceres.Chess.NNEvaluators.Internals;
 using System.Linq;
+using Ceres.MCGS.GameEngines;
+using Ceres.MCGS.Search.Params;
+using Ceres.Chess.SearchResultVerboseMoveInfo;
+using Ceres.Chess.NNEvaluators.Defs;
 
 #endregion
 
@@ -54,35 +58,81 @@ namespace Ceres.Features.Suites
     public int NumConcurrent;
 
     /// <summary>
-    /// Engine for first Ceres engine definition.
+    /// Optionally a flat sequence of GPU device IDs over which the concurrent suite
+    /// workers are allocated. The IDs are partitioned into consecutive chunks (one chunk
+    /// per worker), where the chunk size equals the number of devices in the engine
+    /// specification. When null the engines are used exactly as specified
+    /// (no per-worker device assignment).
     /// </summary>
-    public ConcurrentBag<GameEngine> EnginesCeres1 = new();
+    public int[] DeviceIDs;
 
     /// <summary>
-    /// Engine for optional second optional Ceres engine definition.
+    /// Pool of (paired) Ceres engine instances available to the concurrent suite workers.
+    /// Each entry holds the first Ceres engine and (optionally) the second Ceres engine
+    /// for one worker; the two engines in a pair share the same assigned device(s), so a
+    /// worker always runs both engines on the same GPU(s).
     /// </summary>
-    public ConcurrentBag<GameEngine> EnginesCeres2 = new();
+    public ConcurrentBag<(GameEngine Engine1, GameEngine Engine2)> EngineSets = new();
 
     /// <summary>
     /// Engine for optional external UCI engine.
     /// </summary>
     public GameEngine EngineExternal { get; private set; }
 
+    /// <summary>
+    /// When Run is invoked with useMultiEngineMode (or the definition was already in multiengine
+    /// mode), holds the comprehensive multiengine result produced by the run (Run itself returns
+    /// null in that case, since its return type is the two-engine SuiteTestResult).
+    /// </summary>
+    public MultiEngineSuiteResult MultiEngineResult { get; private set; }
+
+    /// <summary>
+    /// Pool of engine instance arrays for multiengine mode (one array per concurrent worker,
+    /// with one engine instance per engine in the multiengine definition). The Ceres engines
+    /// within a worker's array all share that worker's assigned device(s), and for any position
+    /// a worker runs all its engines sequentially on those device(s) (preserving the fair-timing
+    /// property of the two-engine mode). Used only when Def.IsMultiEngine.
+    /// </summary>
+    public ConcurrentBag<GameEngine[]> EngineArrays = new();
+
 
     int numConcurrentSuiteThreads;
 
 
-    static void PopulateCeresEngines(GameEngineDef engineDef, EnginePlayerDef playerDef, ConcurrentBag<GameEngine> engines, int count)
+    /// <summary>
+    /// Creates and warms up a single engine instance for a worker, optionally rewriting
+    /// the device indices (of an isolated clone of the engine definition) so the worker
+    /// runs on a specific set of GPUs. The engine is warmed up using the supplied search
+    /// limit (which may be null, in which case a default warmup is performed).
+    /// </summary>
+    static GameEngine CreateWorkerEngine(GameEngineDef engineDef, SearchLimit warmupLimit, int[] deviceIDsForWorker)
     {
-      if (engineDef != null)
+      if (engineDef == null)
       {
-        for (int i = 0; i < count; i++)
-        {
-          GameEngine engine = engineDef.CreateEngine();
-          engine.Warmup(playerDef.SearchLimit.KnownMaxNumNodes);
-          engines.Add(engine);
-        }
+        return null;
       }
+
+      GameEngineDef defForWorker = engineDef;
+      if (deviceIDsForWorker != null)
+      {
+        // Clone so the device rewrite is isolated to this worker
+        // (binary deep clone, the same mechanism used by TournamentDef.Clone).
+        defForWorker = ObjUtils.DeepClone(engineDef);
+        defForWorker.TrySetDeviceIndicesIfNotPooled(deviceIDsForWorker);
+      }
+
+      GameEngine engine = defForWorker.CreateEngine();
+
+      // Enable per-move (root) visit statistics so the policy-difference (KLD) metric can be
+      // computed. MCGS only populates GameEngineSearchResult.VerboseMoveStats when this flag is
+      // set; it is a cheap post-search root walk and does not change search behavior or output.
+      if (engine is GameEngineCeresMCGSInProcess mcgsEngine)
+      {
+        mcgsEngine.GatherVerboseMoveStats = true;
+      }
+
+      engine.Warmup(warmupLimit?.KnownMaxNumNodes);
+      return engine;
     }
 
 
@@ -95,13 +145,110 @@ namespace Ceres.Features.Suites
       Def = def;
     }
 
-    void Init()
+
+    /// <summary>
+    /// Constructor specifying a level of concurrency and (optionally) a flat set of GPU
+    /// device IDs over which the concurrent suite workers are spread.
+    ///
+    /// The deviceIDs are treated as a flat pool partitioned into consecutive chunks (one
+    /// chunk per concurrent worker), where the chunk size equals the number of devices in
+    /// the engine's device specification. For example, with a "GPU:0,1" specification,
+    /// numConcurrent 2 and deviceIDs [0,1,2,3], one worker runs on GPUs [0,1] and the
+    /// other on GPUs [2,3]. (Modeled after TournamentManager.)
+    /// </summary>
+    /// <param name="def"></param>
+    /// <param name="numConcurrent"></param>
+    /// <param name="deviceIDs"></param>
+    public SuiteTestRunner(SuiteTestDef def, int numConcurrent, int[] deviceIDs = null)
     {
-      // Create and warmup both engines (in parallel)
-      PopulateCeresEngines(Def.Engine1Def, Def.CeresEngine1Def, EnginesCeres1, numConcurrentSuiteThreads);
-      PopulateCeresEngines(Def.Engine2Def, Def.CeresEngine2Def, EnginesCeres2, numConcurrentSuiteThreads);
+      if (numConcurrent > 1 && deviceIDs == null)
+      {
+        throw new Exception("Must specify deviceIDs if numConcurrent > 1.");
+      }
+
+      Def = def;
+      NumConcurrent = numConcurrent;
+      DeviceIDs = deviceIDs;
+    }
+
+
+    /// <summary>
+    /// Returns the set of (absolute) GPU device IDs assigned to a given concurrent worker,
+    /// or null if no explicit device assignment is in effect.
+    /// </summary>
+    int[] DeviceSliceForWorker(int workerIndex, int numDevicesPerWorker)
+    {
+      if (DeviceIDs == null)
+      {
+        return null;
+      }
+
+      // Each worker gets its own disjoint chunk of the device pool (no wrap-around), so that
+      // concurrent workers never share a GPU. This is validated in ComputeAndValidateDevicePartitioning.
+      int start = workerIndex * numDevicesPerWorker;
+      int[] ret = new int[numDevicesPerWorker];
+      Array.Copy(DeviceIDs, start, ret, 0, numDevicesPerWorker);
+      return ret;
+    }
+
+
+    void Init(int numDevicesPerWorker)
+    {
+      // Create and warm up the engine pairs (one pair per concurrent worker).
+      for (int i = 0; i < numConcurrentSuiteThreads; i++)
+      {
+        int[] deviceIDsForWorker = DeviceSliceForWorker(i, numDevicesPerWorker);
+        GameEngine engine1 = CreateWorkerEngine(Def.Engine1Def, Def.CeresEngine1Def?.SearchLimit, deviceIDsForWorker);
+        GameEngine engine2 = CreateWorkerEngine(Def.Engine2Def, Def.CeresEngine2Def?.SearchLimit, deviceIDsForWorker);
+        EngineSets.Add((engine1, engine2));
+      }
+
       Def.ExternalEngineDef?.EngineDef.CreateEngine(); EngineExternal?.Warmup(Def.ExternalEngineDef.SearchLimit.KnownMaxNumNodes);
     }
+
+
+    /// <summary>
+    /// Validates that the supplied DeviceIDs pool can be evenly partitioned into one chunk
+    /// per concurrent worker, and returns the number of devices per worker (the number of
+    /// devices in the engine specification).
+    /// </summary>
+    int ComputeAndValidateDevicePartitioning()
+    {
+      Chess.NNEvaluators.Defs.NNEvaluatorDef evalDef1 = Def.Engine1Def.GetEvaluatorDef();
+      if (evalDef1 == null)
+      {
+        throw new Exception("DeviceIDs were specified but the first engine is not a Ceres engine with an evaluator.");
+      }
+
+      int numDevicesPerWorker = evalDef1.NumDevices;
+      if (numDevicesPerWorker < 1)
+      {
+        throw new Exception("Engine specification must reference at least one device.");
+      }
+
+      Chess.NNEvaluators.Defs.NNEvaluatorDef evalDef2 = Def.Engine2Def?.GetEvaluatorDef();
+      if (evalDef2 != null && evalDef2.NumDevices != numDevicesPerWorker)
+      {
+        throw new Exception($"Both Ceres engines must reference the same number of devices when using DeviceIDs "
+                          + $"(engine1 has {numDevicesPerWorker}, engine2 has {evalDef2.NumDevices}).");
+      }
+
+      // Require enough device IDs that every concurrent worker is assigned its OWN disjoint
+      // set of GPUs (no sharing across workers). This is essential for fairness: for any
+      // position the two engines run sequentially on the worker's GPU(s), so if a worker had
+      // exclusive use of its GPU(s) the measured per-engine execution times are directly
+      // comparable; sharing GPUs between concurrent workers would distort those timings.
+      int numWorkers = NumConcurrent;
+      if (DeviceIDs.Length < numWorkers * numDevicesPerWorker)
+      {
+        throw new Exception($"Insufficient DeviceIDs ({DeviceIDs.Length}): need at least "
+                          + $"NumConcurrent ({numWorkers}) * devices-per-engine ({numDevicesPerWorker}) "
+                          + $"= {numWorkers * numDevicesPerWorker}, so each concurrent worker has its own GPU(s).");
+      }
+
+      return numDevicesPerWorker;
+    }
+
 
     int numSearches = 0;
     int numSearchesBothFound = 0;
@@ -124,6 +271,36 @@ namespace Ceres.Features.Suites
     int sumEvalNumBatches2;
     int sumEvalNumPos2;
 
+    long sumTablebaseHits1;
+    long sumTablebaseHits2;
+
+    // Correct-move-visit counters: over positions where both engines exposed root visit stats,
+    // how often each engine put a (meaningfully, by > 3 percentage points) larger fraction of
+    // its final visits on the correct move(s), and how often the two were within 3 points.
+    int countEngine1MoreCorrectVisits;
+    int countEngine2MoreCorrectVisits;
+    int countCorrectVisitsEqual;
+    int countCorrectVisitsCompared;
+
+    // Accumulates per-column statistics so a summary row (average of each column) can be
+    // emitted at end of suite, and used to populate the comprehensive SuiteTestResult.
+    readonly ColumnAccumulator columnAcc = new();
+
+    // Whether the per-position detail table is being printed (governs the summary row).
+    bool outputDetailRun;
+
+    // Policy difference: symmetric KLD of the two engines' root visit distributions, summed
+    // over positions where both engines exposed per-move visit statistics.
+    double sumPolicyKLD;
+    int countPolicyKLD;
+
+    // Per-engine evaluations-per-second (EPS), accumulated from each search result.
+    long sumEPS1;
+    long sumEPS2;
+
+    // Number of positions in the test set actually run (after filtering/slicing).
+    int numPositionsInRun;
+
 
 #if NOT
     void DumpParams(TextWriter writer, bool differentOnly)
@@ -140,11 +317,90 @@ namespace Ceres.Features.Suites
 #endif
 
 
+    /// <summary>
+    /// If both Ceres engines are in-process MCGS engines, writes to the output any
+    /// differences in their ParamsSearch (including the nested ParamsSearchExecution)
+    /// and ParamsSelect. Nothing is written if the engines are not both MCGS engines
+    /// or if their parameters are identical.
+    /// </summary>
+    void DumpMCGSEngineParamsDifferences()
+    {
+      if (!Def.RunCeres2Engine)
+      {
+        return;
+      }
+
+      // The engine instances are created during Init (which has already run when this is
+      // called); peek at one warmed-up worker pair to inspect the effective parameters.
+      if (!EngineSets.TryPeek(out var engineSet))
+      {
+        return;
+      }
+
+      if (engineSet.Engine1 is not GameEngineCeresMCGSInProcess mcgs1
+       || engineSet.Engine2 is not GameEngineCeresMCGSInProcess mcgs2)
+      {
+        return;
+      }
+
+      string searchDiff = ObjUtils.FieldValuesDumpString<ParamsSearch>(mcgs1.SearchParams, mcgs2.SearchParams, true);
+      string executionDiff = ObjUtils.FieldValuesDumpString<ParamsSearchExecution>(mcgs1.SearchParams.Execution, mcgs2.SearchParams.Execution, true);
+      string selectDiff = ObjUtils.FieldValuesDumpString<ParamsSelect>(mcgs1.SelectParams, mcgs2.SelectParams, true);
+
+      // FieldValuesDumpString returns null for a section when there are no differences.
+      if (searchDiff == null && executionDiff == null && selectDiff == null)
+      {
+        return;
+      }
+
+      Def.Output.WriteLine();
+      Def.Output.WriteLine("MCGS1 (C1) vs MCGS2 (C2) parameter differences");
+      if (searchDiff != null)
+      {
+        Def.Output.WriteLine(searchDiff);
+      }
+      if (executionDiff != null)
+      {
+        Def.Output.WriteLine(executionDiff);
+      }
+      if (selectDiff != null)
+      {
+        Def.Output.WriteLine(selectDiff);
+      }
+      Def.Output.WriteLine();
+    }
+
+
+    /// <summary>
+    /// Runs the suite test.
+    ///
+    /// When useMultiEngineMode is true a legacy (one/two/three engine) definition is converted
+    /// on the fly into multiengine mode (with the first Ceres engine as the baseline) and run via
+    /// the multiengine path — i.e. the single in-place-refreshed statistics block instead of the
+    /// per-position detail rows. In that case (or when the definition was already in multiengine
+    /// mode) the comprehensive result is exposed via the MultiEngineResult property and this
+    /// method returns null.
+    /// </summary>
     public SuiteTestResult Run(int numConcurrentSuiteThreads = 1,
                                bool outputDetail = true,
                                bool saveCacheWhenDone = true,
-                               bool enableCancelVialCtrlC = true)
+                               bool enableCancelVialCtrlC = true,
+                               bool useMultiEngineMode = false)
     {
+      // Optionally convert a legacy definition into multiengine mode (Engine1 = baseline).
+      if (useMultiEngineMode && !Def.IsMultiEngine)
+      {
+        Def.ConfigureMultiEngineFromLegacy();
+      }
+
+      if (Def.IsMultiEngine)
+      {
+        MultiEngineResult = RunMultiEngine(numConcurrentSuiteThreads, outputDetail, enableCancelVialCtrlC);
+        return null;
+      }
+
+      outputDetailRun = outputDetail;
+
       // Tree reuse is no help, indicate that we won't need it
       Def.Engine1Def.DisableTreeReuse();
       Def.Engine2Def?.DisableTreeReuse();
@@ -153,9 +409,19 @@ namespace Ceres.Features.Suites
       // for the warmup which is confusing because different parameters
       // will be chosen for the actual search.
       //DumpParams(Def.Output, true);
+
+      // If a device pool was supplied (via the concurrency constructor) then it governs
+      // the number of concurrent workers, and each worker is assigned a distinct set of GPUs.
+      int numDevicesPerWorker = 0;
+      if (DeviceIDs != null)
+      {
+        numConcurrentSuiteThreads = NumConcurrent;
+        numDevicesPerWorker = ComputeAndValidateDevicePartitioning();
+      }
+
       this.numConcurrentSuiteThreads = numConcurrentSuiteThreads;
 
-      Init();
+      Init(numDevicesPerWorker);
 
       // Install Ctrl-C handler to allow ad hoc clean termination (with stats).
       bool stopRequested = false;
@@ -210,6 +476,11 @@ namespace Ceres.Features.Suites
         Def.Output.WriteLine("EX = " + Def.ExternalEngineDef.EngineDef);
       }
 
+      // If both engines are in-process MCGS engines, dump any differences in their
+      // search/selection parameters as part of the header (so A/B parameter comparisons
+      // are self-documenting in the suite output).
+      DumpMCGSEngineParamsDifferences();
+
 #if NOT
       // To make up for the fact that LZ0 "cheats" by sometimes running over specified number of nodes
       // (she seems to always fill the batch even if reached limit), add half a batch extra for Ceres as compensation
@@ -248,6 +519,8 @@ namespace Ceres.Features.Suites
       if (Def.MaxNumPositions > epds.Count) Def.MaxNumPositions = epds.Count;
       epds = epds.GetRange(Def.FirstTestPosition, Def.MaxNumPositions);
 
+      numPositionsInRun = epds.Count;
+
       int numExternalGameProcesses = 1;
 
       numConcurrentSuiteThreads = Math.Min(Def.MaxNumPositions, numConcurrentSuiteThreads);
@@ -276,7 +549,7 @@ namespace Ceres.Features.Suites
           GameEngineDefLC0 lc0EngineDef = Def.ExternalEngineDef.EngineDef as GameEngineDefLC0;
           bool forceDisableSmartPruning = lc0EngineDef.ForceDisableSmartPruning;
           const bool FILL_HISTORY = true;
-          Chess.NNEvaluators.Defs.NNEvaluatorDef engine1EvalDef = Def.Engine1Def.GetEvaluatorDef();
+          NNEvaluatorDef engine1EvalDef = lc0EngineDef.EvaluatorDef;
           makeExternalEngine = (int processorGroupID) =>
           {
             LC0Engine engine = LC0EngineConfigured.GetLC0Engine(null, null, engine1EvalDef,
@@ -341,6 +614,16 @@ namespace Ceres.Features.Suites
 
       Shutdown(externalEnginePool);
 
+      // Mean of a per-position column (from the accumulator), coalescing NaN (absent column) to 0.
+      float ColAvg(string id)
+      {
+        double v = columnAcc.Average(id);
+        return double.IsNaN(v) ? 0.0f : (float)v;
+      }
+
+      float avgEPS1 = numSearches > 0 ? (float)sumEPS1 / numSearches : 0;
+      float avgEPS2 = numSearches > 0 ? (float)sumEPS2 / numSearches : 0;
+
       return new SuiteTestResult(Def)
       {
         AvgScore1 = (float)accCeres1 / numSearches,
@@ -360,27 +643,621 @@ namespace Ceres.Features.Suites
         TotalNodes1 = totalNodes1,
         TotalNodes2 = totalNodes2,
 
-        AvgAbsQDifference = finalQ2.Count == 0 ? 0 : StatUtils.Average(StatUtils.AbsDiff(finalQ1.ToArray(), finalQ2.ToArray()))
+        AvgAbsQDifference = finalQ2.Count == 0 ? 0 : StatUtils.Average(StatUtils.AbsDiff(finalQ1.ToArray(), finalQ2.ToArray())),
+
+        // Per-position averages (mirroring the console columns).
+        AvgDepth1 = ColAvg("ADep"),
+        AvgDepth2 = ColAvg("ADep2"),
+        MaxDepth1 = ColAvg("MDep"),
+        MaxDepth2 = ColAvg("MDep2"),
+        VisitEntropy1 = ColAvg("VEnt"),
+        VisitEntropy2 = ColAvg("VEnt2"),
+        YieldFrac1 = ColAvg("Yld"),
+        YieldFrac2 = ColAvg("Yld2"),
+        CorrectMoveVisitFracPct1 = ColAvg("Fr"),
+        CorrectMoveVisitFracPct2 = ColAvg("Fr2"),
+        AvgQ1 = ColAvg("QC"),
+        AvgQ2 = ColAvg("QC2"),
+        AvgQLC0 = ColAvg("QEx"),
+
+        // Totals (sums) over all positions.
+        TotalNNBatches1 = sumEvalNumBatches1,
+        TotalNNBatches2 = sumEvalNumBatches2,
+        TotalNNEvals1 = sumEvalNumPos1,
+        TotalNNEvals2 = sumEvalNumPos2,
+        TotalTablebaseHits1 = sumTablebaseHits1,
+        TotalTablebaseHits2 = sumTablebaseHits2,
+        TotalNodesWhenChoseTopN1 = sumCeres1NumNodesWhenChoseTopNode,
+        TotalNodesWhenChoseTopN2 = sumCeres2NumNodesWhenChoseTopNode,
+
+        // Correct-move-visit comparison (positions where both engines exposed root visit stats).
+        CountEngine1MoreCorrectVisits = countEngine1MoreCorrectVisits,
+        CountEngine2MoreCorrectVisits = countEngine2MoreCorrectVisits,
+        CountCorrectVisitsEqual = countCorrectVisitsEqual,
+        CountCorrectVisitsCompared = countCorrectVisitsCompared,
+
+        // Suite identity.
+        ID = Def.ID,
+        EPDFileName = Def.EPDFileName,
+        NumPositionsTested = numPositionsInRun,
+        SearchLimit1 = Def.CeresEngine1Def?.SearchLimit,
+        SearchLimit2 = Def.CeresEngine2Def?.SearchLimit,
+        MachineName = Environment.MachineName,
+        RunDateTime = DateTime.Now,
+
+        // Performance summary metrics.
+        MeanPolicyKLD = countPolicyKLD > 0 ? (float)(sumPolicyKLD / countPolicyKLD) : float.NaN,
+        CountPolicyKLDPositions = countPolicyKLD,
+        AvgEPS1 = avgEPS1,
+        AvgEPS2 = avgEPS2,
+        RelativeEPSPct = avgEPS2 > 0 ? (avgEPS1 / avgEPS2 - 1.0f) * 100.0f : 0
       };
 
     }
+
+    #region Multiengine mode
+
+    // Index (into Def.MultiEngineDefs) of the baseline engine in multiengine mode.
+    int baselineIndexMulti;
+
+
+    /// <summary>
+    /// Runs the suite in "multiengine mode": an arbitrary number of engines (each a standard
+    /// in-process Ceres engine or an external engine) are compared at once on the same set of
+    /// positions. Results are shown in a single statistics block which is refreshed in place
+    /// as the suite runs (best value per row green, worst red), and returned as a comprehensive
+    /// MultiEngineSuiteResult. Requires a SuiteTestDef built with the multiengine constructor.
+    ///
+    /// As in the two-engine mode, each concurrent worker holds its own instance of every engine;
+    /// for any position a worker runs all its engines sequentially on its own GPU(s) (so the
+    /// measured per-engine timings/EPS remain directly comparable). Multi-GPU spreading via the
+    /// SuiteTestRunner(def, numConcurrent, deviceIDs) constructor is supported.
+    /// </summary>
+    public MultiEngineSuiteResult RunMultiEngine(int numConcurrentSuiteThreads = 1,
+                                                 bool outputDetail = true,
+                                                 bool enableCancelViaCtrlC = true)
+    {
+      if (!Def.IsMultiEngine)
+      {
+        throw new Exception("RunMultiEngine requires a SuiteTestDef constructed with the multiengine constructor.");
+      }
+
+      List<MultiEngineEntry> entries = Def.MultiEngineDefs;
+      baselineIndexMulti = entries.FindIndex(e => e.IsBaseline);
+      if (baselineIndexMulti < 0)
+      {
+        baselineIndexMulti = 0;
+      }
+
+      // Tree reuse is no help in suite testing.
+      foreach (MultiEngineEntry e in entries)
+      {
+        e.PlayerDef.EngineDef.DisableTreeReuse();
+      }
+
+      // If a device pool was supplied (via the concurrency constructor) it governs the number
+      // of concurrent workers, and each worker is assigned a distinct set of GPUs.
+      int numDevicesPerWorker = 0;
+      if (DeviceIDs != null)
+      {
+        numConcurrentSuiteThreads = NumConcurrent;
+        numDevicesPerWorker = ComputeAndValidateDevicePartitioningMulti();
+      }
+      this.numConcurrentSuiteThreads = numConcurrentSuiteThreads;
+
+      InitMultiEngine(numDevicesPerWorker);
+
+      // Install Ctrl-C handler to allow ad hoc clean termination (with stats so far).
+      bool stopRequested = false;
+      if (enableCancelViaCtrlC)
+      {
+        ConsoleCancelEventHandler ctrlCHandler = new ConsoleCancelEventHandler((object sender, ConsoleCancelEventArgs args) =>
+        {
+          Console.WriteLine("Suite pending shutdown....");
+          stopRequested = true;
+          args.Cancel = true;
+        });
+        Console.CancelKeyPress += ctrlCHandler;
+      }
+
+      List<EPDEntry> epds = LoadAndSliceEPDsMulti();
+      numPositionsInRun = epds.Count;
+
+      this.numConcurrentSuiteThreads = Math.Min(Math.Max(1, epds.Count), this.numConcurrentSuiteThreads);
+
+      WriteMultiEngineHeader();
+
+      MultiEngineAccumulator acc = new MultiEngineAccumulator(entries, baselineIndexMulti);
+      MultiEngineLiveDisplay display = new MultiEngineLiveDisplay(Def.Output, entries.ToArray(), epds.Count);
+
+      using (new TimingBlock("EPDS", Def.Output == Console.Out ? TimingBlock.LoggingType.Console : TimingBlock.LoggingType.None))
+      {
+        Parallel.For(0, epds.Count,
+                     new ParallelOptions() { MaxDegreeOfParallelism = this.numConcurrentSuiteThreads },
+                     delegate (int gameNum)
+                     {
+                       if (stopRequested)
+                       {
+                         return;
+                       }
+
+                       try
+                       {
+                         EPDEntry epd = epds[gameNum];
+
+                         // Skip positions which are already draws.
+                         if (epd.Position.CheckDrawBasedOnMaterial == Position.PositionDrawStatus.DrawByInsufficientMaterial)
+                         {
+                           return;
+                         }
+
+                         ProcessEPDMultiEngine(gameNum, epd, acc, display);
+                       }
+                       catch (Exception exc)
+                       {
+                         Def.Output.WriteLine("Error in ProcessEPDMultiEngine " + exc);
+                         throw;
+                       }
+                     });
+      }
+
+      // Final frozen statistics block.
+      MultiEngineEngineResult[] snapshot = acc.Snapshot();
+      display.RenderFinal(snapshot, acc.PositionsDone);
+
+      if (outputDetail)
+      {
+        WriteMultiEngineDetailDump(snapshot);
+      }
+
+      ShutdownMultiEngine();
+
+      return new MultiEngineSuiteResult(Def)
+      {
+        Engines = snapshot,
+        BaselineIndex = baselineIndexMulti,
+        ID = Def.ID,
+        EPDFileName = Def.EPDFileName,
+        NumPositionsTested = acc.PositionsDone,
+        MachineName = Environment.MachineName,
+        RunDateTime = DateTime.Now
+      };
+    }
+
+
+    /// <summary>
+    /// Loads, filters and slices the EPD test positions for a multiengine run
+    /// (Lichess puzzle format is not currently supported in multiengine mode).
+    /// </summary>
+    List<EPDEntry> LoadAndSliceEPDsMulti()
+    {
+      if (Def.EPDLichessPuzzleFormat)
+      {
+        throw new NotSupportedException("Lichess puzzle format EPD files are not yet supported in multiengine mode.");
+      }
+
+      List<EPDEntry> epds = EPDEntry.EPDEntriesInEPDFile(Def.EPDFileName, Def.MaxNumPositions,
+                                                         Def.EPDLichessPuzzleFormat,
+                                                         Def.EPDRawLineFilter, Def.EPDFilter);
+
+      if (Def.SkipNumPositions > 0)
+      {
+        if (Def.SkipNumPositions >= epds.Count)
+        {
+          throw new Exception("Insufficient positions in " + Def.EPDFileName + " to skip " + Def.SkipNumPositions);
+        }
+        epds = epds.GetRange(Def.SkipNumPositions, epds.Count - Def.SkipNumPositions);
+      }
+
+      if (Def.AcceptPosPredicate != null)
+      {
+        epds = epds.Where(s => Def.AcceptPosPredicate(s.Position)).ToList();
+      }
+
+      int first = Math.Min(Def.FirstTestPosition, epds.Count);
+      int max = (Def.MaxNumPositions <= 0 || Def.MaxNumPositions == int.MaxValue)
+              ? epds.Count - first
+              : Math.Min(Def.MaxNumPositions, epds.Count - first);
+      epds = epds.GetRange(first, max);
+      return epds;
+    }
+
+
+    /// <summary>
+    /// Validates that the supplied DeviceIDs pool can be partitioned into one chunk per
+    /// concurrent worker (one chunk per worker, chunk size = number of devices referenced by
+    /// the Ceres engines, which must all match), and returns the number of devices per worker.
+    /// </summary>
+    int ComputeAndValidateDevicePartitioningMulti()
+    {
+      int? numDevicesPerWorker = null;
+      foreach (MultiEngineEntry e in Def.MultiEngineDefs)
+      {
+        Chess.NNEvaluators.Defs.NNEvaluatorDef evalDef = e.PlayerDef.EngineDef.GetEvaluatorDef();
+        if (evalDef == null)
+        {
+          continue; // external engine: not assigned a GPU slice
+        }
+
+        int n = evalDef.NumDevices;
+        if (n < 1)
+        {
+          throw new Exception($"Engine {e.ID} specification must reference at least one device.");
+        }
+
+        if (numDevicesPerWorker == null)
+        {
+          numDevicesPerWorker = n;
+        }
+        else if (n != numDevicesPerWorker.Value)
+        {
+          throw new Exception($"All Ceres engines must reference the same number of devices when using DeviceIDs "
+                            + $"(engine {e.ID} has {n}, expected {numDevicesPerWorker.Value}).");
+        }
+      }
+
+      if (numDevicesPerWorker == null)
+      {
+        throw new Exception("DeviceIDs were specified but none of the engines is a Ceres engine with an evaluator.");
+      }
+
+      int numWorkers = NumConcurrent;
+      if (DeviceIDs.Length < numWorkers * numDevicesPerWorker.Value)
+      {
+        throw new Exception($"Insufficient DeviceIDs ({DeviceIDs.Length}): need at least "
+                          + $"NumConcurrent ({numWorkers}) * devices-per-engine ({numDevicesPerWorker.Value}) "
+                          + $"= {numWorkers * numDevicesPerWorker.Value}, so each concurrent worker has its own GPU(s).");
+      }
+
+      return numDevicesPerWorker.Value;
+    }
+
+
+    /// <summary>
+    /// Creates and warms up one array of engine instances per concurrent worker (one instance
+    /// per engine in the multiengine definition). Ceres engines are cloned onto the worker's
+    /// assigned device slice; external engines are created as-is (each worker gets its own).
+    /// </summary>
+    void InitMultiEngine(int numDevicesPerWorker)
+    {
+      List<MultiEngineEntry> entries = Def.MultiEngineDefs;
+      for (int i = 0; i < numConcurrentSuiteThreads; i++)
+      {
+        int[] deviceIDsForWorker = DeviceSliceForWorker(i, numDevicesPerWorker);
+        GameEngine[] arr = new GameEngine[entries.Count];
+        for (int k = 0; k < entries.Count; k++)
+        {
+          MultiEngineEntry e = entries[k];
+          int[] slice = e.IsCeresEngine ? deviceIDsForWorker : null;
+          arr[k] = CreateWorkerEngine(e.PlayerDef.EngineDef, e.Limit, slice);
+        }
+        EngineArrays.Add(arr);
+      }
+    }
+
+
+    /// <summary>
+    /// Evaluates one position with every engine (sequentially, on the worker's own device(s)),
+    /// merges the results into the accumulator and refreshes the live statistics block.
+    /// </summary>
+    void ProcessEPDMultiEngine(int epdNum, EPDEntry epd, MultiEngineAccumulator acc, MultiEngineLiveDisplay display)
+    {
+      if (!EngineArrays.TryTake(out GameEngine[] engines))
+      {
+        throw new Exception("No engine array available");
+      }
+
+      int n = engines.Length;
+      GameEngineSearchResult[] results = new GameEngineSearchResult[n];
+      PositionWithHistory pos = epd.PosWithHistory;
+
+      try
+      {
+        // Rotate the starting engine each position to avoid any systematic ordering effect.
+        int start = epdNum % n;
+        for (int j = 0; j < n; j++)
+        {
+          int k = (start + j) % n;
+          GameEngine eng = engines[k];
+          eng.ResetGame();
+          SearchLimit limit = Def.MultiEngineDefs[k].Limit.ConvertedGameToMoveLimit;
+          results[k] = eng.Search(pos, limit);
+        }
+      }
+      finally
+      {
+        // Restore the array to the pool (so this worker keeps its assigned device(s)).
+        EngineArrays.Add(engines);
+      }
+
+      lock (lockObj)
+      {
+        acc.AddPosition(results, epd);
+        MultiEngineEngineResult[] snapshot = acc.Snapshot();
+        display.Refresh(snapshot, acc.PositionsDone);
+      }
+    }
+
+
+    /// <summary>
+    /// Writes the multiengine header block (suite identity and the participating engines), and
+    /// any MCGS search/selection parameter differences of each engine versus the baseline.
+    /// </summary>
+    void WriteMultiEngineHeader()
+    {
+      Def.Output.WriteLine();
+      Def.Output.WriteLine("MULTIENGINE SUITE TEST: " + Def.ID);
+      Def.Output.WriteLine("  Machine      : " + Environment.MachineName);
+      Def.Output.WriteLine("  Date/Time    : " + DateTime.Now);
+      Def.Output.WriteLine("  EPD file     : " + Def.EPDFileName);
+      Def.Output.WriteLine("  Positions    : " + numPositionsInRun);
+      Def.Output.WriteLine("  Concurrency  : " + numConcurrentSuiteThreads
+                         + (DeviceIDs != null ? "   Devices [" + string.Join(",", DeviceIDs) + "]" : ""));
+      Def.Output.WriteLine();
+
+      foreach (MultiEngineEntry e in Def.MultiEngineDefs)
+      {
+        string kind = !e.IsCeresEngine ? "external"
+                    : (e.PlayerDef.EngineDef is GameEngineDefCeresMCGS ? "MCGS" : "MCTS");
+        Def.Output.WriteLine($"  {e.ID,-12}{(e.IsBaseline ? " *BASELINE" : "         ")}  [{kind,-8}]  limit={e.Limit}   {e.PlayerDef.EngineDef}");
+      }
+
+      DumpMultiEngineParamDifferences();
+
+      Def.Output.WriteLine();
+    }
+
+
+    /// <summary>
+    /// For each in-process MCGS engine, writes any differences in its ParamsSearch / ParamsSelect
+    /// versus the baseline engine (when the baseline is also an MCGS engine). Nothing is written
+    /// when the engines are not MCGS or their parameters are identical.
+    /// </summary>
+    void DumpMultiEngineParamDifferences()
+    {
+      if (!EngineArrays.TryPeek(out GameEngine[] arr))
+      {
+        return;
+      }
+
+      if (arr[baselineIndexMulti] is not GameEngineCeresMCGSInProcess baseMCGS)
+      {
+        return;
+      }
+
+      for (int k = 0; k < arr.Length; k++)
+      {
+        if (k == baselineIndexMulti || arr[k] is not GameEngineCeresMCGSInProcess mcgs)
+        {
+          continue;
+        }
+
+        string searchDiff = ObjUtils.FieldValuesDumpString<ParamsSearch>(mcgs.SearchParams, baseMCGS.SearchParams, true);
+        string selectDiff = ObjUtils.FieldValuesDumpString<ParamsSelect>(mcgs.SelectParams, baseMCGS.SelectParams, true);
+        if (searchDiff == null && selectDiff == null)
+        {
+          continue;
+        }
+
+        Def.Output.WriteLine();
+        Def.Output.WriteLine($"  {Def.MultiEngineDefs[k].ID} vs baseline {Def.MultiEngineDefs[baselineIndexMulti].ID} parameter differences:");
+        if (searchDiff != null)
+        {
+          Def.Output.WriteLine(searchDiff);
+        }
+        if (selectDiff != null)
+        {
+          Def.Output.WriteLine(selectDiff);
+        }
+      }
+    }
+
+
+    /// <summary>
+    /// Writes a per-engine detail recap (all available aggregate statistics) at end of run,
+    /// after the live statistics block has been frozen.
+    /// </summary>
+    void WriteMultiEngineDetailDump(MultiEngineEngineResult[] engines)
+    {
+      Def.Output.WriteLine();
+      Def.Output.WriteLine("PER-ENGINE DETAIL");
+      foreach (MultiEngineEngineResult r in engines)
+      {
+        string Fmt(float v, string fmt) => float.IsNaN(v) ? "n/a" : v.ToString(fmt);
+        Def.Output.WriteLine($"  {r.ID}{(r.IsBaseline ? "*" : "")} [{r.Kind}]  positions={r.NumPositions}");
+        Def.Output.WriteLine($"      solve={Fmt(r.AvgSolveScorePct, "F1")}%  EPS={Fmt(r.AvgEPS, "N0")}  Q={Fmt(r.AvgQ, "F3")}  "
+                           + $"|dQ|vsBase={Fmt(r.AvgAbsQDiffVsBaseline, "F3")}  KLDvsBase={Fmt(r.AvgPolicyKLDVsBaseline, "F4")}  "
+                           + $"correctVisits={Fmt(r.AvgCorrectMoveVisitPct, "F1")}%");
+        Def.Output.WriteLine($"      nodes={r.TotalNodes:N0}  time={r.TotalTimeSecs:F1}s  NNevals={r.TotalNNEvals:N0}  "
+                           + $"TBhits={r.TotalTablebaseHits:N0}  avgDepth={Fmt(r.AvgDepth, "F1")}  visitEntropy={Fmt(r.AvgVisitEntropy, "F2")}");
+      }
+      Def.Output.WriteLine();
+    }
+
+
+    void ShutdownMultiEngine()
+    {
+      // Note: like the two-engine Shutdown, engine disposal is currently skipped (the underlying
+      // dispose path has a known issue); we simply release the engine references.
+      EngineArrays.Clear();
+    }
+
+
+    /// <summary>
+    /// Accumulates per-engine aggregate statistics across all positions in a multiengine run,
+    /// including the baseline-relative difference statistics. A position's full set of engine
+    /// results is added atomically (caller holds the suite lock).
+    /// </summary>
+    internal sealed class MultiEngineAccumulator
+    {
+      readonly int n;
+      readonly int baselineIndex;
+      readonly MultiEngineEntry[] entries;
+      readonly MultiEngineKind[] kinds;
+
+      public int PositionsDone { get; private set; }
+      public int BaselineIndex => baselineIndex;
+
+      readonly double[] sumSolve; readonly int[] cntSolve;
+      readonly double[] sumEPS;   readonly int[] cntEPS;
+      readonly double[] sumQ;     readonly int[] cntQ;
+      readonly double[] sumCV;    readonly int[] cntCV;
+      readonly double[] sumQDiff; readonly int[] cntQDiff;
+      readonly double[] sumKLD;   readonly int[] cntKLD;
+      readonly long[] totNodes;
+      readonly double[] totTime;
+      readonly long[] totNNEvals;
+      readonly long[] totTB;
+      readonly double[] sumDepth; readonly int[] cntDepth;
+      readonly double[] sumEnt;   readonly int[] cntEnt;
+
+      public MultiEngineAccumulator(List<MultiEngineEntry> entriesList, int baselineIndex)
+      {
+        entries = entriesList.ToArray();
+        this.baselineIndex = baselineIndex;
+        n = entries.Length;
+
+        kinds = new MultiEngineKind[n];
+        for (int k = 0; k < n; k++)
+        {
+          MultiEngineEntry e = entries[k];
+          kinds[k] = !e.IsCeresEngine ? MultiEngineKind.External
+                   : (e.PlayerDef.EngineDef is GameEngineDefCeresMCGS ? MultiEngineKind.CeresMCGS : MultiEngineKind.CeresMCTS);
+        }
+
+        sumSolve = new double[n]; cntSolve = new int[n];
+        sumEPS = new double[n];   cntEPS = new int[n];
+        sumQ = new double[n];     cntQ = new int[n];
+        sumCV = new double[n];    cntCV = new int[n];
+        sumQDiff = new double[n]; cntQDiff = new int[n];
+        sumKLD = new double[n];   cntKLD = new int[n];
+        totNodes = new long[n];
+        totTime = new double[n];
+        totNNEvals = new long[n];
+        totTB = new long[n];
+        sumDepth = new double[n]; cntDepth = new int[n];
+        sumEnt = new double[n];   cntEnt = new int[n];
+      }
+
+      public void AddPosition(GameEngineSearchResult[] results, EPDEntry epd)
+      {
+        PositionsDone++;
+
+        Position position = epd.Position;
+        GameEngineSearchResult baseR = (baselineIndex >= 0 && baselineIndex < results.Length) ? results[baselineIndex] : null;
+
+        for (int k = 0; k < n; k++)
+        {
+          GameEngineSearchResult r = results[k];
+          if (r == null)
+          {
+            continue;
+          }
+
+          // Solve score (correctness 0..10), best move parsed uniformly from the UCI move string.
+          Move bm = default;
+          try
+          {
+            bm = Move.FromUCI(in position, r.MoveString);
+          }
+          catch
+          {
+            // Unparseable move (counts as not solved).
+          }
+          int score = bm.IsNull ? 0 : epd.CorrectnessScore(bm, 10);
+          sumSolve[k] += score; cntSolve[k]++;
+
+          // EPS (only counted when the engine reported a value).
+          if (r.EPS > 0)
+          {
+            sumEPS[k] += r.EPS; cntEPS[k]++;
+          }
+
+          // Root Q (best-move Q, populated by all engine types).
+          sumQ[k] += r.ScoreQ; cntQ[k]++;
+
+          // Correct-move visit fraction (requires per-move visit statistics).
+          double cv = CorrectMoveVisitFraction(r, epd);
+          if (!double.IsNaN(cv))
+          {
+            sumCV[k] += cv; cntCV[k]++;
+          }
+
+          // Totals / additional aggregates.
+          totNodes[k] += r.FinalN;
+          totTime[k] += r.TimingStats.ElapsedTimeSecs;
+          totNNEvals[k] += r.NumNNNodes;
+          totTB[k] += r.CountSearchContinuations > 0 ? 0 : r.CountTablebaseHits;
+          if (r.AvgDepth > 0)
+          {
+            sumDepth[k] += r.AvgDepth; cntDepth[k]++;
+          }
+          if (r.VisitEntropy > 0)
+          {
+            sumEnt[k] += r.VisitEntropy; cntEnt[k]++;
+          }
+
+          // Baseline-relative difference statistics (skipped for the baseline engine itself).
+          if (k != baselineIndex && baseR != null)
+          {
+            sumQDiff[k] += Math.Abs(r.ScoreQ - baseR.ScoreQ); cntQDiff[k]++;
+            if (r.VerboseMoveStats != null && baseR.VerboseMoveStats != null)
+            {
+              double kld = PolicySymmetricKLD(r.VerboseMoveStats, baseR.VerboseMoveStats);
+              if (!double.IsNaN(kld))
+              {
+                sumKLD[k] += kld; cntKLD[k]++;
+              }
+            }
+          }
+        }
+      }
+
+      public MultiEngineEngineResult[] Snapshot()
+      {
+        MultiEngineEngineResult[] outArr = new MultiEngineEngineResult[n];
+        for (int k = 0; k < n; k++)
+        {
+          outArr[k] = new MultiEngineEngineResult
+          {
+            ID = entries[k].ID,
+            IsBaseline = k == baselineIndex,
+            Kind = kinds[k],
+            SearchLimit = entries[k].Limit,
+            NumPositions = cntSolve[k],
+            AvgSolveScorePct = cntSolve[k] > 0 ? (float)(sumSolve[k] / cntSolve[k]) * 10f : float.NaN,
+            AvgEPS = cntEPS[k] > 0 ? (float)(sumEPS[k] / cntEPS[k]) : float.NaN,
+            AvgTimeSecs = cntSolve[k] > 0 ? (float)(totTime[k] / cntSolve[k]) : float.NaN,
+            AvgQ = cntQ[k] > 0 ? (float)(sumQ[k] / cntQ[k]) : float.NaN,
+            AvgAbsQDiffVsBaseline = (k == baselineIndex || cntQDiff[k] == 0) ? float.NaN : (float)(sumQDiff[k] / cntQDiff[k]),
+            AvgPolicyKLDVsBaseline = (k == baselineIndex || cntKLD[k] == 0) ? float.NaN : (float)(sumKLD[k] / cntKLD[k]),
+            AvgCorrectMoveVisitPct = cntCV[k] > 0 ? (float)(sumCV[k] / cntCV[k]) : float.NaN,
+            TotalNodes = totNodes[k],
+            TotalTimeSecs = (float)totTime[k],
+            TotalNNEvals = totNNEvals[k],
+            TotalTablebaseHits = totTB[k],
+            AvgDepth = cntDepth[k] > 0 ? (float)(sumDepth[k] / cntDepth[k]) : float.NaN,
+            AvgVisitEntropy = cntEnt[k] > 0 ? (float)(sumEnt[k] / cntEnt[k]) : float.NaN
+          };
+        }
+        return outArr;
+      }
+    }
+
+    #endregion
+
 
     private void Shutdown(ObjectPool<object> externalEnginePool)
     {
       return;
 
       // TODO: restore this, currently buggy (stack overflow)
-      foreach (var engine in EnginesCeres1)
+      foreach (var engineSet in EngineSets)
       {
-        engine.Dispose();
+        engineSet.Engine1?.Dispose();
+        engineSet.Engine2?.Dispose();
       }
-      EnginesCeres1.Clear();
-
-      foreach (var engine in EnginesCeres2)
-      {
-        engine.Dispose();
-      }
-      EnginesCeres2.Clear();
+      EngineSets.Clear();
 
       EngineExternal?.Dispose();
 
@@ -389,6 +1266,12 @@ namespace Ceres.Features.Suites
 
     private void WriteSummaries()
     {
+      // Averaged summary row, aligned directly beneath the per-position detail table.
+      if (outputDetailRun)
+      {
+        WriteSummaryRow();
+      }
+
       Def.Output.WriteLine();
 
       Def.Output.WriteLine();
@@ -434,7 +1317,297 @@ namespace Ceres.Features.Suites
       float stdFaster = (float)StatUtils.StdDev(solvedPct1MinusPct2Samples) / MathF.Sqrt(solvedPct1MinusPct2Samples.Count);
       Def.Output.WriteLine($"Ceres1 time required to solve vs. Ceres2 (%) {(100* avgFaster),5:F2} +/-{(100 * stdFaster),5:F2}");
 
+      if (Def.CeresEngine2Def != null)
+      {
+        Def.Output.WriteLine();
+        Def.Output.WriteLine($"Correct move visits (fraction of root visits on the correct move(s), ~equal = within 3 points):");
+        Def.Output.WriteLine($"  Ceres1 more visits {countEngine1MoreCorrectVisits,5}   "
+                           + $"Ceres2 more visits {countEngine2MoreCorrectVisits,5}   "
+                           + $"~equal {countCorrectVisitsEqual,5}   of {countCorrectVisitsCompared,5}");
+      }
+
+      // Recap header block followed by the boxed performance summary, at the very end of output.
       Def.Output.WriteLine();
+      WriteSuiteHeaderBlock();
+      if (Def.CeresEngine2Def != null)
+      {
+        Def.Output.WriteLine();
+        WritePerformanceSummary();
+      }
+
+      Def.Output.WriteLine();
+    }
+
+
+    /// <summary>
+    /// Emits a final "summary row" beneath the per-position detail table. Each column shows
+    /// the average of its per-position values, except the running cumulative-average score
+    /// columns (rendered as their final converged value) and non-numeric columns (blank).
+    /// The row reuses the exact column ids and widths captured during the run, so it aligns
+    /// directly under the table headers.
+    /// </summary>
+    private void WriteSummaryRow()
+    {
+      if (columnAcc.RowCount == 0)
+      {
+        return;
+      }
+
+      Writer w = new Writer(true);
+      foreach ((string id, int width, CellAgg agg, string summaryFormat) in columnAcc.Order)
+      {
+        string display;
+        if (id == "#")
+        {
+          display = "AVG";
+        }
+        else if (agg == CellAgg.None)
+        {
+          display = "";
+        }
+        else if (agg == CellAgg.Final)
+        {
+          display = FormatFinal(id, summaryFormat);
+        }
+        else
+        {
+          double avg = columnAcc.Average(id);
+          display = double.IsNaN(avg) ? "" : string.Format(summaryFormat, avg);
+        }
+
+        w.Add(id, display, width);
+      }
+
+      Def.Output.WriteLine(w.dividers.ToString());
+      Def.Output.WriteLine(w.text.ToString());
+    }
+
+
+    /// <summary>
+    /// Renders the final converged value of a running cumulative-average "score" column,
+    /// computed directly from the authoritative accumulators (matching the per-position
+    /// interpolation), using the supplied composite format string.
+    /// </summary>
+    private string FormatFinal(string id, string summaryFormat)
+    {
+      double v = id switch
+      {
+        "CEx" => numSearches == 0 ? 0 : (double)avgOther / numSearches,
+        "CC"  => numSearches == 0 ? 0 : (double)accCeres1 / numSearches,
+        "CC2" => numSearches == 0 ? 0 : (double)accCeres2 / numSearches,
+        "P"   => numSearchesBothFound == 0 ? 0 : 0.001 * accWCeres1 / numSearchesBothFound,
+        "P2"  => numSearchesBothFound == 0 ? 0 : 0.001 * accWCeres2 / numSearchesBothFound,
+        _     => double.NaN
+      };
+
+      return double.IsNaN(v) ? "" : string.Format(summaryFormat, v);
+    }
+
+
+    /// <summary>
+    /// Converts a list of per-move verbose stats into an empirical policy distribution
+    /// (move -> probability) using final visit counts, excluding the "node" pseudo-entry.
+    /// Returns null if there were no visits.
+    /// </summary>
+    private static Dictionary<string, double> EmpiricalPolicyDistribution(List<VerboseMoveStat> stats)
+    {
+      Dictionary<string, long> counts = new();
+      long total = 0;
+      foreach (VerboseMoveStat s in stats)
+      {
+        if (s.MoveString == null || s.MoveString == "node")
+        {
+          continue;
+        }
+        counts.TryGetValue(s.MoveString, out long c);
+        counts[s.MoveString] = c + s.VisitCount;
+        total += s.VisitCount;
+      }
+
+      if (total <= 0 || counts.Count == 0)
+      {
+        return null;
+      }
+
+      Dictionary<string, double> dist = new(counts.Count);
+      foreach (KeyValuePair<string, long> kv in counts)
+      {
+        dist[kv.Key] = (double)kv.Value / total;
+      }
+      return dist;
+    }
+
+
+    /// <summary>
+    /// Symmetric KL divergence 0.5*(KL(P1||P2) + KL(P2||P1)) between the two engines' empirical
+    /// root-move visit distributions. Returns NaN if either distribution is unavailable.
+    /// A small probability floor avoids log(0) for moves visited by only one engine.
+    /// </summary>
+    private static double PolicySymmetricKLD(List<VerboseMoveStat> stats1, List<VerboseMoveStat> stats2)
+    {
+      Dictionary<string, double> d1 = EmpiricalPolicyDistribution(stats1);
+      Dictionary<string, double> d2 = EmpiricalPolicyDistribution(stats2);
+      if (d1 == null || d2 == null)
+      {
+        return double.NaN;
+      }
+
+      HashSet<string> moves = new(d1.Keys);
+      moves.UnionWith(d2.Keys);
+
+      const double FLOOR = 1e-9;
+      double KL(Dictionary<string, double> p, Dictionary<string, double> q)
+      {
+        double acc = 0;
+        foreach (string m in moves)
+        {
+          p.TryGetValue(m, out double pv);
+          if (pv <= 0)
+          {
+            continue;
+          }
+          q.TryGetValue(m, out double qv);
+          acc += pv * Math.Log(pv / Math.Max(qv, FLOOR));
+        }
+        return acc;
+      }
+
+      return 0.5 * (KL(d1, d2) + KL(d2, d1));
+    }
+
+
+    /// <summary>
+    /// Returns the percentage of the search's total root visits (FinalN) that landed on the
+    /// correct move(s) for this position, summed over all correct moves (handles multi-best and
+    /// avoid-move EPDs uniformly via EPDEntry.CorrectnessScore). Returns NaN if per-move visit
+    /// statistics are unavailable or the search had no visits.
+    /// </summary>
+    private static double CorrectMoveVisitFraction(GameEngineSearchResult search, EPDEntry epd)
+    {
+      if (search?.VerboseMoveStats == null || search.FinalN <= 0)
+      {
+        return double.NaN;
+      }
+
+      Position position = epd.Position;
+      long correctVisits = 0;
+      foreach (VerboseMoveStat stat in search.VerboseMoveStats)
+      {
+        if (stat.MoveString == null || stat.MoveString == "node")
+        {
+          continue;
+        }
+
+        Move move;
+        try
+        {
+          move = Move.FromUCI(in position, stat.MoveString);
+        }
+        catch
+        {
+          continue;
+        }
+
+        if (epd.CorrectnessScore(move, 10) == 10)
+        {
+          correctVisits += stat.VisitCount;
+        }
+      }
+
+      return 100.0 * correctVisits / search.FinalN;
+    }
+
+
+    /// <summary>
+    /// Writes a recap header block (loosely patterned after TournamentDef.DumpParams) identifying
+    /// the suite, machine, positions, EPD file, and the engine player definitions.
+    /// </summary>
+    private void WriteSuiteHeaderBlock()
+    {
+      void Line(string label, object value) => Def.Output.WriteLine($"  {label,-20}: {value}");
+
+      Def.Output.WriteLine("SUITE TEST");
+      Line("ID", Def.ID);
+      Line("Machine Name", Environment.MachineName);
+      Line("Date/Time", DateTime.Now);
+      Line("Test Positions", numPositionsInRun);
+      Line("EPD file name", Def.EPDFileName);
+      Def.Output.WriteLine($"  Player 1 : {Def.CeresEngine1Def}");
+      if (Def.RunCeres2Engine)
+      {
+        Def.Output.WriteLine($"  Player 2 : {Def.CeresEngine2Def}");
+      }
+      if (Def.ExternalEngineDef != null)
+      {
+        Def.Output.WriteLine($"  External : {Def.ExternalEngineDef}");
+      }
+    }
+
+
+    /// <summary>
+    /// Writes the boxed performance-summary table of head-to-head metrics (engine 1 vs engine 2).
+    /// </summary>
+    private void WritePerformanceSummary()
+    {
+      float meanAbsQ = (finalQ2 == null || finalQ2.Count == 0)
+                     ? 0
+                     : (float)StatUtils.Average(StatUtils.AbsDiff(finalQ1.ToArray(), finalQ2.ToArray()));
+
+      float avgScore1 = numSearches > 0 ? (float)accCeres1 / numSearches : 0;
+      float avgScore2 = numSearches > 0 ? (float)accCeres2 / numSearches : 0;
+
+      float avgEPS1 = numSearches > 0 ? (float)sumEPS1 / numSearches : 0;
+      float avgEPS2 = numSearches > 0 ? (float)sumEPS2 / numSearches : 0;
+      float relEPS = avgEPS2 > 0 ? (avgEPS1 / avgEPS2 - 1.0f) * 100.0f : 0;
+
+      string policyStr = countPolicyKLD > 0
+                       ? (sumPolicyKLD / countPolicyKLD).ToString("F4")
+                       : "n/a";
+
+      List<(string, string)> rows = new()
+      {
+        ("Q difference (mean abs)",       meanAbsQ.ToString("F4")),
+        ("Policy difference (sym KLD)",   policyStr),
+        ("Evaluation intensity (EPS)",    $"{relEPS.ToString("+0.0;-0.0")}%  ({avgEPS1:N0} vs {avgEPS2:N0})"),
+        ("Solve score difference",        $"{(avgScore1 - avgScore2).ToString("+0.00;-0.00")} ({avgScore1:F2} vs {avgScore2:F2})"),
+        ("Solve correct move visits (3%)", $"{countEngine1MoreCorrectVisits} better vs {countEngine2MoreCorrectVisits} better"),
+      };
+
+      WriteBoxedTable("PERFORMANCE SUMMARY  (C1 vs C2)", rows);
+    }
+
+
+    /// <summary>
+    /// Writes a simple ASCII boxed table: a title row, then one "label : value" row per entry,
+    /// auto-sized to the widest content. ASCII borders are used for cross-platform/log safety.
+    /// </summary>
+    private void WriteBoxedTable(string title, List<(string Label, string Value)> rows)
+    {
+      int labelWidth = 0;
+      foreach ((string label, _) in rows)
+      {
+        labelWidth = Math.Max(labelWidth, label.Length);
+      }
+
+      List<string> contentLines = new(rows.Count);
+      int innerWidth = title.Length;
+      foreach ((string label, string value) in rows)
+      {
+        string line = $"{label.PadRight(labelWidth)} : {value}";
+        contentLines.Add(line);
+        innerWidth = Math.Max(innerWidth, line.Length);
+      }
+
+      string border = "+" + new string('-', innerWidth + 2) + "+";
+
+      Def.Output.WriteLine(border);
+      Def.Output.WriteLine($"| {title.PadRight(innerWidth)} |");
+      Def.Output.WriteLine(border);
+      foreach (string line in contentLines)
+      {
+        Def.Output.WriteLine($"| {line.PadRight(innerWidth)} |");
+      }
+      Def.Output.WriteLine(border);
     }
 
 
@@ -446,21 +1619,13 @@ namespace Ceres.Features.Suites
 
     void ProcessEPD(int epdNum, EPDEntry epd, bool outputDetail, ObjectPool<object> otherEngines)
     {
-      GameEngine EngineCeres1 = null;
-      GameEngine EngineCeres2 = null;
-
-      if (!EnginesCeres1.TryTake(out EngineCeres1))
+      if (!EngineSets.TryTake(out var engineSet))
       {
         throw new Exception("No engine available");
       }
 
-      if (Def.Engine2Def != null)
-      {
-        if (!EnginesCeres2.TryTake(out EngineCeres2))
-        {
-          throw new Exception("No engine available");
-        }
-      }
+      GameEngine EngineCeres1 = engineSet.Engine1;
+      GameEngine EngineCeres2 = engineSet.Engine2;
 
       EngineCeres1.ResetGame();
       EngineCeres2?.ResetGame();
@@ -543,6 +1708,11 @@ namespace Ceres.Features.Suites
       int evalNumBatches2 = search2 == null ? 0 : search2.NumNNBatches;
       int evalNumPos2 = search2 == null ? 0 : search2.NumNNNodes;
 
+      // Fraction (percent) of total root visits (FinalN) each engine placed on the correct
+      // move(s) at the end of search (NaN if per-move visit statistics are unavailable).
+      double correctVisitFrac1 = CorrectMoveVisitFraction(search1, epd);
+      double correctVisitFrac2 = search2 == null ? double.NaN : CorrectMoveVisitFraction(search2, epd);
+
       string correctMove = null;
       if (epd.AMMoves != null)
       {
@@ -564,6 +1734,8 @@ namespace Ceres.Features.Suites
         sumEvalNumPosOther += otherEngineAnalysis2 == null ? 0 : (int)otherEngineAnalysis2.Nodes;
         sumEvalNumBatches1 += evalNumBatches1;
         sumEvalNumPos1 += evalNumPos1;
+        sumTablebaseHits1 += search1.CountSearchContinuations > 0 ? 0 : search1.CountTablebaseHits;
+        sumEPS1 += search1.EPS;
 
         if (Def.RunCeres2Engine)
         {
@@ -571,10 +1743,30 @@ namespace Ceres.Features.Suites
           totalNodes2 += search2.FinalN;
           sumEvalNumBatches2 += evalNumBatches2;
           sumEvalNumPos2 += evalNumPos2;
+          sumTablebaseHits2 += search2.CountSearchContinuations > 0 ? 0 : search2.CountTablebaseHits;
+          sumEPS2 += search2.EPS;
+        }
+
+        // Correct-move-visit comparison: which engine placed a larger fraction of its visits on
+        // the correct move(s), counting the two as tied when within 3 percentage points.
+        if (search2 != null && !double.IsNaN(correctVisitFrac1) && !double.IsNaN(correctVisitFrac2))
+        {
+          double diffPts = correctVisitFrac1 - correctVisitFrac2;
+          if (Math.Abs(diffPts) <= 3.0)
+          {
+            countCorrectVisitsEqual++;
+          }
+          else if (diffPts > 0)
+          {
+            countEngine1MoreCorrectVisits++;
+          }
+          else
+          {
+            countEngine2MoreCorrectVisits++;
+          }
+          countCorrectVisitsCompared++;
         }
       }
-
-      float Adjust(int score, float frac) => score == 0 ? 0 : Math.Max(1.0f, MathF.Round(frac * 100.0f, 0));
 
       string worker1PickedNonTopNMoveStr = search1.PickedNonTopNMoveStr;
       string worker2PickedNonTopNMoveStr = search2?.PickedNonTopNMoveStr;
@@ -583,135 +1775,157 @@ namespace Ceres.Features.Suites
       bool c2 = search2 != null;
 
       Writer writer = new Writer(epdNum == 0);
-      writer.Add("#", $"{epdNum,4}", 6);
+
+      // Every column is emitted via this single helper, which both writes the per-position
+      // cell to the Writer (byte-identical to the historical output) and records a Cell so
+      // the same column layout can be replayed as an averaged summary row at end of suite.
+      List<Cell> cells = new();
+      void Emit(string id, string display, int width, CellAgg agg, double value = 0, string summaryFormat = null)
+      {
+        writer.Add(id, display, width);
+        cells.Add(new Cell(id, width, display, agg, value, summaryFormat));
+      }
+
+      // Renders a correct-move-visit-fraction cell (NaN -> "n/a"), prefixed by the non-top-N flag.
+      string FrCell(string prefix, double frac) => double.IsNaN(frac) ? $"{prefix}n/a" : $"{prefix}{frac,3:F0}%";
+
+      Emit("#", $"{epdNum,4}", 6, CellAgg.None);
 
       if (ex)
       {
-        writer.Add("CEx", $"{avgOther,5:F2}", 7);
+        Emit("CEx", $"{avgOther,5:F2}", 7, CellAgg.Final, summaryFormat: "{0,5:F2}");
       }
 
-      writer.Add("CC", $"{avgCeres1,5:F2}", 7);
+      Emit("CC", $"{avgCeres1,5:F2}", 7, CellAgg.Final, summaryFormat: "{0,5:F2}");
       if (c2)
       {
-        writer.Add("CC2", $"{avgCeres2,5:F2}", 7);
+        Emit("CC2", $"{avgCeres2,5:F2}", 7, CellAgg.Final, summaryFormat: "{0,5:F2}");
       }
 
-      writer.Add("P", $"{0.001f * avgWCeres1,6:f2}", 8);
+      Emit("P", $"{0.001f * avgWCeres1,6:f2}", 8, CellAgg.Final, summaryFormat: "{0,6:F2}");
       if (c2)
       {
-        writer.Add("P2", $"{0.001f * avgWCeres2,6:f2}", 8);
+        Emit("P2", $"{0.001f * avgWCeres2,6:f2}", 8, CellAgg.Final, summaryFormat: "{0,6:F2}");
       }
 
       if (ex)
       {
-        writer.Add("SEx", $" {scoreOtherEngine,3}", 5);
+        Emit("SEx", $" {scoreOtherEngine,3}", 5, CellAgg.Average, scoreOtherEngine, " {0,3:F1}");
       }
 
-      writer.Add("SC", $" {scoreCeres1,3}", 5);
+      Emit("SC", $" {scoreCeres1,3}", 5, CellAgg.Average, scoreCeres1, " {0,3:F1}");
       if (c2)
       {
-        writer.Add("SC2", $" {scoreCeres2,3}", 5);
+        Emit("SC2", $" {scoreCeres2,3}", 5, CellAgg.Average, scoreCeres2, " {0,3:F1}");
       }
 
       if (ex)
       {
-        writer.Add("MEx", $"{otherEngineAnalysis2.BestMove,7}", 9);
+        Emit("MEx", $"{otherEngineAnalysis2.BestMove,7}", 9, CellAgg.None);
       }
 
-      writer.Add("MC", $"{search1.BestMoveMG,7}", 9);
+      Emit("MC", $"{search1.BestMoveMG,7}", 9, CellAgg.None);
       if (c2)
       {
-        writer.Add("MC2", $"{search2.BestMoveMG,7}", 9);
+        Emit("MC2", $"{search2.BestMoveMG,7}", 9, CellAgg.None);
       }
 
-      writer.Add("Fr", $"{worker1PickedNonTopNMoveStr}{100.0f * search1.TopNNodeN / search1.FinalN,3:F0}%", 8);
+      // Fr / Fr2: percentage of total root visits placed on the correct move(s) at end of search.
+      Emit("Fr", FrCell(worker1PickedNonTopNMoveStr, correctVisitFrac1), 8,
+           CellAgg.Average, correctVisitFrac1, "{0,3:F0}%");
       if (c2)
       {
-        writer.Add("Fr2", $"{worker2PickedNonTopNMoveStr}{100.0f * search2?.TopNNodeN / search2?.FinalN,3:F0}%", 8);
+        Emit("Fr2", FrCell(worker2PickedNonTopNMoveStr, correctVisitFrac2), 8,
+             CellAgg.Average, correctVisitFrac2, "{0,3:F0}%");
       }
 
-      writer.Add("Yld", $"{search1.NodeSelectionYieldFrac,6:f3}", 9);
+      Emit("Yld", $"{search1.NodeSelectionYieldFrac,6:f3}", 9, CellAgg.Average, search1.NodeSelectionYieldFrac, "{0,6:F3}");
       if (c2)
       {
-        writer.Add("Yld2", $"{search2.NodeSelectionYieldFrac,6:f3}", 9);
+        Emit("Yld2", $"{search2.NodeSelectionYieldFrac,6:f3}", 9, CellAgg.Average, search2.NodeSelectionYieldFrac, "{0,6:F3}");
       }
 
       // Search time
       if (ex)
       {
-        writer.Add("TimeEx", $"{otherEngineTime,7:F2}", 9);
+        Emit("TimeEx", $"{otherEngineTime,7:F2}", 9, CellAgg.Average, otherEngineTime, "{0,7:F2}");
       }
 
-      writer.Add("TimeC", $"{search1.TimingStats.ElapsedTimeSecs,7:F2}", 9);
+      Emit("TimeC", $"{search1.TimingStats.ElapsedTimeSecs,7:F2}", 9, CellAgg.Average, search1.TimingStats.ElapsedTimeSecs, "{0,7:F2}");
       if (c2)
       {
-        writer.Add("TimeC2", $"{search2.TimingStats.ElapsedTimeSecs,7:F2}", 9);
+        Emit("TimeC2", $"{search2.TimingStats.ElapsedTimeSecs,7:F2}", 9, CellAgg.Average, search2.TimingStats.ElapsedTimeSecs, "{0,7:F2}");
       }
 
-      writer.Add("ADep", $"{search1.AvgDepth,5:f1}", 7);
+      Emit("ADep", $"{search1.AvgDepth,5:f1}", 7, CellAgg.Average, search1.AvgDepth, "{0,5:F1}");
       if (c2)
       {
-        writer.Add("ADep2", $"{search2.AvgDepth,5:f1}", 7);
+        Emit("ADep2", $"{search2.AvgDepth,5:f1}", 7, CellAgg.Average, search2.AvgDepth, "{0,5:F1}");
       }
 
-      writer.Add("MDep", $"{search1.MaxDepth,5:f1}", 7);
+      Emit("MDep", $"{search1.MaxDepth,5:f1}", 7, CellAgg.Average, search1.MaxDepth, "{0,5:F1}");
       if (c2)
       {
-        writer.Add("MDep2", $"{search2.MaxDepth,5:f1}", 7);
+        Emit("MDep2", $"{search2.MaxDepth,5:f1}", 7, CellAgg.Average, search2.MaxDepth, "{0,5:F1}");
       }
 
-      writer.Add("VEnt", $"{search1.VisitEntropy,5:f2}", 7);
+      Emit("VEnt", $"{search1.VisitEntropy,5:f2}", 7, CellAgg.Average, search1.VisitEntropy, "{0,5:F2}");
       if (c2)
       {
-        writer.Add("VEnt2", $"{search2.VisitEntropy,5:f2}", 7);
+        Emit("VEnt2", $"{search2.VisitEntropy,5:f2}", 7, CellAgg.Average, search2.VisitEntropy, "{0,5:F2}");
       }
 
       // Nodes
-      if (ex) writer.Add("NEx", $"{otherEngineAnalysis2.Nodes,12:N0}", 14);
-      writer.Add("Nodes", $"{search1.FinalN,12:N0}", 14);
-      if (c2)
+      if (ex)
       {
-        writer.Add("Nodes2", $"{search2.FinalN,12:N0}", 14);
+        Emit("NEx", $"{otherEngineAnalysis2.Nodes,12:N0}", 14, CellAgg.Average, otherEngineAnalysis2.Nodes, "{0,12:N0}");
       }
-
-      // Fraction when chose top N
-      writer.Add("Frac", $"{Adjust(scoreCeres1, search1.FractionNumNodesWhenChoseTopNNode),4:F0}", 6);
+      Emit("Nodes", $"{search1.FinalN,12:N0}", 14, CellAgg.Average, search1.FinalN, "{0,12:N0}");
       if (c2)
       {
-        writer.Add("Frac2", $"{Adjust(scoreCeres2, search2.FractionNumNodesWhenChoseTopNNode),4:F0}", 6);
+        Emit("Nodes2", $"{search2.FinalN,12:N0}", 14, CellAgg.Average, search2.FinalN, "{0,12:N0}");
       }
 
       // Score (Q)
       if (ex)
       {
-        writer.Add("QEx", $"{otherEngineAnalysis2.ScoreLogistic,6:F3}", 8);
+        Emit("QEx", $"{otherEngineAnalysis2.ScoreLogistic,6:F3}", 8, CellAgg.Average, otherEngineAnalysis2.ScoreLogistic, "{0,6:F3}");
       }
 
-      writer.Add("QC", $"{search1.ScoreQRoot,6:F3}", 8);
+      Emit("QC", $"{search1.ScoreQRoot,6:F3}", 8, CellAgg.Average, search1.ScoreQRoot, "{0,6:F3}");
       if (c2)
       {
-        writer.Add("QC2", $"{search2.ScoreQRoot,6:F3}", 8);
+        Emit("QC2", $"{search2.ScoreQRoot,6:F3}", 8, CellAgg.Average, search2.ScoreQRoot, "{0,6:F3}");
       }
 
       // Num batches&positions
-      writer.Add("Batches", $"{evalNumBatches1,8:N0}", 10);
-      writer.Add("NNEvals", $"{evalNumPos1,11:N0}", 13);
+      Emit("Batches", $"{evalNumBatches1,8:N0}", 10, CellAgg.Average, evalNumBatches1, "{0,8:N0}");
+      Emit("NNEvals", $"{evalNumPos1,11:N0}", 13, CellAgg.Average, evalNumPos1, "{0,11:N0}");
       if (c2)
       {
-        writer.Add("Batches2", $"{evalNumBatches2,8:N0}", 10);
-        writer.Add("NNEvals2", $"{evalNumPos2,11:N0}", 13);
+        Emit("Batches2", $"{evalNumBatches2,8:N0}", 10, CellAgg.Average, evalNumBatches2, "{0,8:N0}");
+        Emit("NNEvals2", $"{evalNumPos2,11:N0}", 13, CellAgg.Average, evalNumPos2, "{0,11:N0}");
       }
 
       // Tablebase hits
-      writer.Add("TBase", $"{(search1.CountSearchContinuations > 0 ? 0 : search1.CountTablebaseHits),8:N0}", 10);
+      Emit("TBase", $"{(search1.CountSearchContinuations > 0 ? 0 : search1.CountTablebaseHits),8:N0}", 10,
+           CellAgg.Average, search1.CountSearchContinuations > 0 ? 0 : search1.CountTablebaseHits, "{0,8:N0}");
       if (c2)
       {
-        writer.Add("TBase2", $"{(search2.CountSearchContinuations > 0 ? 0 : search2.CountTablebaseHits),8:N0}", 10);
+        Emit("TBase2", $"{(search2.CountSearchContinuations > 0 ? 0 : search2.CountTablebaseHits),8:N0}", 10,
+             CellAgg.Average, search2.CountSearchContinuations > 0 ? 0 : search2.CountTablebaseHits, "{0,8:N0}");
       }
 
       if (Def.DumpEPDInfo)
       {
-        writer.Add("FEN", epd.FEN, -1);
+        Emit("FEN", epd.FEN, -1, CellAgg.None);
+      }
+
+      // Merge this row's columns into the run-level accumulator (atomically, under the lock),
+      // so the summary row and the comprehensive SuiteTestResult can be produced at the end.
+      lock (lockObj)
+      {
+        columnAcc.Merge(cells);
       }
 
       if (outputDetail)
@@ -837,9 +2051,8 @@ namespace Ceres.Features.Suites
 
       if (restoreEnginesToPoolWhenDone)
       {
-        // Restore engines to pool
-        EnginesCeres1.Add(engineCeres1);
-        EnginesCeres2?.Add(engineCeres2);
+        // Restore engines to pool (as a pair, so a worker keeps its assigned device(s)).
+        EngineSets.Add((engineCeres1, engineCeres2));
       }
 
       lock (lockObj)
@@ -916,6 +2129,19 @@ namespace Ceres.Features.Suites
           }
           numSearchesBothFound++;
         }
+
+        // Policy difference: symmetric KLD between the two engines' root visit distributions
+        // (only when both engines exposed per-move visit statistics for this position).
+        if (search2 != null && search1.VerboseMoveStats != null && search2.VerboseMoveStats != null)
+        {
+          double kld = PolicySymmetricKLD(search1.VerboseMoveStats, search2.VerboseMoveStats);
+          if (!double.IsNaN(kld))
+          {
+            sumPolicyKLD += kld;
+            countPolicyKLD++;
+          }
+        }
+
         this.avgOther += scoreOtherEngine;
 
         numSearches++;
@@ -974,6 +2200,124 @@ namespace Ceres.Features.Suites
       int padLeft = pad / 2 + str.Length;
       return str.PadLeft(padLeft, ' ').PadRight(width, ' ');
     }
+  }
+
+
+  /// <summary>
+  /// Aggregation behavior for a console column when building the summary row at end of suite.
+  /// </summary>
+  internal enum CellAgg
+  {
+    /// <summary>Non-numeric column (e.g. a move or FEN); blank in the summary row.</summary>
+    None,
+
+    /// <summary>Summary cell is the average of the per-position numeric values.</summary>
+    Average,
+
+    /// <summary>
+    /// Summary cell is a single converged value (used by the running cumulative-average
+    /// "score" columns, which are rendered from the authoritative accumulators).
+    /// </summary>
+    Final
+  }
+
+
+  /// <summary>
+  /// One console table cell, capturing both the exact display string emitted per position
+  /// and the metadata needed to render the corresponding cell in the final summary row.
+  /// </summary>
+  internal readonly struct Cell
+  {
+    /// <summary>Column id (header).</summary>
+    public readonly string Id;
+
+    /// <summary>Column width (passed to the Writer; -1 means unbounded/raw).</summary>
+    public readonly int Width;
+
+    /// <summary>Exact string emitted for this cell in the per-position row.</summary>
+    public readonly string Display;
+
+    /// <summary>How this column is aggregated into the summary row.</summary>
+    public readonly CellAgg Agg;
+
+    /// <summary>Numeric payload used when Agg == Average (ignored otherwise).</summary>
+    public readonly double Value;
+
+    /// <summary>
+    /// Composite format string (including any literal prefix/suffix) used to render the
+    /// summary cell so that its width matches the per-position cell exactly.
+    /// </summary>
+    public readonly string SummaryFormat;
+
+    public Cell(string id, int width, string display, CellAgg agg,
+                double value = 0, string summaryFormat = null)
+    {
+      Id = id;
+      Width = width;
+      Display = display;
+      Agg = agg;
+      Value = value;
+      SummaryFormat = summaryFormat;
+    }
+  }
+
+
+  /// <summary>
+  /// Accumulates per-column statistics across all suite positions so that a single averaged
+  /// summary row (aligned under the existing columns) can be emitted at the end of the run.
+  ///
+  /// A full row's cell list is merged atomically (caller holds the lock); the first merged
+  /// row establishes the canonical ordered set of columns. This is safe because the present
+  /// column set is constant for a given run (the external engine and second Ceres engine are
+  /// configured once, so the ex/c2 conditional columns never change between rows).
+  /// </summary>
+  internal sealed class ColumnAccumulator
+  {
+    readonly List<(string Id, int Width, CellAgg Agg, string SummaryFormat)> order = new();
+    readonly Dictionary<string, double> sumById = new();
+    readonly Dictionary<string, int> countById = new();
+    bool orderEstablished = false;
+
+    /// <summary>Number of rows (positions) merged.</summary>
+    public int RowCount { get; private set; }
+
+    /// <summary>The canonical ordered column metadata (from the first merged row).</summary>
+    public IReadOnlyList<(string Id, int Width, CellAgg Agg, string SummaryFormat)> Order => order;
+
+    /// <summary>
+    /// Merges one position's complete ordered cell list. Caller must hold the lock.
+    /// </summary>
+    public void Merge(IReadOnlyList<Cell> cells)
+    {
+      if (!orderEstablished)
+      {
+        foreach (Cell c in cells)
+        {
+          order.Add((c.Id, c.Width, c.Agg, c.SummaryFormat));
+        }
+        orderEstablished = true;
+      }
+
+      foreach (Cell c in cells)
+      {
+        if (c.Agg == CellAgg.Average && !double.IsNaN(c.Value))
+        {
+          sumById.TryGetValue(c.Id, out double s);
+          countById.TryGetValue(c.Id, out int n);
+          sumById[c.Id] = s + c.Value;
+          countById[c.Id] = n + 1;
+        }
+      }
+
+      RowCount++;
+    }
+
+    /// <summary>
+    /// Returns the mean of the per-position values for a column, or NaN if the column was
+    /// never seen or had no values (e.g. an absent external-engine or second-Ceres column).
+    /// </summary>
+    public double Average(string id)
+      => countById.TryGetValue(id, out int n) && n > 0 ? sumById[id] / n : double.NaN;
   }
 
 }

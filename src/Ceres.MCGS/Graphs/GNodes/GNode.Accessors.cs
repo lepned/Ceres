@@ -71,6 +71,21 @@ public readonly partial struct GNode : IComparable<GNode>, IEquatable<GNode>
   public readonly FP16 UncertaintyPolicy => NodeRef.UncertaintyPolicy;
 
   /// <summary>
+  /// Exponentially-weighted (~50-visit) volatility of the leaf values backed up through this node,
+  /// measured as RMS deviation about the node's Q. Nonzero only when search was run with
+  /// ParamsSearch.TrackLeafValueVolatility enabled.
+  /// </summary>
+  public readonly double LeafValueVolatility => NodeRef.LeafValueVolatility.RunningStdDev;
+
+  /// <summary>
+  /// Bias-corrected variant of <see cref="LeafValueVolatility"/> that removes the EWMA cold-start
+  /// under-reporting by supplying this node's N as the effective sample count. Prefer this over the
+  /// raw value when comparing volatility across nodes with differing visit counts (otherwise small-N
+  /// nodes look spuriously settled). See <see cref="RunningStdDevShort.RunningStdDevDebiased"/>.
+  /// </summary>
+  public readonly double LeafValueVolatilityDebiased => NodeRef.LeafValueVolatility.RunningStdDevDebiased(N);
+
+  /// <summary>
   /// Fortress probability metric: minimum P(NEVER) over all pawn squares.
   /// High values indicate a pawn unlikely to ever move, suggesting fortress-like structure.
   /// </summary>
@@ -175,6 +190,13 @@ public readonly partial struct GNode : IComparable<GNode>, IEquatable<GNode>
   public readonly bool HasRepetitions => NodeRef.miscFields.HasRepetitions;
 
   /// <summary>
+  /// Fraction of this node's visits which terminated at a history-sensitive
+  /// (repetition/50-move) terminal draw edge anywhere beneath it
+  /// (stochastically-rounded single-byte running average; see GNodeStruct).
+  /// </summary>
+  public readonly double RepDrawFraction => NodeRef.RepDrawFraction;
+
+  /// <summary>
   /// Number of pieces on board.
   /// </summary>
   public readonly byte NumPieces => NodeRef.miscFields.NumPieces;
@@ -211,7 +233,7 @@ public readonly partial struct GNode : IComparable<GNode>, IEquatable<GNode>
     get
     {
       // Do not expect to find deferred copy here
-      // (should have called DoPolicyCopyFromDeferredNodeSource already).
+      // (should have called TryDoDeferredPolicyCopyIfNeeded already).
       Debug.Assert(!NodeRef.edgeHeaderBlockIndexOrDeferredNode.IsNodeIndex);
       return NodeRef.edgeHeaderBlockIndexOrDeferredNode.BlockIndexIntoEdgeHeaderStore;
     }
@@ -224,31 +246,45 @@ public readonly partial struct GNode : IComparable<GNode>, IEquatable<GNode>
   public readonly bool IsPendingPolicyCopy => NodeRef.edgeHeaderBlockIndexOrDeferredNode.IsNodeIndex;
 
 
-  internal void DoDeferredPolicyCopyIfNeeded()
+  /// <summary>
+  /// If a deferred policy copy is pending, attempts to materialize it now
+  /// (allocating edge headers and copying policy from the source node).
+  /// Returns false if the source node's lock could not be acquired.
+  ///
+  /// The source lock is acquired NON-blockingly: the caller holds this node's lock
+  /// (typically as a select-phase expansion parent), and a blocking acquire of a
+  /// second node lock while holding one creates a deadlock surface (see the same
+  /// pattern in TranspositionAutoExtension). On contention the copy simply remains
+  /// deferred; callers abort/retry at their level.
+  /// </summary>
+  internal bool TryDoDeferredPolicyCopyIfNeeded()
   {
-    if (IsPendingPolicyCopy)
+    if (!IsPendingPolicyCopy)
     {
-      DoPolicyCopyFromDeferredNodeSource();
+      return true;
     }
-  }
 
-
-  internal void DoPolicyCopyFromDeferredNodeSource()
-  {
     ref GNodeStruct nodeRef = ref NodeRef;
 
-    EdgeHeaderBlockIndexOrNodeIndex blockIndexIntoEdgeHeaderStore = nodeRef.edgeHeaderBlockIndexOrDeferredNode;
-
-    // If just a pointer to a source node, then allocate and copy values now.
-    GNode copyFrom = Graph[blockIndexIntoEdgeHeaderStore.NodeIndex];
+    // The stored value is a pointer to the source node; allocate and copy values now.
+    GNode copyFrom = Graph[nodeRef.edgeHeaderBlockIndexOrDeferredNode.NodeIndex];
 
     Debug.Assert(this.IsLocked);
-    using (new NodeLockBlock(copyFrom))
+    if (!copyFrom.TryAcquireLock())
+    {
+      return false;
+    }
+    try
     {
       nodeRef.edgeHeaderBlockIndexOrDeferredNode.Clear();
       Graph.AllocateAndCopyPolicyValues(copyFrom, this);
     }
+    finally
+    {
+      copyFrom.ReleaseLock();
+    }
 
+    return true;
   }
 
 
@@ -292,8 +328,17 @@ public readonly partial struct GNode : IComparable<GNode>, IEquatable<GNode>
       {
         if (edge.Type == GEdgeStruct.EdgeType.ChildEdge)
         {
-          int nNonRep = edge.N - edge.NDrawByRepetition;
-          dSum += edge.ChildNode.D * nNonRep + 1.0 * edge.NDrawByRepetition;
+          if (edge.ChildNodeHasDrawKnownToExist)
+          {
+            // Opponent has an available draw at this child, so its value mass was forced toward a
+            // draw (edge.Q -> 0 in backup); credit the whole edge as a draw (D = 1) to match.
+            dSum += 1.0 * edge.N;
+          }
+          else
+          {
+            int nNonRep = edge.N - edge.NDrawByRepetition;
+            dSum += edge.ChildNode.D * nNonRep + 1.0 * edge.NDrawByRepetition;
+          }
         }
         else if (edge.Type == GEdgeStruct.EdgeType.TerminalEdgeDrawn)
         {
@@ -304,6 +349,17 @@ public readonly partial struct GNode : IComparable<GNode>, IEquatable<GNode>
     }
     return dSum / N;
   }
+
+  /// <summary>
+  /// Draw probability to use for display (UCI WDL, dumps, SVG).
+  ///
+  /// Returns the raw neural-network DrawP for an unsearched node (N &lt;= 1), otherwise the
+  /// exact-from-children aggregate (ComputeDFromChildren), which is correct one level down
+  /// regardless of any residual staleness in this node's stored D (e.g. from off-path
+  /// multi-parent visits). Pair with the always-correct Q to derive consistent W/L:
+  ///   W = (Q + 1 - D) / 2,  L = (1 - D - Q) / 2.
+  /// </summary>
+  public readonly double ComputeDForDisplay() => N <= 1 ? DrawP : ComputeDFromChildren();
 
   /// <summary>
   /// Average win percentage.
@@ -332,6 +388,12 @@ public readonly partial struct GNode : IComparable<GNode>, IEquatable<GNode>
   /// Delegates to the underlying NodeRef.LockRef to ensure atomic operations on the actual lock byte.
   /// </summary>
   public void AcquireLock() => NodeRef.LockRef.Acquire();
+
+  /// <summary>
+  /// Attempts to acquire the lock for this node without blocking,
+  /// returning false if the lock is currently held (by any thread, including this one).
+  /// </summary>
+  public bool TryAcquireLock() => NodeRef.LockRef.TryAcquire();
 
   /// <summary>
   /// Releases the lock for this node.

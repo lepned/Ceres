@@ -66,6 +66,14 @@ public class NNEvaluatorTensorRT : NNEvaluator
   /// </summary>
   public const bool PARALLEL_ENGINE_LOAD_ENABLED = false; // Needs more testing
 
+  /// <summary>
+  /// If true, a second (overlap) evaluator built with a compatible reference evaluator shares the
+  /// reference's already-deserialized ICudaEngine (weights) instead of deserializing/allocating
+  /// them again — cutting the overlap evaluator's startup cost and halving network weight VRAM.
+  /// Set false to revert to fully independent engines per evaluator.
+  /// </summary>
+  public const bool SHARE_REFERENCE_ENGINE_ENABLED = true;
+
 
   /// <summary>
   /// Path to the ONNX model file.
@@ -142,9 +150,8 @@ public class NNEvaluatorTensorRT : NNEvaluator
   // Input mode: byte inputs or Half inputs with /100 normalization
   private readonly bool useByteInputs;
 
-  // Shared buffers for TPG encoding
+  // Shared call-level input staging buffers (allocated lazily / grown on demand by EnsureInputBuffers)
   private byte[] squareByteBuffer;
-  private byte[] inputByteBuffer;
   private Half[] inputHalfBuffer;
   private int maxBatchSize;
 
@@ -222,6 +229,23 @@ public class NNEvaluatorTensorRT : NNEvaluator
   /// <inheritdoc/>
   public override int MaxBatchSize => maxBatchSize;
 
+  /// <inheritdoc/>
+  public override int NumDevices => GpuIDs.Length;
+
+  /// <inheritdoc/>
+  public override EvaluatorInfo Info => ONNXFileName == null ? null : new EvaluatorInfo(0, FileSizeBytesOrZero(ONNXFileName));
+
+  /// <inheritdoc/>
+  public override int PaddedBatchCapacity(int numPositions)
+  {
+    if (pool == null || numPositions <= 0 || numPositions >= MaxBatchSize)
+    {
+      return numPositions;
+    }
+
+    return Math.Min(MaxBatchSize, pool.PaddedBatchCapacity(numPositions));
+  }
+
   public override InputTypes InputsRequired => InputTypes.Positions | InputTypes.Boards | InputTypes.Moves | (HasState ? InputTypes.State : 0);
 
 
@@ -252,7 +276,8 @@ public class NNEvaluatorTensorRT : NNEvaluator
                              bool forceInt8 = false,
                              bool forceFP8 = false,
                              bool refittable = false,
-                             int fp32AllNormsOverride = -1)
+                             int fp32AllNormsOverride = -1,
+                             NNEvaluatorTensorRT referenceEvaluator = null)
   {
     if (!File.Exists(onnxFileName))
     {
@@ -378,7 +403,27 @@ public class NNEvaluatorTensorRT : NNEvaluator
     Console.WriteLine($"  Build options: FP16={options.UseFP16}, BF16={options.UseBF16}, INT8={options.UseInt8}, FP32PostAttentionNorm={options.FP32PostAttentionNorm}, FP32Softmax={options.FP32Softmax}, FP32AllNorms={options.FP32AllNorms}, UseCUDAGraphs={options.UseCudaGraphs}");
 
     const int MIN_BATCH_SIZE_PER_GPU = 6;
-    pool = new MultiGPUEnginePool(trt, onnxFileName, effectiveSizesPerGPU, poolMode, options, 0, 0, GpuIDs, MIN_BATCH_SIZE_PER_GPU, cacheDir);
+
+    // If a compatible reference evaluator was supplied, share its already-deserialized engine(s)
+    // rather than deserializing/allocating the network weights again. Requires identical engine
+    // identity (same ONNX, GPUs, pool mode, batch sizes) and a non-refittable engine (refit would
+    // mutate the shared weights). Falls back to an independent build otherwise.
+    MultiGPUEnginePool referencePool = null;
+    if (SHARE_REFERENCE_ENGINE_ENABLED && referenceEvaluator != null && !refittable)
+    {
+      if (CanShareEngineWith(referenceEvaluator, onnxFileName, poolMode, batchSizes, GpuIDs))
+      {
+        referencePool = referenceEvaluator.pool;
+        Console.WriteLine("  Sharing engine weights from reference evaluator (no re-deserialize).");
+      }
+      else
+      {
+        Console.WriteLine("  NOTE: reference evaluator engine identity differs; building independent engine (no sharing).");
+      }
+    }
+
+    pool = new MultiGPUEnginePool(trt, onnxFileName, effectiveSizesPerGPU, poolMode, options, 0, 0, GpuIDs,
+                                  MIN_BATCH_SIZE_PER_GPU, cacheDir, referencePool: referencePool);
 
     // Query actual max batch size from pool AFTER construction (may differ if optimization rebuilt engines)
     largestEngineBatchSize = pool.MaxEngineBatchSize;
@@ -488,23 +533,16 @@ public class NNEvaluatorTensorRT : NNEvaluator
     hasAction = actionSizePerPos == EncodedPolicyVector.POLICY_VECTOR_LENGTH * 3; // [B, 1858, 3] - WDL logits for all possible moves
     hasQDeviation = qDevLowerSize > 0 && qDevUpperSize > 0;
 
-    if (netType == ONNXNetExecutor.NetTypeEnum.TPG)
-    {
-      // Size the byte buffer for the model's actual input shape — supports both
-      // standard 137-byte/square nets and V3 141-byte/square nets (per CeresTrain's
-      // CERES_AUX_FEATURES_PER_SQUARE flag). inputElementsPerPosition
-      // is derived from the ONNX input dimension at engine load.
-      squareByteBuffer = new byte[maxBatchSize * inputElementsPerPosition];
-    }
-
-    if (useByteInputs)
-    {
-      inputByteBuffer = new byte[maxBatchSize * inputElementsPerPosition];
-    }
-    else
-    {
-      inputHalfBuffer = new Half[maxBatchSize * inputElementsPerPosition];
-    }
+    // Call-level input staging buffers (squareByteBuffer / inputHalfBuffer) are allocated
+    // lazily and grown on demand to the actual per-call batch size via EnsureInputBuffers,
+    // rather than pre-sized to the (soft) maxBatchSize. This way a large softMaxBatchSize
+    // headroom costs no host memory unless/until a batch that large actually arrives — the
+    // common case (search MaxBatchSize == 1024) never materializes the 4096-sized buffers.
+    // (The internal engine sub-batch splitting does NOT shrink these: they must hold the
+    //  whole call's input. The output/result buffers below are likewise sized to the whole
+    //  call by contract, so they remain pre-allocated to maxBatchSize.)
+    // V3 141-byte/square support is preserved: inputElementsPerPosition (used by
+    // EnsureInputBuffers) is derived from the ONNX input dimension at engine load.
 
     outputFloatBufferSize = (int)pool.MaxTotalOutputSize;
 
@@ -621,6 +659,36 @@ public class NNEvaluatorTensorRT : NNEvaluator
 
 
   /// <summary>
+  /// Ensures the call-level input staging buffers are large enough to hold numPos positions,
+  /// growing them on demand (grow-only; never shrinks). Sized to the actual batch rather than
+  /// the (soft) maxBatchSize so the softMaxBatchSize headroom costs no host memory until a batch
+  /// that large actually arrives. Mirrors the constructor's by-net-type / by-input-type allocation.
+  /// Must be called single-threaded at the top of an evaluation, before any input fill or the
+  /// (parallel) sub-batch handler runs.
+  /// </summary>
+  private void EnsureInputBuffers(int numPos)
+  {
+    if (NetType == ONNXNetExecutor.NetTypeEnum.TPG)
+    {
+      int squareBytes = numPos * 64 * TPGRecord.BYTES_PER_SQUARE_RECORD;
+      if (squareByteBuffer == null || squareByteBuffer.Length < squareBytes)
+      {
+        squareByteBuffer = new byte[squareBytes];
+      }
+    }
+
+    if (!useByteInputs)
+    {
+      int halfElems = numPos * inputElementsPerPosition;
+      if (inputHalfBuffer == null || inputHalfBuffer.Length < halfElems)
+      {
+        inputHalfBuffer = new Half[halfElems];
+      }
+    }
+  }
+
+
+  /// <summary>
   /// Optional worker method which evaluates batch of positions which are already converted into native format needed by evaluator.
   /// </summary>
   /// <param name="positionsNativeInput">The positions in native TPG format</param>
@@ -663,14 +731,15 @@ public class NNEvaluatorTensorRT : NNEvaluator
       InitLookupTable();
     }
 
-    // Allocate thread-static buffers if needed
-    int bytesPerSquareRecord = TPGRecord.BYTES_PER_SQUARE_RECORD;
-    int maxBufferSize = MaxBatchSize * 64 * TPGRecord.BYTES_PER_SQUARE_RECORD;
+    EnsureInputBuffers(numPositions);
 
-    if (inputsPrimaryNative == null || inputsPrimaryNative.Length < maxBufferSize)
+    // Allocate thread-static buffers if needed (sized to the actual batch, grown on demand)
+    int requiredBufferSize = numPositions * 64 * TPGRecord.BYTES_PER_SQUARE_RECORD;
+
+    if (inputsPrimaryNative == null || inputsPrimaryNative.Length < requiredBufferSize)
     {
-      inputsPrimaryNative = new byte[maxBufferSize];
-      inputsPrimaryNativeF = new Half[maxBufferSize];
+      inputsPrimaryNative = new byte[requiredBufferSize];
+      inputsPrimaryNativeF = new Half[requiredBufferSize];
     }
 
     // Convert native input to flat format
@@ -974,6 +1043,36 @@ public class NNEvaluatorTensorRT : NNEvaluator
     return new TensorOffsets(valueOffset, effectiveValue2Offset, policyOffset, policy2Offset, mlhOffset, uncVOffset, uncPOffset,
                              pieceMoveOffset, pieceCaptureOffset, punimSelfOffset, punimOpponentOffset,
                              qDevLowerOffset, qDevUpperOffset, actionOffset);
+  }
+
+
+  /// <summary>
+  /// Converts the output heads from FP16 to float, EXCEPT the large policy head, and only
+  /// for the used positions [0, count). The policy head is read sparsely (legal moves only)
+  /// directly from the FP16 buffer by ExtractSubBatchResults — (float)Half is exact — so
+  /// bulk-converting all ~1858 policy entries per position would be wasted work (the policy
+  /// is ~99% of the output for typical LC0 nets). Other heads (value/MLH/uncertainty and,
+  /// when present, policy2/action/ply-bin/PUNIM/qDev) are still converted here and read from
+  /// the float buffer as before. Walks tensors with the identical offset/alignment logic as
+  /// ComputeTensorOffsets so offsets stay consistent.
+  /// </summary>
+  private void PerfConvertNonPolicyHeads(ReadOnlySpan<Half> rawSpan, Span<float> floatBuf, int count, int engineBatchSize)
+  {
+    const int ALIGN = 128;
+    int currentOffset = 0;
+    for (int t = 0; t < outputInfos.Length; t++)
+    {
+      int sizePerPos = (int)(outputInfos[t].Size / largestEngineBatchSize);
+      int tensorSize = engineBatchSize * sizePerPos;
+
+      if (t != policyTensorIndex && sizePerPos > 0)
+      {
+        int n = count * sizePerPos;
+        TensorPrimitives.ConvertToSingle(rawSpan.Slice(currentOffset, n), floatBuf.Slice(currentOffset, n));
+      }
+
+      currentOffset += (tensorSize + ALIGN - 1) / ALIGN * ALIGN;
+    }
   }
 
 
@@ -1447,13 +1546,12 @@ public class NNEvaluatorTensorRT : NNEvaluator
       throw new ArgumentException($"Batch size {numPos} exceeds maximum {maxBatchSize}");
     }
 
-    if (NetType == ONNXNetExecutor.NetTypeEnum.LC0)
-    {
-      // LC0 path: convert positions to 112-plane format directly into inputHalfBuffer
-      Memory<Half> inputBuffer = new Memory<Half>(inputHalfBuffer, 0, numPos * inputElementsPerPosition);
-      batch.ConvertValuesToFlatFromPlanes(inputBuffer, false, true);
-    }
-    else
+    EnsureInputBuffers(numPos);
+
+    // LC0 path: the plane->Half conversion is deferred to FillInputLC0, invoked inside
+    // ProcessWithHandlerDirect, which writes the result straight into the pinned input
+    // buffer (no managed staging buffer / redundant copy). Only TPG pre-fills its buffer here.
+    if (NetType != ONNXNetExecutor.NetTypeEnum.LC0)
     {
       // TPG path: convert positions to flat TPG byte format
       if (ConverterToFlat == null)
@@ -1544,78 +1642,19 @@ public class NNEvaluatorTensorRT : NNEvaluator
     Half[] punimSelf = punimSelfBuffer;
     Half[] punimOpponent = punimOpponentBuffer;
 
-    // Get option values for value head temperature
-    float valueHead1Temperature = Options?.ValueHead1Temperature ?? 1.0f;
-    float valueHead2Temperature = Options?.ValueHead2Temperature ?? 1.0f;
-    float valueHead1TemperatureScaling = Options?.Value1UncertaintyTemperatureScalingFactor ?? 0.0f;
-    float valueHead2TemperatureScaling = Options?.Value2UncertaintyTemperatureScalingFactor ?? 0.0f;
-
-    // Policy2 blend parameters
-    float fractionPolicyHead2 = (hasPolicySecondary ? Options?.FractionPolicyHead2 : null) ?? 0.0f;
-    bool policy2BlendLogits = Options?.Policy2BlendLogits ?? true;
-    float policy1Temperature = Options?.Policy1Temperature ?? 1.0f;
-    float policy2Temperature = Options?.Policy2Temperature ?? 1.0f;
-    float actionTemperature = Options?.ActionTemperature ?? 1.0f;
-
-    // Capture buffer size for thread-local allocation in handler
-    int requiredBufferSize = outputFloatBufferSize;
-
-    SubBatchOutputHandler handler = (int globalStartPosition, int positionCount, int engineBatchSize, IntPtr rawOutputPtr, int outputElementCount) =>
-    {
-      // Ensure thread-local buffer is allocated (each GPU thread gets its own buffer)
-      if (threadLocalOutputFloatBuffer == null || threadLocalOutputFloatBuffer.Length < requiredBufferSize)
-      {
-        threadLocalOutputFloatBuffer = new float[requiredBufferSize];
-      }
-
-      // Vectorized conversion from Half to float directly from pinned host memory
-      unsafe
-      {
-        ReadOnlySpan<Half> rawSpan = new ReadOnlySpan<Half>((void*)rawOutputPtr, outputElementCount);
-
-        // Check for NaNs on raw Half data (half the bandwidth vs checking floats)
-        int usedOutputElements = positionCount * outputElementsPerPosition;
-        bool hasNaN = MathUtils.ContainsNaN(rawSpan.Slice(0, usedOutputElements));
-
-        TensorPrimitives.ConvertToSingle(rawSpan, threadLocalOutputFloatBuffer.AsSpan(0, outputElementCount));
-
-        if (hasNaN)
-        {
-          // Identify which head(s) contain the NaN before we substitute zeros.
-          string nanHeads = IdentifyNaNHeads(rawSpan, positionCount, engineBatchSize);
-
-          // Substitute NaN with 0 in the converted float buffer so downstream
-          // consumers see sane values, then emit a rate-limited warning.
-          Span<float> usedFloats = threadLocalOutputFloatBuffer.AsSpan(0, usedOutputElements);
-          for (int i = 0; i < usedFloats.Length; i++)
-          {
-            if (float.IsNaN(usedFloats[i]))
-            {
-              usedFloats[i] = 0;
-            }
-          }
-
-          ReportNaNOccurrence(positionCount, usedOutputElements, nanHeads);
-        }
-      }
-
-      ExtractSubBatchResults(batch, globalStartPosition, positionCount, engineBatchSize,
-                             threadLocalOutputFloatBuffer, w, l, w2, l2, m, uncV, uncP, policies,
-                             pol2, actions,
-                             plyBinMove, plyBinCapture, punimSelf, punimOpponent,
-                             extraStat0, extraStat1,
-                             valueHead1Temperature, valueHead2Temperature,
-                             valueHead1TemperatureScaling, valueHead2TemperatureScaling,
-                             fractionPolicyHead2, policy2BlendLogits,
-                             policy1Temperature, policy2Temperature,
-                             NetType == ONNXNetExecutor.NetTypeEnum.TPG,
-                             actionTemperature);
-    };
+    // Set per-call state for the cached output handler. The handler is an instance
+    // method whose delegate is allocated once (cachedHandler), avoiding a per-batch
+    // closure + delegate allocation. All other state it needs (buffers, option-derived
+    // parameters) is read from instance fields; only the batch varies per call.
+    handlerBatch = batch;
+    SubBatchOutputHandler handler = cachedHandler ??= OutputHandler;
 
     if (NetType == ONNXNetExecutor.NetTypeEnum.LC0)
     {
-      // LC0: inputHalfBuffer already contains the encoded planes from DoEvaluateIntoBuffers
-      pool.ProcessWithHandler(inputHalfBuffer, numPos, handler);
+      // LC0: convert the 112-plane input directly into the pinned input buffer via
+      // FillInputLC0 (no managed staging buffer + redundant copy). handlerBatch was set above.
+      // inputHalfBuffer is passed only as scratch for the rare multi-sub-batch fallback.
+      pool.ProcessWithHandlerDirect(numPos, cachedFillInputLC0 ??= FillInputLC0, handler, inputHalfBuffer);
     }
     else if (useByteInputs)
     {
@@ -1688,6 +1727,109 @@ public class NNEvaluatorTensorRT : NNEvaluator
       extraStat1: hasQDeviation ? extraStat1 : default,
       hasPolicySecondary: hasPolicySecondary,
       policies2: hasPolicySecondary ? pol2 : default);
+  }
+
+
+  // Per-call state for the cached output handler (set before each pool call).
+  private SubBatchOutputHandler cachedHandler;
+  private IEncodedPositionBatchFlat handlerBatch;
+
+  // Cached LC0 input-fill delegate (allocated once). Converts the current batch's 112-plane
+  // representation directly into the destination Memory<Half> supplied by the engine pool
+  // (the pinned input buffer for single-engine batches). Uses handlerBatch, set per call.
+  private Action<Memory<Half>> cachedFillInputLC0;
+  private void FillInputLC0(Memory<Half> dest) => handlerBatch.ConvertValuesToFlatFromPlanes(dest, false, true);
+
+  /// <summary>
+  /// Output handler invoked (possibly concurrently across GPU worker threads) for each
+  /// sub-batch produced by the engine pool. Implemented as an instance method so its
+  /// delegate can be cached once (see cachedHandler) rather than allocating a closure
+  /// per batch. Reads buffers and option-derived parameters from instance state; the
+  /// per-call batch is passed via the handlerBatch field. All worker threads for a single
+  /// ProcessBatchWithPool call operate on the same batch (disjoint position sub-ranges),
+  /// so a single shared field is correct.
+  /// </summary>
+  private void OutputHandler(int globalStartPosition, int positionCount, int engineBatchSize, IntPtr rawOutputPtr, int outputElementCount)
+  {
+    IEncodedPositionBatchFlat batch = handlerBatch;
+    int requiredBufferSize = outputFloatBufferSize;
+
+    // Option-derived parameters (constant for this evaluator; recomputed cheaply here
+    // to keep the handler closure-free).
+    float valueHead1Temperature = Options?.ValueHead1Temperature ?? 1.0f;
+    float valueHead2Temperature = Options?.ValueHead2Temperature ?? 1.0f;
+    float valueHead1TemperatureScaling = Options?.Value1UncertaintyTemperatureScalingFactor ?? 0.0f;
+    float valueHead2TemperatureScaling = Options?.Value2UncertaintyTemperatureScalingFactor ?? 0.0f;
+    float fractionPolicyHead2 = (hasPolicySecondary ? Options?.FractionPolicyHead2 : null) ?? 0.0f;
+    bool policy2BlendLogits = Options?.Policy2BlendLogits ?? true;
+    float policy1Temperature = Options?.Policy1Temperature ?? 1.0f;
+    float policy2Temperature = Options?.Policy2Temperature ?? 1.0f;
+    float actionTemperature = Options?.ActionTemperature ?? 1.0f;
+    CompressedActionVector[] actions = hasAction ? actionsBuffer : Array.Empty<CompressedActionVector>();
+
+    // Ensure thread-local buffer is allocated (each GPU thread gets its own buffer)
+    if (threadLocalOutputFloatBuffer == null || threadLocalOutputFloatBuffer.Length < requiredBufferSize)
+    {
+      threadLocalOutputFloatBuffer = new float[requiredBufferSize];
+    }
+
+    // Vectorized conversion from Half to float directly from pinned host memory
+    unsafe
+    {
+      ReadOnlySpan<Half> rawSpan = new ReadOnlySpan<Half>((void*)rawOutputPtr, outputElementCount);
+
+      // Check for NaNs on raw Half data (half the bandwidth vs checking floats).
+      // outputElementsPerPosition is a single global, floor(largestEngine.TotalOutputSize /
+      // largestBatch); because TotalOutputSize sums each output tensor aligned-up independently,
+      // positionCount * outputElementsPerPosition can slightly EXCEED this engine's actual aligned
+      // output (outputElementCount = rawSpan.Length) for some bucket sets — e.g. an exact-fit batch
+      // on a mid engine whose per-tensor alignment padding amortizes less than the largest engine's.
+      // Clamp to the real buffer length to avoid over-reading rawSpan (was an ArgumentOutOfRange in
+      // the NaN slice). The genuine per-head data is read via aligned per-tensor offsets elsewhere
+      // (PerfConvertNonPolicyHeads / ExtractSubBatchResults / ComputeTensorOffsets), so this scan is
+      // only an approximate sanity bound; when it clamps, positionCount == engineBatchSize and the
+      // whole buffer is valid used data anyway. A no-op whenever the product already fits.
+      int usedOutputElements = Math.Min(positionCount * outputElementsPerPosition, outputElementCount);
+      bool hasNaN = MathUtils.ContainsNaN(rawSpan.Slice(0, usedOutputElements));
+
+      // Convert only the small heads (value/MLH/uncertainty/etc.) to float. The large
+      // policy/policy2/action heads are NOT converted here: extraction reads only the
+      // handful of legal-move logits it needs directly from this Half buffer (and
+      // (float)Half is exact), so converting the full ~1858-wide policy per position is
+      // pure waste. Only the used positions (count, not engineBatchSize) are converted.
+      PerfConvertNonPolicyHeads(rawSpan, threadLocalOutputFloatBuffer.AsSpan(), positionCount, engineBatchSize);
+
+      if (hasNaN)
+      {
+        // Identify which head(s) contain the NaN before we substitute zeros.
+        string nanHeads = IdentifyNaNHeads(rawSpan, positionCount, engineBatchSize);
+
+        // Substitute NaN with 0 in the converted float buffer so downstream
+        // consumers see sane values, then emit a rate-limited warning.
+        Span<float> usedFloats = threadLocalOutputFloatBuffer.AsSpan(0, usedOutputElements);
+        for (int i = 0; i < usedFloats.Length; i++)
+        {
+          if (float.IsNaN(usedFloats[i]))
+          {
+            usedFloats[i] = 0;
+          }
+        }
+
+        ReportNaNOccurrence(positionCount, usedOutputElements, nanHeads);
+      }
+    }
+
+    ExtractSubBatchResults(batch, globalStartPosition, positionCount, engineBatchSize,
+                           threadLocalOutputFloatBuffer, rawOutputPtr, wBuffer, lBuffer, w2Buffer, l2Buffer, mBuffer, uncVBuffer, uncPBuffer, policiesBuffer,
+                           policies2Buffer, actions,
+                           plyBinMoveBuffer, plyBinCaptureBuffer, punimSelfBuffer, punimOpponentBuffer,
+                           extraStat0Buffer, extraStat1Buffer,
+                           valueHead1Temperature, valueHead2Temperature,
+                           valueHead1TemperatureScaling, valueHead2TemperatureScaling,
+                           fractionPolicyHead2, policy2BlendLogits,
+                           policy1Temperature, policy2Temperature,
+                           NetType == ONNXNetExecutor.NetTypeEnum.TPG,
+                           actionTemperature);
   }
 
 
@@ -1877,8 +2019,8 @@ public class NNEvaluatorTensorRT : NNEvaluator
   /// Uses parallel processing for all per-position extractions (values, policies, etc.)
   /// for improved performance, matching the pattern used in the ONNX backend.
   /// </summary>
-  private void ExtractSubBatchResults(IEncodedPositionBatchFlat batch, int startPos, int count, int engineBatchSize,
-                                      float[] subBatchOutput,
+  private unsafe void ExtractSubBatchResults(IEncodedPositionBatchFlat batch, int startPos, int count, int engineBatchSize,
+                                      float[] subBatchOutput, IntPtr rawHalfPtr,
                                       FP16[] w, FP16[] l, FP16[] w2, FP16[] l2, FP16[] m, FP16[] uncV, FP16[] uncP,
                                       CompressedPolicyVector[] policies,
                                       CompressedPolicyVector[] policies2,
@@ -1987,7 +2129,10 @@ public class NNEvaluatorTensorRT : NNEvaluator
         return;
       }
 
-      ReadOnlySpan<float> policyLogits = subBatchOutput.AsSpan().Slice(posPolicyOffset, policySize);
+      // Policy logits are read directly from the FP16 output buffer (this head is NOT
+      // bulk-converted to float, since only the legal-move entries are needed and
+      // (float)Half is exact). NaN->0 reproduces the substitution applied to converted heads.
+      Half* policyHalf = (Half*)rawHalfPtr + posPolicyOffset;
 
       // Collect move indices and find max logit in a single pass
       Span<int> indices = stackalloc int[numMoves];
@@ -2003,7 +2148,11 @@ public class NNEvaluatorTensorRT : NNEvaluator
 
         if (nnIndex >= 0 && nnIndex < policySize)
         {
-          float logit = policyLogits[nnIndex];
+          float logit = (float)policyHalf[nnIndex];
+          if (float.IsNaN(logit))
+          {
+            logit = 0f;
+          }
           logits[mv] = logit;
           if (logit > maxLogit)
           {
@@ -2353,11 +2502,29 @@ public class NNEvaluatorTensorRT : NNEvaluator
   }
 
 
+  /// <summary>
+  /// Returns whether a reference evaluator's already-built engine(s) are identical to what this
+  /// evaluator would build (same ONNX, GPUs, pool mode, and batch sizes) and can therefore be
+  /// safely shared. Build options are a deterministic function of the same definition, so engine
+  /// identity reduces to these cache-key inputs.
+  /// </summary>
+  static bool CanShareEngineWith(NNEvaluatorTensorRT reference, string onnxFileName,
+                                 EnginePoolMode poolMode, int[] batchSizes, int[] gpuIDs)
+  {
+    return reference?.pool != null
+        && string.Equals(reference.ONNXFileName, onnxFileName, StringComparison.Ordinal)
+        && reference.PoolMode == poolMode
+        && reference.GpuIDs.AsSpan().SequenceEqual(gpuIDs)
+        && reference.BatchSizes.AsSpan().SequenceEqual(batchSizes);
+  }
+
+
   public static NNEvaluatorTensorRT BuildEvaluator(NNEvaluatorNetDef netDef,
                                                      int[] gpuIDs,
                                                      NNEvaluatorOptions options,
                                                      ONNXNetExecutor.NetTypeEnum netType = ONNXNetExecutor.NetTypeEnum.TPG,
-                                                     string overrideFileName = null)
+                                                     string overrideFileName = null,
+                                                     NNEvaluator referenceEvaluator = null)
   {
     // Determine network file path
     string netFileName = overrideFileName ?? netDef.NetworkID;
@@ -2377,7 +2544,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
     }
 
     //    if (optionsCeres.HeadOverrides != null)
-    //    {
+    //    { 
     //      throw new NotImplementedException("Ceres TensorRT Native evaluator does not yet support head overrides.");
     //    }
     bool EXACT_BATCHES = options.EnableCUDAGraphs;
@@ -2385,7 +2552,16 @@ public class NNEvaluatorTensorRT : NNEvaluator
     // Check if BF16 mode or refittable is requested via NNEvaluatorOptionsCeres
     TensorRTBuildOptions? buildOptions = null;
 
-    //const bool ENABLE_GRAPHS = false;
+    // Determine set of batch sizes (for exact batch mode)
+    // Smaller batch sizes are used with multiple GPUs because each GPU processes a smaller sub-batch
+    int[] batchSizes = gpuIDs.Length switch
+    {
+      1           => [8, 32, 64, 96, 132, 168, 208, 224],
+      2           => [8, 24, 40, 56, 72, 88, 104, 120],
+      3 or 4 or 5 => [8, 20, 32, 48, 60, 72, 88, 104],
+      _           => [8, 16, 24, 32, 40, 48, 56, 64],
+    };
+
     bool forceBF16 = options is NNEvaluatorOptionsCeres optionsCeres && optionsCeres.UseBF16;
     bool forceInt8 = options is NNEvaluatorOptionsCeres optionsCeresInt8 && optionsCeresInt8.UseInt8;
     bool forceFP8 = options is NNEvaluatorOptionsCeres optionsCeresFP8 && optionsCeresFP8.UseFP8;
@@ -2396,23 +2572,25 @@ public class NNEvaluatorTensorRT : NNEvaluator
     // for the value-head collapse — standard TRT was discarding dequant scales).
     // (Earlier single-profile routing for INT8 was a diagnostic; it did not fix
     // value, and the real cause was the non-strongly-typed build.)
-    EnginePoolMode poolMode = EXACT_BATCHES ? EnginePoolMode.Exact : EnginePoolMode.Range;
-    int[] poolSizes = EXACT_BATCHES ? [1, 8, 20, 42, 64, 88, 116, 240] : [96, 1024];
-    bool poolCudaGraphs = EXACT_BATCHES;
     NNEvaluatorTensorRT trtNativeEngine = new(netFileName,
                                               netType,
-                                              poolMode,
-                                              poolSizes,
+                                              EXACT_BATCHES ? EnginePoolMode.Exact : EnginePoolMode.Range,
+                                              EXACT_BATCHES ? batchSizes : [96, 1024],
                                               buildOptions,
                                               gpuIDs: gpuIDs,
-                                              useCudaGraphs: poolCudaGraphs,
-                                              softMaxBatchSize: 1024,
+                                              useCudaGraphs: EXACT_BATCHES,
+                                              // Soft (logical) max batch size. Engines are NOT built at this size;
+                                              // larger logical batches are split into engine-sized sub-batches
+                                              // (engine ranges remain [96, 1024] above, exact sizes when CUDA graphs).
+                                              // Drives only the host-side per-position buffers, not engine/pinned VRAM.
+                                              softMaxBatchSize: 4096,
                                               optimizationLevel: options.OptimizationLevel,
                                               forceBF16: forceBF16,
                                               forceInt8: forceInt8,
                                               forceFP8: forceFP8,
                                               refittable: refittable,
-                                              fp32AllNormsOverride: fp32AllNorms);
+                                              fp32AllNormsOverride: fp32AllNorms,
+                                              referenceEvaluator: referenceEvaluator as NNEvaluatorTensorRT);
     trtNativeEngine.Options = options;
 
     EncodedPositionBatchFlat.RETAIN_POSITION_INTERNALS = true; // ** TODO: remove/rework
@@ -2444,7 +2622,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
     {
       throw new Exception($"Failed to query SM count for GPU {deviceID}");
     }
-    const int THRESHOLD_ADJUST_TO_SM_DISTANCE = 8;
+    const int THRESHOLD_ADJUST_TO_SM_DISTANCE = 6;
 
     int[] bases = { smCount };
 

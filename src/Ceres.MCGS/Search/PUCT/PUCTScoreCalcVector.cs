@@ -98,7 +98,7 @@ public unsafe static class PUCTScoreCalcVector
     Debug.Assert(outputScores.IsEmpty || outputScores.Length >= numChildren);
     Debug.Assert(numVisitsToCompute == 0 || outputChildVisitCounts.Length >= numChildren);
 
-    if (paramsSelect.CBGPUCTSelectActive
+    if (paramsSelect.CBGPUCTSelectActiveAtN(parentN)
         && MCGSParamsFixed.DEBUG_CBGPUCT
         && parentNode.IsSearchRoot
         && numVisitsToCompute > 1)
@@ -109,13 +109,13 @@ public unsafe static class PUCTScoreCalcVector
                           cpuctMultiplier, parentNode);
     }
 
-    if (paramsSelect.CBGPUCTSelectActive)
+    if (paramsSelect.CBGPUCTSelectActiveAtN(parentN))
     {
       return CBGPUCTScoreCalc.ScoreCalc(paramsSelect, parentNode, childStats,
                                         qParent, parentSumPVisited,
                                         numChildren, numVisitsToCompute,
                                         outputScores, outputChildVisitCounts,
-                                        qWhenNoChildrenPerChild);
+                                        qWhenNoChildrenPerChild, cpuctMultiplier);
     }
 
     float virtualLossMultiplier;
@@ -206,6 +206,9 @@ public unsafe static class PUCTScoreCalcVector
     int numVisits = 0;
     int numTooSuboptimal = 0;
 
+    // Allow at least 1 and up to 20% of requested visits to exceed the limit (or up to 5% of parent N).
+    int maxVisitsAllowedOverSuboptimalityLimit = 1 + Math.Max(numVisitsToCompute / 5, parentN / 20);
+
     while (numVisits < numVisitsToCompute
         || numVisits == 0 && numVisitsToCompute == 0) // just querying scores, no children to select
     {
@@ -243,16 +246,14 @@ public unsafe static class PUCTScoreCalcVector
         double thisQ = childStats.W.Span[maxIndex] / childStats.N.Span[maxIndex];
         double qSuboptimality = thisQ + qParent;
 
-        // Allow at least 1 and up to 10% of requested visits to exceed the limit.
-        int maxVisitsAllowedOverSuboptimalityLimit = 1 + parentN / 10;
         if (qSuboptimality > thresholdPUCTSuboptimalityReject)
         {
           numTooSuboptimal++;
 
           if (numTooSuboptimal > maxVisitsAllowedOverSuboptimalityLimit)
           {
-//            Console.WriteLine($"Reducing visit count from {numVisitsToCompute} to {numVisits} at parentN= {parentN}");
-            numTooSuboptimal++;
+//if (Random.Shared.Next(100) == 0)
+//  Console.WriteLine($"Reducing visit count from {numVisitsToCompute} to {numVisits} at parentN= {parentN} due to Q suboptimality {qSuboptimality}");
             return numVisits;
           }
         }
@@ -406,13 +407,21 @@ This changes selection behavior even when ACTION_ENABLED is not defined and adds
       Vector<double> vQWhenNoChildren;
       if (qWhenNoChildrenPerChild != null)
       {
-        double[] qPerChildPadded = t_simdQChildBuffer ??= new double[Vector<double>.Count];
-        int remaining = qWhenNoChildrenPerChild.Length - startOffset;
-        for (int i = 0; i < simdWidth; i++)
+        ReadOnlySpan<double> qNoChildrenSpan = qWhenNoChildrenPerChild.AsSpan(startOffset);
+
+        if (qNoChildrenSpan.Length >= Vector<double>.Count)
         {
-          qPerChildPadded[i] = i < remaining ? qWhenNoChildrenPerChild[startOffset + i] : qWhenNoChildren;
+          // Hot path: a full vector is available — load straight from the array.
+          vQWhenNoChildren = new Vector<double>(qNoChildrenSpan);
         }
-        vQWhenNoChildren = new Vector<double>(qPerChildPadded);
+        else
+        {
+          // Tail only: pad the missing lanes with the scalar fallback.
+          Span<double> padded = stackalloc double[Vector<double>.Count];
+          padded.Fill(qWhenNoChildren);
+          qNoChildrenSpan.CopyTo(padded);
+          vQWhenNoChildren = new Vector<double>(padded);
+        }
       }
       else
       {

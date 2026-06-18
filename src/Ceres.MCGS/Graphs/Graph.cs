@@ -145,6 +145,28 @@ public unsafe partial class Graph : IDisposable
 
   public int NumLinksToExistingNodes;
 
+  /// <summary>
+  /// Stress-test knob: when the environment variable CERES_CHAOS_NONBLOCK contains '1',
+  /// AddEdgeToNewOrExistingNode simulates frequent non-blocking lock contention (1 in 8
+  /// calls fail as if the existing node's lock were held). This exercises the select-phase
+  /// contention fallbacks (expansion blocking, dropped-visit ledger backout) which are
+  /// otherwise too rare to test; a search under chaos must still end with zero residual
+  /// in-flight counts. Zero cost when unset (the static readonly false branch is JITted away).
+  /// </summary>
+  internal static readonly bool CHAOS_NONBLOCK_SITE_A =
+    (System.Environment.GetEnvironmentVariable("CERES_CHAOS_NONBLOCK") ?? "").Contains('1');
+  internal static int chaosCounter;
+
+  /// <summary>
+  /// Threshold for repetition-draw discounting of pseudotransposition blending donors:
+  /// donor weight is scaled by max(0, 1 - donor.RepDrawFraction / thisValue);
+  /// values less than or equal to 0 disable the discounting.
+  /// Mirror of ParamsSearch.PseudoTranspositionBlendingMaxRepDrawFraction, copied here
+  /// (per engine construction) because the donor contribution computation is a static
+  /// method with access only to the node/graph.
+  /// </summary>
+  internal float PTBMaxRepDrawFraction;
+
   public bool HasState => Store.HasState;
 
   public bool HasAction => Store.HasAction;
@@ -295,7 +317,7 @@ public unsafe partial class Graph : IDisposable
   private void Initialize(int maxNodes)
   {
     // Try to size Dictionary based on maxNodes but don't allow to be too large.
-    const int MAX_DICTIONARY_SIZE_HINT = 2_000_000; 
+    const int MAX_DICTIONARY_SIZE_HINT = 2_000_000;
     int dictionarySizeHint = Math.Min(maxNodes, MAX_DICTIONARY_SIZE_HINT);
     const int DICTIONARY_CONCURRENCY = 16;
 
@@ -318,7 +340,7 @@ public unsafe partial class Graph : IDisposable
 
     // Ensure NodeIndexSetStore is cached locally before we use it
     NodeIndexSetStore = Store.NodeIndexSetStore;
-    
+
     // Initialize the root node with basic information.
     MGPosition initialPos = Store.NodesStore.PositionHistory.FinalPosMG;
     PosHash64 hash64 = MGPositionHashing.Hash64(in initialPos);
@@ -389,7 +411,8 @@ public unsafe partial class Graph : IDisposable
   /// <param name="okToCreate"></param>
   /// <returns></returns>
   (GNode node, bool wasCreated, bool wasCollision) LookupOrCreateAndAcquire(
-    PosHash96MultisetFinalized hash, PosHash64WithMove50AndReps standaloneKey, bool okToCreate)
+    PosHash96MultisetFinalized hash, PosHash64WithMove50AndReps standaloneKey, bool okToCreate,
+    bool nonBlockingExistingNodeLock = false)
   {
     int index;
     GNode node;
@@ -415,7 +438,17 @@ public unsafe partial class Graph : IDisposable
           ? setIndex.DirectNodeIndex
           : NodeIndexSetStore.sets[setIndex.NodeSetIndex][0].Index;
         node = this[existingIdx];
-        node.AcquireLock();
+        if (nonBlockingExistingNodeLock)
+        {
+          if (!node.TryAcquireLock())
+          {
+            return (default, false, false);
+          }
+        }
+        else
+        {
+          node.AcquireLock();
+        }
         return (node, false, false);
       }
 
@@ -446,7 +479,17 @@ public unsafe partial class Graph : IDisposable
             ? setIndex.DirectNodeIndex
             : NodeIndexSetStore.sets[setIndex.NodeSetIndex][0].Index;
           GNode collisionNode = this[existingIdx];
-          collisionNode.AcquireLock();
+          if (nonBlockingExistingNodeLock)
+          {
+            if (!collisionNode.TryAcquireLock())
+            {
+              return (default, false, false);
+            }
+          }
+          else
+          {
+            collisionNode.AcquireLock();
+          }
           return (collisionNode, false, true);
         }
         else
@@ -460,7 +503,17 @@ public unsafe partial class Graph : IDisposable
     if (transpositionPositionAndSequence.TryGetValue(hash, out index))
     {
       node = this[index];
-      node.AcquireLock();
+      if (nonBlockingExistingNodeLock)
+      {
+        if (!node.TryAcquireLock())
+        {
+          return (default, false, false);
+        }
+      }
+      else
+      {
+        node.AcquireLock();
+      }
       return (node, false, false);
     }
 
@@ -497,7 +550,17 @@ public unsafe partial class Graph : IDisposable
       if (transpositionPositionAndSequence.TryGetValue(hash, out index))
       {
         GNode collisionNode = this[index];
-        collisionNode.AcquireLock();
+        if (nonBlockingExistingNodeLock)
+        {
+          if (!collisionNode.TryAcquireLock())
+          {
+            return (default, false, false);
+          }
+        }
+        else
+        {
+          collisionNode.AcquireLock();
+        }
         return (collisionNode, false, true);
       }
       else
@@ -519,6 +582,24 @@ public unsafe partial class Graph : IDisposable
   internal static readonly LiveStats fiftyMoveCounter50 = MCGSParamsFixed.LOG_LIVE_STATS ? new LiveStats("50 move rule, over 50 ply", 1) : null;
   internal static readonly LiveStats fiftyMoveCounter90 = MCGSParamsFixed.LOG_LIVE_STATS ? new LiveStats("50 move rule, over 90 ply", 1) : null;
 
+
+
+  /// <summary>
+  /// Read-only (lock-free) probe of the 96-bit position+sequence dictionary,
+  /// returning the exact node registered under the specified key (or null node).
+  /// </summary>
+  /// <param name="hash"></param>
+  /// <returns></returns>
+  internal GNode TryGetNodeByPositionAndSequence(PosHash96MultisetFinalized hash)
+  {
+    if (transpositionPositionAndSequence != null
+     && transpositionPositionAndSequence.TryGetValue(hash, out int index))
+    {
+      return this[index];
+    }
+
+    return default;
+  }
 
 
   /// <summary>
@@ -708,6 +789,13 @@ public unsafe partial class Graph : IDisposable
     nodeRef.IsGraphRoot = isRoot;
     nodeRef.IsWhite = mgPos.SideToMove == SideType.White;
 
+    // Record 50-move bucket and repetition context on the node. These drive the
+    // pseudo-transposition blending eligibility/lookup key (which must agree with the
+    // position-derived hash64WithMoveAndReps registration above) and the
+    // GraphRewriter standalone dictionary rebuild filters.
+    nodeRef.Move50Category = mgPos.Move50Category;
+    nodeRef.HasRepetitions = mgPos.RepetitionCount > 0;
+
     GameResult terminalStatus = mgPos.CalcTerminalStatus(moves); // TODO: potentially in most situations this is already known, do not recompute
     nodeRef.Terminal = terminalStatus;
     switch (terminalStatus)
@@ -736,11 +824,19 @@ public unsafe partial class Graph : IDisposable
   }
 
 
-  public GEdge AddNewTerminalEdge(GNode parentNode, int indexOfChildInParent, double edgeV, double edgeD, int numVisits, bool propagateAsDraw)
+  /// <param name="historySensitiveDraw">If the terminal draw arises from repetition or the 50-move rule
+  /// (valid only for histories like the current one), as opposed to history-free draws
+  /// (stalemate/insufficient material/tablebase). Recorded via a sentinel in the edge's
+  /// NDrawByRepetition field (maintained in tandem with N by BackupToEdge thereafter),
+  /// enabling downstream features (e.g. the per-node RepDrawFraction statistic) to
+  /// distinguish draw kinds on revisits.</param>
+  public GEdge AddNewTerminalEdge(GNode parentNode, int indexOfChildInParent, double edgeV, double edgeD, int numVisits, bool propagateAsDraw,
+                                  bool historySensitiveDraw = false)
   {
     Debug.Assert(numVisits > 0);
     Debug.Assert(Math.Abs(edgeV) <= EvaluatorSyzygy.BLESSED_WIN_LOSS_MAGNITUDE + 0.01 || Math.Abs(edgeV) >= 1.0);
     Debug.Assert(!propagateAsDraw || (edgeD == 1 && edgeV == 0));
+    Debug.Assert(!historySensitiveDraw || propagateAsDraw);
 
     if (propagateAsDraw)
     {
@@ -767,6 +863,15 @@ public unsafe partial class Graph : IDisposable
     //      thisEdgeRef.W = numVisits * edgeV;
     //      thisEdgeRef.DSum = edgeV == 0 ? numVisits : 0;
     thisEdgeRef.QChild = edgeV;
+
+    if (historySensitiveDraw)
+    {
+      // Kind sentinel: NDrawByRepetition > 0 on a terminal drawn edge marks it as a
+      // repetition/50-move draw. Q-neutral (the edge Q property's N == 0 and
+      // N == NDrawByRepetition branches both yield the drawn value); BackupToEdge
+      // maintains NDrawByRepetition == N on such edges thereafter.
+      thisEdgeRef.NDrawByRepetition = 1;
+    }
 
     //      thisEdgeRef.N = numVisits;
     //      thisEdgeRef.W = numVisits * edgeV;
@@ -804,6 +909,9 @@ public unsafe partial class Graph : IDisposable
   /// <param name="standaloneHash">A hash representing the position on a standalone basis.</param>
   /// <param name="lookupHash">A cumulative hash representing the sequence, order-insensitive except for the last element.</param>
   /// <param name="moves">A reference to the list of moves used to initialize the child node.</param>
+  /// <param name="nonBlockingExistingNodeLock">If acquisition of an EXISTING node's lock should be attempted
+  /// non-blockingly; on contention the method returns a default (null) edge without creating anything.
+  /// Used by callers (e.g. transposition auto-extension) which hold other node locks and must not block.</param>
   /// <returns>The edge connecting the parent node to the new or existing child node.</returns>
   public (GEdge childNode, bool wasCollision) AddEdgeToNewOrExistingNode(GNode parentNode,
                                                                          int indexOfChildInParent,
@@ -813,9 +921,20 @@ public unsafe partial class Graph : IDisposable
                                                                          MGMoveList moves,
                                                                          out bool wasCreated,
                                                                          out GNode standaloneTranspositionNode,
-                                                                         bool okToCreate)
+                                                                         bool okToCreate,
+                                                                         bool nonBlockingExistingNodeLock = false)
   {
     Debug.Assert(parentNode.IsLocked);
+
+    // Stress-test hook (see CHAOS_NONBLOCK_SITE_A): simulate frequent non-blocking
+    // lock contention to exercise callers' fallback ledger handling.
+    if (CHAOS_NONBLOCK_SITE_A && nonBlockingExistingNodeLock
+     && (System.Threading.Interlocked.Increment(ref chaosCounter) & 7) == 0)
+    {
+      wasCreated = false;
+      standaloneTranspositionNode = default;
+      return default;
+    }
 
     if (!parentNode.IsGraphRoot)
     {
@@ -831,14 +950,16 @@ public unsafe partial class Graph : IDisposable
       ? MGPositionHashing.Hash64WithMove50AndRepsAdded(standaloneHash, 0, default)
       : default;
 
-    (GNode childNode, wasCreated, bool wasCollision) = LookupOrCreateAndAcquire(lookupHash, standaloneKey, okToCreate);
+    (GNode childNode, wasCreated, bool wasCollision) = LookupOrCreateAndAcquire(lookupHash, standaloneKey, okToCreate,
+                                                                                nonBlockingExistingNodeLock);
     Debug.Assert(childNode.IsNull || childNode.IsLocked);
 
     if (!wasCreated)
     {
       standaloneTranspositionNode = default;
-      if (!okToCreate && childNode.IsNull)
+      if (childNode.IsNull)
       {
+        // Not found (okToCreate false), or existing node lock unavailable (non-blocking mode).
         return default;
       }
       else
@@ -906,8 +1027,8 @@ public unsafe partial class Graph : IDisposable
     thisEdgeRef.P = thisEdgeHeader.P;
     thisEdgeRef.Move = thisEdgeHeader.Move;
 #if ACTION_ENABLED
-      thisEdgeRef.ActionV = thisEdgeHeader.ActionV;
-      thisEdgeRef.ActionU = thisEdgeHeader.ActionU;
+    thisEdgeRef.ActionV = thisEdgeHeader.ActionV;
+    thisEdgeRef.ActionU = thisEdgeHeader.ActionU;
 #endif
     thisEdgeRef.ChildNodeIndex = childNode.Index;
 
@@ -920,14 +1041,20 @@ public unsafe partial class Graph : IDisposable
   }
 
 
-  static bool haveWarned = false;
+  static bool haveWarnedEdgeOutOfOrder = false;
 
   private ref GEdgeStruct InitializeNewEdge(GNode parentNode, int indexOfChildInParent, out GEdgeHeaderStruct thisEdgeHeader)
   {
-    if (!haveWarned && indexOfChildInParent != parentNode.NumEdgesExpanded)
+    // Edges expected to be expanded strictly in index order: creating edge k relies on edge k-1's
+    // block index being set.  An out-of-order expansion (a "hole" left by selection) would
+    // otherwise read a garbage block index below and corrupt memory.
+    if (!parentNode.IsGraphRoot 
+      && indexOfChildInParent != parentNode.NumEdgesExpanded 
+      && !haveWarnedEdgeOutOfOrder)
     {
-      ConsoleUtils.WriteLineColored(ConsoleColor.Yellow, $"Warning: indexOfchildInParent = {indexOfChildInParent} but NumEdgesExpanded = {parentNode.NumEdgesExpanded} for {parentNode}");
-      haveWarned = true;
+      ConsoleUtils.WriteLineColored(ConsoleColor.Yellow, $"Out-of-order edge expansion: indexOfChildInParent={indexOfChildInParent} "
+                                                       + $"but NumEdgesExpanded={parentNode.NumEdgesExpanded} for {parentNode}");
+      haveWarnedEdgeOutOfOrder = true;
     }
     Debug.Assert(indexOfChildInParent < parentNode.NumPolicyMoves);
 
@@ -1139,7 +1266,7 @@ public unsafe partial class Graph : IDisposable
     Span<double> w = stats.W.Span;
     Span<double> uv = stats.UV.Span;
 #if ACTION_ENABLED
-      Span<double> a = stats.A.Span;
+    Span<double> a = stats.A.Span;
 #endif
 
     int numEdgesExpanded = node.NumEdgesExpanded;
@@ -1181,9 +1308,6 @@ public unsafe partial class Graph : IDisposable
               && refEdge.Type == GEdgeStruct.EdgeType.ChildEdge
               && !refEdge.ChildNodeHasDrawKnownToExist)
           {
-            // NumParentsMoreThanOne touches the child node header (same cache line we'd hit for
-            // the refresh itself); gating here eliminates the read entirely for single-parent
-            // edges, which dominate non-transposition positions.
             GNode candidateChild = new GNode(node.Graph, refEdge.ChildNodeIndex);
             needsRefresh = candidateChild.NumParentsMoreThanOne;
           }
@@ -1470,7 +1594,7 @@ public unsafe partial class Graph : IDisposable
           if (!child.IsExpanded)
           {
 #if ACTION_ENABLED
-              Console.WriteLine($"    {(isWhite ? child.Move.Flipped : child.Move)}  P={child.P,5:F3}  AV={child.ActionV,5:F3}  AU={child.ActionU,5:F3}");
+            Console.WriteLine($"    {(isWhite ? child.Move.Flipped : child.Move)}  P={child.P,5:F3}  AV={child.ActionV,5:F3}  AU={child.ActionU,5:F3}");
 #else
             Console.WriteLine($"    {(isWhite ? child.Move.Flipped : child.Move)}  P={child.P,5:F3}");
 #endif
@@ -1479,7 +1603,7 @@ public unsafe partial class Graph : IDisposable
           {
             GEdge childEdge = node.ChildEdgeAtIndex(childIndex);
 #if ACTION_ENABLED
-              Console.WriteLine($"  --> {childEdge.ChildNodeIndex.Index}  {(isWhite ? childEdge.Move.Flipped : childEdge.Move)}  P={childEdge.P,5:F3}  AV={childEdge.ActionV,5:F3}  AU={childEdge.ActionU,5:F3}");
+            Console.WriteLine($"  --> {childEdge.ChildNodeIndex.Index}  {(isWhite ? childEdge.Move.Flipped : childEdge.Move)}  P={childEdge.P,5:F3}  AV={childEdge.ActionV,5:F3}  AU={childEdge.ActionU,5:F3}");
 #else
             Console.WriteLine($"  --> {childEdge.ChildNodeIndex.Index}  {(isWhite ? childEdge.Move.Flipped : childEdge.Move)}  P={childEdge.P,5:F3}");
 #endif
@@ -1591,10 +1715,62 @@ public unsafe partial class Graph : IDisposable
 
       bool isIrreversible = posParent.IsIrreversibleMove(thisMove, posChild);
 
-      retInfo.Add(new GraphRootToSearchRootNodeInfo(curNode, in posChild, childHash64, childHash96, thisMove, isIrreversible));
+      // Set the repetition flag explicitly on the stored copy (not on the loop-carried posChild,
+      // since MakeMove does not reset RepetitionCount and the flag would leak into later entries).
+      // These positions appear in NN history planes, so the flag must be populated here just as it
+      // is for prehistory (PositionWithHistoryHashes) and path visits (select phase).
+      MGPosition posChildToStore = posChild;
+      posChildToStore.RepetitionCount = (byte)((!isIrreversible && HashAppearsInSegmentOrPrehistory(retInfo, childHash64)) ? 1 : 0);
+      retInfo.Add(new GraphRootToSearchRootNodeInfo(curNode, in posChildToStore, childHash64, childHash96, thisMove, isIrreversible));
     }
 
     return retInfo;
+  }
+
+
+  /// <summary>
+  /// Returns if the specified hash appears among earlier positions
+  /// (graph-root-to-search-root segment entries accumulated so far, then prehistory),
+  /// stopping the lookback at irreversible moves.
+  /// Mirrors MCGSPath.HashFoundInGraphRootPathOrPrehistory but with plain seen-once
+  /// semantics, consistent with the prehistory flags set by the PositionWithHistoryHashes
+  /// constructor (segment and prehistory positions coexist in the same NN history input).
+  /// </summary>
+  bool HashAppearsInSegmentOrPrehistory(List<GraphRootToSearchRootNodeInfo> segmentSoFar, PosHash64 hash)
+  {
+    // Earlier segment positions, newest first.
+    for (int i = segmentSoFar.Count - 1; i >= 0; i--)
+    {
+      if (segmentSoFar[i].ChildHashStandalone64 == hash)
+      {
+        return true;
+      }
+
+      if (segmentSoFar[i].MoveToChildIrreversible)
+      {
+        // The move into entry i was irreversible; nothing earlier can repeat.
+        return false;
+      }
+    }
+
+    // Prehistory, newest first (entry [^1] is the graph root).
+    // MoveAfterPositionWasIrreversible[i - 1] is the move from position i-1 into position i.
+    PosHash64[] prehistoryHashes = Store.HistoryHashes.PriorPositionsHashes64;
+    bool[] moveAfterIrreversible = Store.HistoryHashes.MoveAfterPositionWasIrreversible;
+    for (int i = prehistoryHashes.Length - 1; i >= 0; i--)
+    {
+      if (prehistoryHashes[i] == hash)
+      {
+        return true;
+      }
+
+      if (i == 0 || moveAfterIrreversible[i - 1])
+      {
+        break;
+      }
+    }
+
+    return false;
   }
 
 
@@ -1683,6 +1859,26 @@ public unsafe partial class Graph : IDisposable
 
     // Make the contribution an increasing function of excess visits
     float excessN = siblingN - targetNodeNAfterPendingVisits;
+
+    // Discount donors whose value derives significantly from history-sensitive
+    // (repetition/50-move) draws, which are valid only for the donor's own histories:
+    // scale the donated WEIGHT by a linear ramp hitting zero at PTBMaxRepDrawFraction
+    // (scaling excessN rather than Q correctly reduces both the donor's share of the
+    // blended average and the overall blend fraction).
+    float maxRepDrawFraction = transpositionNode.Graph.PTBMaxRepDrawFraction;
+    if (maxRepDrawFraction > 0)
+    {
+      double repDrawFraction = transpositionNode.RepDrawFraction;
+      if (repDrawFraction > 0)
+      {
+        float discount = (float)Math.Max(0, 1 - repDrawFraction / maxRepDrawFraction);
+        if (discount == 0)
+        {
+          return (0, 0);
+        }
+        excessN *= discount;
+      }
+    }
 
     if (MCGSParamsFixed.SIBLING_POWER_SHRINK_SIBLING_N == 1)
     {

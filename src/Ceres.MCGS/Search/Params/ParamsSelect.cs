@@ -89,14 +89,17 @@ public record ParamsSelect
   /// <summary>
   /// Minimum policy value for moves (as a fraction) which forces policy probabilities to be at least this level.
   /// </summary>
-  public const float MinPolicyProbability = 0.005f;
+  public const float MinPolicyProbability = 0.004f;
 
   /// <summary>
-  /// Regularization coefficient on Boltzmann calibration of policy-based imputation values.
-  /// Higher values make the imputed Q values more closely track the policy (thus more exploration).
-  /// Maps to lambda in RegularizedPolicyOptimum.Solve when FPUMode is PolicyImputed or PolicyImputedRPO.
+  /// Temperature (lambda) of the policy->Q imputation in RegularizedPolicyOptimum.Solve
+  /// (fills Q for unvisited children = FPU, and the CB-GPUCT backup shrinkage prior).
+  /// Default forward-KL form:  q(a) = anchorQ + tau*(log mu_a - E_mu[log mu]).  Higher tau
+  /// spreads imputed Q further by policy (top-policy moves look better, tail moves worse),
+  /// sharpening the search toward the policy rather than broadening it; tau -> 0 gives a
+  /// flat FPU equal to anchorQ (parent Q).  Used when FPUMode is PolicyImputed or PolicyImputedRPO.
   /// </summary>
-  public float PolicyImputationTau = 0.10f;
+  public float PolicyImputationTau = 0.15f; // values less than 0.15 test as significantly inferior
 
 
   /// <summary>
@@ -122,6 +125,12 @@ public record ParamsSelect
   public RPORegularization RPOFPURegularization = RPORegularization.ForwardKLSoftmax;
 
   /// <summary>
+  /// Amount by which unvisited child value scores are shifted in RPO mode
+  /// from the value computed by RPO imputation.
+  /// </summary>
+  public float RPOFPUValue = -0.15f;
+
+  /// <summary>
   /// Apportionment algorithm used to translate pi_bar into a concrete visit allocation
   /// in CB-GPUCT.  Default IterativeLargestDeficit matches the historical CBGPUCT inner
   /// loop exactly; HamiltonClosedForm is behaviorally equivalent up to tie-breaking and
@@ -130,30 +139,50 @@ public record ParamsSelect
   public RPOAllocationAlgorithm RPOSelectAllocator = RPOAllocationAlgorithm.IterativeLargestDeficit;
 
   /// <summary>
-  /// Number of Sinkhorn-style fixed-point refinement iterations applied after the
-  /// initial Solve in CB-GPUCT selection.  After the first Solve produces pi_bar,
-  /// the imputed q values for unvisited children are refreshed via
-  ///   q(a) = v_parent + lambda * (1 - mu(a) / pi_bar(a))
-  /// and the solve is repeated.  At the (un-clamped) fixed point the regularized
-  /// child value v* equals v_parent, enforcing the soft-Bellman expectation that
-  /// the parent value is consistent with the regularized aggregate of its children.
-  /// This is the reverse-KL analogue of the MatchValue forward-KL anchor.
+  /// Choice of base anchor VALUE used to calibrate per-child imputed Q for unvisited
+  /// children.  The selected scalar is passed as the MatchValue/MatchChild anchor.Value
+  /// to RegularizedPolicyOptimum.Solve, fixing the absolute level of the imputed q
+  /// vector (relative spread among children comes from lambda * log mu).
   ///
-  /// Default 0 disables this (no extra solves; zero overhead, behavior identical
-  /// to legacy).  Typical setting: 2 or 3 iterations.  Higher counts risk pushing
-  /// unvisited q values toward the -1 clamp when the visited children's Q values
-  /// are systematically higher than v_parent (which can over-suppress exploration).
-  /// Cost scales linearly with the iteration count.  Only takes effect when
-  /// RPOSelectRegularization = ReverseKL.
+  /// IMPORTANT: This enum controls only the anchor VALUE, not the anchor MODE.  The
+  /// FPU call site additionally picks MatchChild(0) vs MatchValue mode based on
+  /// whether child 0 is visited (a legacy convention - see PUCTSelector docs for
+  /// the "legacy quirk" note).  Mode selection is orthogonal and unchanged here.
+  ///
+  /// Options:
+  ///   ParentV                  - node.NodeRef.V (raw NN value head; unaffected by search).
+  ///   ParentQ                  - node.Q (search-improved Q; under CBGPUCT this is the
+  ///                              previous V_bar, selfV-blended and possibly stale).
+  ///                              This reproduces the legacy FPU anchor value exactly.
+  ///   FirstChildElseParentQ    - observed Q of child 0 (parent perspective) if visited,
+  ///                              else node.Q.  Useful when child 0 is reliably the
+  ///                              highest-P move and is visited first; this is what the
+  ///                              MatchChild mode "should" do semantically (whereas
+  ///                              legacy keeps the value at node.Q regardless).
+  ///   BestChildElseParentQ     - max over visited children of -edge.Q (parent perspective),
+  ///                              else node.Q.  Anchors on the strongest observation;
+  ///                              corresponds to the "earlier dead code computing
+  ///                              bestIndex" referenced in PUCTSelector docs.
+  ///   BlendBestChildParentQ    - 0.5 * (best visited child Q + node.Q), else node.Q.
+  ///                              Compromise between BestChild and ParentQ.
   /// </summary>
-  public int CBGPUCT_SelectFixedPointIterations = 2;
+  public enum CBGPUCTQAnchorType
+  {
+    ParentV,
+    ParentQ,
+    FirstChildElseParentQ,
+    BestChildElseParentQ,
+    BlendBestChildParentQ,
+  }
 
   /// <summary>
-  /// Convergence threshold for the fixed-point refinement: the loop exits early once
-  /// the largest single-child change in imputed q falls below this value.
+  /// Anchor VALUE used to calibrate per-child imputed Q in the FPU imputation
+  /// (ApplyRPOImputedFPU during selection).  Default ParentQ exactly reproduces
+  /// legacy behavior: anchor.Value = node.Q in both legacy branches (MatchChild
+  /// when child 0 visited, MatchValue otherwise - the mode switch is unrelated to
+  /// the value and remains driven by child 0's visit status regardless of this enum).
   /// </summary>
-  public double RPOSelectFixedPointTol = 1e-4;
-
+  public CBGPUCTQAnchorType CBGPUCT_QAnchorTypeFPU = CBGPUCTQAnchorType.ParentQ;
 
 
   /// <summary>
@@ -286,10 +315,233 @@ public record ParamsSelect
                                   || CBGPUCT_Mode == CBGPUCTModeType.SelectAndBackup;
 
   /// <summary>
+  /// Convenience predicate: visit-target pi_bar selection is active for a parent node
+  /// with the specified visit count <paramref name="n"/>.
+  ///
+  /// This is true only when CB-GPUCT select is enabled (see CBGPUCTSelectActive) AND the
+  /// parent N has not exceeded CBGPUCT_PUCTAboveN.  Once the parent N grows strictly larger
+  /// than CBGPUCT_PUCTAboveN the selection falls back to standard PUCT for that node.
+  /// </summary>
+  /// <param name="n">Parent node visit count N.</param>
+  /// <returns>True if CB-GPUCT visit-target selection should run for this parent; false to fall back to PUCT.</returns>
+  public bool CBGPUCTSelectActiveAtN(int n) => CBGPUCTSelectActive && n <= CBGPUCT_PUCTAboveN;
+
+
+  /// <summary>
   /// Convenience predicate: V_bar regularized backup is active.
   /// </summary>
   public bool CBGPUCTBackupActive => CBGPUCT_Mode == CBGPUCTModeType.BackupOnly
                                   || CBGPUCT_Mode == CBGPUCTModeType.SelectAndBackup;
+
+  #region Support-shrinkage (the sole CB-GPUCT robustness mechanism, select + backup)
+
+  /// <summary>
+  /// MASTER TOGGLE + prior strength for the unified support-shrinkage backup.
+  ///
+  /// When &gt; 0, ComputeVBar uses a single posterior-mean Q estimate per child
+  ///   q_hat(a) = (N_a^p * q_obs(a) + K * m_a) / (N_a^p + K)     for visited children
+  ///   q_hat(a) = m_a                                            for unvisited (the N_a = 0 limit)
+  /// and uses it CONSISTENTLY for BOTH the pi_bar weights AND the V_bar dot product:
+  ///   pi_bar = ReverseKL(mu, q_hat, lambda_N),
+  ///   V_bar  = (sum_a pi_bar(a) * q_hat(a) * (N - 1) + selfV) / N.
+  /// Here K = this knob (prior pseudo-visit count), p = CBGPUCT_BackupSupportShrinkageDecayExponent,
+  /// N_a = child.N (statistical support; cross-parent in graph mode), and m_a is the
+  /// empirical-Bayes prior: the support-weighted consensus of the children themselves,
+  /// policy-shaped via the existing forward-KL imputation -
+  ///   q_bar = sum_a N_a q_a / sum_a N_a,   m_a = q_bar + tau*(log mu_a - E_mu[log mu]),   tau = PolicyImputationTau,
+  /// falling back to node.V when no child is visited.  N_a here (the consensus weight)
+  /// defaults to child.N but is selectable via CBGPUCT_ConsensusWeight (e.g. edge.N
+  /// for transposition-robustness); the shrinkage PRECISION below always uses child.N.
+  ///
+  /// Why one knob suffices: the bias being controlled (reverse-KL pi_bar over-weights
+  /// high-q children, so V_bar is a soft-max of noisy child Q's -> winner's-curse /
+  /// max-operator overestimation that compounds toward the root) is driven by the NOISE
+  /// in each q_obs(a), which scales as 1/sqrt(N_a).  Shrinking each estimate toward the
+  /// prior in proportion to its own support (the conjugate / James-Stein posterior mean)
+  /// denoises it by exactly that amount, and using the same denoised value in the dot
+  /// product bounds its contribution at the source.  A single-visit outlier (e.g. 12,553
+  /// visits elsewhere, one new child returning a lucky +0.8) is shrunk hard toward the
+  /// consensus so it "moves the needle a little, not a lot"; as consistent evidence
+  /// accrues N_a grows, shrinkage vanishes, and the move is progressively believed
+  /// (q_hat -> q_obs as N_a -> infinity).
+  ///
+  /// This is the SOLE backup robustness mechanism (the legacy Q-shrinkage, pi_bar caps,
+  /// mean-preserve control variate, observed-only, anchor-type/anchorK blend, fixed-point
+  /// iteration, and per-child lambda have all been removed in favor of it).  Still active
+  /// alongside it: the lambda_N schedule (CBGPUCT_BackupLambda*), RPOBackupRegularization,
+  /// and PolicyImputationTau.
+  ///
+  /// 0 disables shrinkage (plain Grill V_bar: q_hat = q_obs for visited children, the
+  /// policy-implied prior for unvisited).  Typical setting 3-10; behavior is insensitive
+  /// across that range.  Default 3.
+  /// </summary>
+  public float CBGPUCT_BackupSupportShrinkageK = 3.0f;
+
+  /// <summary>
+  /// Decay exponent p in the support-shrinkage posterior mean
+  ///   q_hat(a) = (N_a^p * q_obs(a) + K * m_a) / (N_a^p + K).
+  /// p = 1 is the principled conjugate / Bayesian rate (shrink weight K/(N_a + K),
+  /// asymptotic 1/N decay).  p &gt; 1 makes the shrinkage vanish faster past N_a = 1
+  /// while leaving the N_a = 1 value unchanged (since 1^p = 1) - motivated by NN-eval-
+  /// based search where per-visit information can exceed the conjugate-Normal assumption.
+  /// Typical range [1.0, 2.0]; default 1.0.  Only used when
+  /// CBGPUCT_BackupSupportShrinkageK &gt; 0.
+  /// </summary>
+  public float CBGPUCT_BackupSupportShrinkageDecayExponent = 1.0f;
+
+  /// <summary>
+  /// Master toggle + strength (beta) of the BACKUP BREADTH BONUS: an additive max-entropy
+  /// style credit that makes a node with multiple good moves back up a slightly higher
+  /// value than an otherwise-equal node resting on a SINGLE good move.
+  ///
+  /// Why needed: the plain regularized value V_bar = sum_a pi_bar(a) q_hat(a) is an
+  /// expected-q (a weighted average bounded by max_a q_hat).  Near-best alternatives drag
+  /// that average DOWN, so V_bar actually mildly penalizes breadth; and as lambda_N -&gt; 0
+  /// at high N, pi_bar collapses onto the single argmax child and V_bar -&gt; max_a q_hat,
+  /// erasing any multi-move distinction entirely.  This term restores (and makes explicit)
+  /// the dropped max-entropy bonus  -lambda*KL(pi_bar||mu)  from the soft-value identity
+  ///   lambda*log sum_a mu_a exp(q_a/lambda) = E_pi[q] - lambda*KL(pi_bar||mu),
+  /// the part the energy-only V_bar discards.
+  ///
+  /// HIGH-N PERSISTENCE: breadth is measured on a value-softmax at a fixed temperature
+  /// CBGPUCT_BackupBreadthTemperature (NOT lambda_N), so unlike H(pi_bar) - which -&gt; 0 as
+  /// lambda_N collapses - this signal survives at large N, exactly where the plain
+  /// mechanism's benefit was observed to fade.
+  ///
+  /// ADVERSARIAL ASYMMETRY (free, no parity knob): the bonus is added in the node's OWN
+  /// (side-to-move) perspective.  Through the existing negamax edge negation (-edge.Q) an
+  /// ancestor reads it with alternating sign, so it rewards the mover's own optionality and
+  /// penalizes the opponent's reply breadth (prophylaxis / "pose the opponent problems").
+  ///
+  /// SAFETY: gated by (1 - |V_bar|) so it fades to 0 at decided/terminal/won-lost nodes
+  /// (proven mates already short-circuit before ComputeVBar), and hard-capped at
+  /// CBGPUCT_BackupBreadthBonusMax so it can never override a genuinely winning narrow move
+  /// (forced tactics / only-moves).  It is a tie-breaker among near-equal candidates, not a
+  /// dominant term.
+  ///
+  /// 0 disables (default; no behavior change).  Suggested starting point when enabling:
+  /// beta ~ 0.03-0.06 with the cap ~ 0.02-0.03.
+  /// Related literature: maximum-entropy MCTS (MENTS, Xiao et al. 2019), soft Q / SAC
+  /// (Haarnoja et al. 2018), MCTS-as-regularized-policy-optimization (Grill et al. 2020),
+  /// convex/Tsallis regularization (Dam et al. 2021); "empowerment differential" for the
+  /// adversarial framing.
+  /// </summary>
+  public float CBGPUCT_BackupBreadthBonusBeta = 0.0f; // 0.03 is reasonable value to enable
+
+  /// <summary>
+  /// Fixed softmax temperature tau_b used to measure breadth for the backup breadth bonus
+  ///   w(a) proportional to mu(a) * exp((q_hat(a) - max_a q_hat) / tau_b),
+  /// whose normalized entropy H(w)/log(#contributing) in [0,1] is the breadth fraction.
+  /// Deliberately decoupled from lambda_N: this is what keeps the bonus alive at high N
+  /// (a lambda_N-based measure would vanish as pi_bar sharpens).  SMALL tau_b -&gt; only
+  /// children within ~tau_b of the best count as "good" (strict); LARGE tau_b -&gt; more
+  /// children count (lenient).  Comparable in scale to the spread of the top children's Q
+  /// (single digits of a centipawn-equivalent up to ~0.3). 
+  /// Only used when CBGPUCT_BackupBreadthBonusBeta &gt; 0; tau_b &lt;= 0 disables the bonus.
+  /// </summary>
+  public float CBGPUCT_BackupBreadthTemperature = 0.02f;
+
+  /// <summary>
+  /// Hard cap on the magnitude of the backup breadth bonus (in Q units, [-1,1] value
+  /// scale).  The bonus beta*breadthFrac*(1-|V_bar|) is clamped to [0, this] before being
+  /// added to V_bar, guaranteeing it can never flip a decision dominated by a real value
+  /// gap (e.g. a winning single move stays winning).  Default 0.03 (~a few centipawns).
+  /// Only used when CBGPUCT_BackupBreadthBonusBeta &gt; 0.
+  /// </summary>
+  public float CBGPUCT_BackupBreadthBonusMax = 0.03f;
+
+  /// <summary>
+  /// Parent-N upper bound for CB-GPUCT visit-target SELECTION.  
+  /// When the parent node's visit count N is strictly greater than this value, 
+  /// CB-GPUCT selection is bypassed for that node and standard PUCT selection runs instead.
+  /// Default int.MaxValue (never bypass on the high side).  
+  /// Affects selection only; the V_bar backup (if active) is unchanged.
+  /// </summary>
+  public int CBGPUCT_PUCTAboveN = 50;
+
+  /// <summary>
+  /// Prior strength K for the SELECT support-shrinkage in ScoreCalc - the select-phase
+  /// analogue of CBGPUCT_BackupSupportShrinkageK.  Each visited child's per-edge q (-W/N)
+  /// is shrunk toward the policy-shaped consensus prior by edge.N (the per-edge q's
+  /// statistical support); unvisited children keep their FPU value untouched (the FPU
+  /// exploration signal is not altered).  The shrunk q then feeds the pi_bar visit-target Solve.
+  /// 0 disables (plain RPO select).  
+  /// Default 0 or 1 (tests suggest needs less shrinkaage than Backup uses by default).
+  /// </summary>
+  public float CBGPUCT_SelectSupportShrinkageK = 0;
+
+  /// <summary>
+  /// Decay exponent p for the SELECT support-shrinkage (see
+  /// CBGPUCT_BackupSupportShrinkageDecayExponent for semantics; select uses edge.N as the
+  /// per-child support).  Default 1.0.  Only used when CBGPUCT_SelectSupportShrinkageK &gt; 0.
+  /// </summary>
+  public float CBGPUCT_SelectSupportShrinkageDecayExponent = 1.0f;
+
+  /// <summary>
+  /// Weight basis for the children when forming the empirical-Bayes consensus anchor
+  ///   q_bar = sum_a w_a q_a / sum_a w_a
+  /// that the shrinkage prior m_a is built around.  Shared by both the select and backup
+  /// support-shrinkage. Only the consensus weight is affected by this knob - the per-child
+  /// shrinkage precision N_a^p / (N_a^p + K) uses child.N in backup and edge.N in select
+  /// (the genuine statistical support of each phase's q - reliability, not preference,
+  /// which transpositions sharpen rather than bias).
+  ///
+  /// The choice matters only in graph mode with transpositions, where child.N is
+  /// inflated by transposition density - an exogenous graph property, not a sign that
+  /// search preferred the move from this parent.  A heavily-transposed child still
+  /// drives V_bar directly through pi_bar (it is barely shrunk and wins the weight on
+  /// its own merits), so the consensus's only remaining job is to prime the prior for
+  /// UNDER-EXPLORED local moves - for which the locally-revealed preference (edge.N) is
+  /// the more relevant weight.
+  /// WHY RAW child.N IS biased: under the hierarchical model q_a | theta_a ~ N(theta_a,
+  /// s^2/N_a), theta_a ~ N(mu0, tau^2), the posterior-mean estimate of the anchor mu0 is
+  /// q_bar = sum_a w_a q_a / sum_a w_a with w_a = 1/(tau^2 + s^2/N_a) proportional to
+  /// N_a/(N_a + Kc), Kc = s^2/tau^2.  Weighting by raw N_a (the ChildN mode) is the
+  /// Kc -> infinity limit, i.e. it assumes tau^2 -> 0: that every sibling move has the
+  /// same true value.  For chess that is false (moves differ a lot -> tau^2 large -> Kc
+  /// SMALL), so the correct weights sature: once a child is out of the high-noise
+  /// region, extra N_a (e.g. from incidental transposition density) should not keep
+  /// increasing its pull on the anchor.  The *Saturating modes implement that.
+  ///   ChildN : weight by child.N (textbook precision pooling; the tau^2 = 0 limit).  A
+  ///            BAD transposition hub - or even a benign low-policy one - can drag the
+  ///            target and over-shrink a good but moderately-supported local move.
+  ///            Matches the originally-validated behavior.
+  ///   EdgeN  : weight by per-edge N (this parent's revealed preference; transposition-
+  ///            free; reduces to ChildN exactly when there are no transpositions).
+  ///   Policy : weight by the prior policy mu (i.e. anchor at E_mu[q]); fully N-free but
+  ///            trusts the network prior, which is fragile when the policy is miscalibrated.
+  ///   ChildNSaturating : weight by child.N / (child.N + Kc), Kc = CBGPUCT_ConsensusReliabilityK.
+  ///            The principled finite-tau^2 estimator: low-N children are still suppressed 
+  ///            proportional to their reliability, any sufficiently-explored child counts ~once, 
+  ///            so a single huge-N transposition can no longer dominate the anchor.
+  ///   PolicyChildNSaturating : weight by mu * child.N / (child.N + Kc).  As above, plus
+  ///            an importance term so the anchor is set by the moves the policy actually
+  ///            prioritizes - a reliable but LOW-policy drawish transposition then
+  ///            contributes little even though its gate is ~1.  Most robust for backup.
+  /// Default ChildN (no behavior change vs. the initial implementation; identical to
+  /// EdgeN whenever there are no transpositions).  Only used when
+  /// CBGPUCT_BackupSupportShrinkageK &gt; 0.  NOTE: the saturating gate is applied in the
+  /// BACKUP consensus only; the SELECT consensus (whose q support is edge.N, already
+  /// transposition-free) maps the *Saturating modes to their non-saturating equivalents
+  /// (ChildNSaturating -> edge.N, PolicyChildNSaturating -> policy).
+  /// </summary>
+  public enum CBGPUCTConsensusWeightType { ChildN, EdgeN, Policy, ChildNSaturating, PolicyChildNSaturating }
+  public CBGPUCTConsensusWeightType CBGPUCT_ConsensusWeight = CBGPUCTConsensusWeightType.PolicyChildNSaturating;
+
+  /// <summary>
+  /// Saturation half-point Kc for the *Saturating consensus weight modes: w_a =
+  /// child.N / (child.N + Kc) (optionally times mu).  Interpretable as Kc = s^2/tau^2 =
+  /// (per-visit Q noise variance) / (between-move value variance); a child reaches half
+  /// its asymptotic weight at child.N = Kc.  SMALL Kc (moves differ a lot, the chess
+  /// regime) flattens the weights quickly toward equal/importance weighting; LARGE Kc
+  /// recovers raw precision pooling (the ChildN mode in the limit).  Single digits are
+  /// expected for chess; defaults to the shrinkage K (3).  No effect unless
+  /// CBGPUCT_ConsensusWeight is one of the *Saturating modes.  Kc &lt;= 0 makes the gate
+  /// degenerate to 1 (uniform for ChildNSaturating, pure policy for PolicyChildNSaturating).
+  /// </summary>
+  public float CBGPUCT_ConsensusReliabilityK = 3.0f;
+
+  #endregion
 
   /// <summary>
   /// Schedule used to compute lambda_N (the regularization strength) from sum N_a.
@@ -355,7 +607,7 @@ public record ParamsSelect
   /// Default Ten approximates a "soft effective branching factor" without literally tying
   /// to per-node |A|.
   /// </summary>
-  public CBGPUCTLambdaDenominatorBaseType CBGPUCT_SelectLambdaDenominatorBase = CBGPUCTLambdaDenominatorBaseType.Ten;
+  public CBGPUCTLambdaDenominatorBaseType CBGPUCT_SelectLambdaDenominatorBase = CBGPUCTLambdaDenominatorBaseType.Thirty;
 
   /// <summary>
   /// Constant offset in the BACKUP-phase lambda_N denominator.  Backup is not allocating
@@ -368,99 +620,6 @@ public record ParamsSelect
   public CBGPUCTLambdaDenominatorBaseType CBGPUCT_BackupLambdaDenominatorBase = CBGPUCTLambdaDenominatorBaseType.One;
 
   /// <summary>
-  /// Bayesian shrinkage of each child's Q estimate toward a per-child policy-implied
-  /// target prior to pi_bar computation.  Parameterized as the BLEND FRACTION OF THE
-  /// PRIOR AT N=1:
-  ///   FractionAtN1 = K / (K + 1)   (equivalently, K = FractionAtN1 / (1 - FractionAtN1))
-  /// The schedule uses a power-law decay controlled by DecayExponent (see field below):
-  ///   q_shrunk(a) = q(a) * (N^p/(N^p+K)) + q_target(a) * (K/(N^p+K))
-  /// At p = 1 this reduces to the standard Bayesian conjugate form (asymptotic 1/N decay);
-  /// at p > 1 the schedule decays faster past N=1 while leaving the N=1 value unchanged
-  /// (since 1^p = 1 for any p).
-  ///
-  /// Decay table at FractionAtN1 = 0.13 (K ~ 0.15) under different DecayExponents:
-  ///         N=1    N=2    N=5    N=10
-  ///   p=1   13%    7.0%   2.9%   1.5%      (current Bayesian)
-  ///   p=1.5 13%    5.0%   1.3%   0.47%     (default - moderately faster)
-  ///   p=2   13%    3.6%   0.6%   0.15%     (aggressive)
-  ///   p=3   13%    1.8%   0.12%  0.015%    (very aggressive)
-  ///
-  /// The target is the per-child policy-implied Q from ComputePolicyImpliedQ - low-mu
-  /// children are shrunk toward a low target, high-mu children toward a high target,
-  /// not a single scalar parentQ.
-  ///
-  /// The shrinkage is skipped for N == 0 (unvisited children retain their imputed Q
-  /// without modification, so their pi_bar coefficient stays full and the UCB1-style
-  /// "every legal child eventually gets visited" guarantee is preserved).
-  ///
-  /// Selection-phase setting.  Default 0 disables shrinkage entirely.
-  /// </summary>
-  public float CBGPUCT_SelectQShrinkageFractionAtN1 = 0.3f;
-
-  /// <summary>
-  /// Decay exponent for the SELECT-phase Q-shrinkage schedule.  See
-  /// CBGPUCT_SelectQShrinkageFractionAtN1 for the formula and decay table.
-  /// p = 1 gives standard Bayesian 1/N decay (theoretically principled).
-  /// p > 1 makes the shrinkage vanish faster past N=1 (heuristic, motivated by
-  /// "observations are more informative per visit than conjugate-Normal assumes",
-  /// reasonable for NN-eval-based search where per-visit variance is low).
-  /// Typical range: [1.0, 2.0].  Default 1.5.
-  /// </summary>
-  public float CBGPUCT_SelectQShrinkageDecayExponent = 1.5f;
-
-  /// <summary>
-  /// Same Bayesian Q-shrinkage as the select-phase pair but applied during the BACKUP
-  /// phase (in CBGPUCTScoreCalc.ComputeVBar), only affecting pi_bar; the final V_bar
-  /// dot product always uses raw (unshrunk) child Q to follow Grill's definition
-  /// V_bar(s) = sum_a pi_bar(s,a) * q(s,a).  Same FractionAtN1 -> K reparameterization,
-  /// same K/(N^p+K) schedule, same decay table as the select-phase docstring.
-  ///
-  /// Default 0 disables.
-  /// </summary>
-  public float CBGPUCT_BackupQShrinkageFractionAtN1 = 0.3f;
-
-  /// <summary>
-  /// Decay exponent for the BACKUP-phase Q-shrinkage schedule.  Independently tunable
-  /// from the select version; see CBGPUCT_QSelectShrinkageDecayExponent for semantics
-  /// and the decay table.  Default 1.5.
-  /// </summary>
-  public float CBGPUCT_BackupQShrinkageDecayExponent = 1.5f;
-
-
-  /// <summary>
-  /// Bayesian-style shrinkage strength applied to pi_bar itself (per child) toward
-  /// the normalized prior mu, weighted by per-child visit count.  For child a with
-  /// per-edge N(a) visits:
-  ///   pi_bar_shrunk(a) = pi_bar(a) * (N(a) / (N(a) + K)) + mu_norm(a) * (K / (N(a) + K))
-  /// then renormalized so sum_a pi_bar_shrunk(a) = 1.
-  ///
-  /// Motivation (distinct from Q-shrinkage): a single high-Q rollout to a low-policy
-  /// child can drive pi_bar to a value near 1.0 for that child, even though the
-  /// estimate has almost no statistical support.  Q-shrinkage attempts to fix this by
-  /// pulling Q toward parentQ, but is ineffective when the outlier's Q happens to be
-  /// near parentQ.  Pi_bar shrinkage attacks the visit-distribution concentration
-  /// directly: low-N children's pi_bar is pulled toward their prior, regardless of
-  /// where their Q sits.  At N >> K the shrinkage decays to near-identity, so the
-  /// RPO solution is preserved for well-visited children.
-  ///
-  /// Default 0 disables.  Typical setting: K in [2, 5] gives rapidly-decaying shrinkage
-  /// (50% pull at N=K, less than 10% pull at N=10K).
-  /// </summary>
-  public float CBGPUCT_SelectPiBarShrinkagePseudoVisits = 0.0f;
-
-  /// <summary>
-  /// Same pi_bar shrinkage as the select-phase pair but applied during the BACKUP
-  /// (V_bar) computation in CBGPUCTScoreCalc.ComputeVBar.  Highly recommended when
-  /// using CB-GPUCT backup, because V_bar is otherwise vulnerable to domination by
-  /// single-visit high-Q outliers (V_bar approx 1.0 * q_outlier even when other children
-  /// have far more evidence).
-  ///
-  /// Default 0 disables.  Typical setting: K in [2, 5].
-  /// </summary>
-  public float CBGPUCT_BackupPiBarShrinkagePseudoVisits = 0.0f;
-
-
-  /// <summary>
   /// Lambda schedule for the SELECTION phase (visit-target deficit pi_bar).
   /// </summary>
   public CBGPUCTLambdaScheduleType CBGPUCT_SelectLambdaSchedule = CBGPUCTLambdaScheduleType.AlphaZero;
@@ -470,7 +629,7 @@ public record ParamsSelect
   /// Larger values keep pi_bar closer to the prior P (more exploration);
   /// smaller values let pi_bar concentrate on high-Q actions.
   /// </summary>
-  public float CBGPUCT_SelectLambdaC = 1.75f;
+  public float CBGPUCT_SelectLambdaC = 1f;
 
   /// <summary>
   /// Exponent on (sum N_a) in the Pow lambda_N schedule for the SELECTION phase.
@@ -500,23 +659,23 @@ public record ParamsSelect
   /// policy.
   /// </summary>
   public float CBGPUCT_SelectLambdaCLogBase = DEFAULT_LOG_GROWTH_BASE;
-  public float CBGPUCT_SelectLambdaCLogFactor = DEFAULT_LOG_GROWTH_FACTOR;
+  public float CBGPUCT_SelectLambdaCLogFactor = 0;// DEFAULT_LOG_GROWTH_FACTOR;
 
   /// <summary>
   /// Lambda schedule for the BACKUP phase (V_bar regularized value computation).
   /// </summary>
-  public CBGPUCTLambdaScheduleType CBGPUCT_BackupLambdaSchedule = CBGPUCTLambdaScheduleType.Pow;
+  public CBGPUCTLambdaScheduleType CBGPUCT_BackupLambdaSchedule = CBGPUCTLambdaScheduleType.AlphaZero;
 
   /// <summary>
   /// Multiplicative scale on lambda_N for the BACKUP phase.
   /// </summary>
-  public float CBGPUCT_BackupLambdaC = 1f;
+  public float CBGPUCT_BackupLambdaC = 0.75f; // use 1.0 for AlphaZero schedule
 
   /// <summary>
   /// Exponent on (sum N_a) in the Pow lambda_N schedule for the BACKUP phase.
   /// Smaller values cause more rapid decay of lambda_N and thus weaker regularization of Q higher visit counts.
   /// </summary>
-  public float CBGPUCT_BackupLambdaExp = 0.5f;
+  public float CBGPUCT_BackupLambdaExp = 0.45f; // use 0.5 for AlphaZero schedule
 
 
   /// <summary>
@@ -539,13 +698,29 @@ public record ParamsSelect
   /// When fraction &gt; 0 some visits may not be placeable (all children over-quota);
   /// MCGSSelect absorbs those visits at the parent.
   /// </summary>
-  public float CBGPUCT_SelectCrossParentNFraction = 0.5f;
+  public float CBGPUCT_SelectCrossParentNFraction = 0.3f;
 
   /// <summary>
   /// Convenience predicate: true iff any cross-parent N contribution is folded into
   /// the visit-target deficit (i.e. CBGPUCT_CrossParentNFraction is strictly positive).
   /// </summary>
   internal bool CBGPUCT_SelectCrossParentNEnabled => CBGPUCT_SelectCrossParentNFraction > 0.0f;
+
+  /// <summary>
+  /// Optional value-uncertainty (leaf value volatility) scaling of the "actual child N"
+  /// that the CB-GPUCT visit-target deficit compares against the RPO-justified target
+  /// (pi_bar * (sumN + 1)).  When nonzero, each child's actual N is multiplied by
+  ///   1 - CBGPUCT_SelectValueUncertaintyScalingFactor * (child.LeafValueVolatilityDebiased - 0.20)
+  /// (applied only to children whose child.N exceeds 5, where the debiased volatility
+  /// estimate is meaningful; the factor is floored at 0).  0.20 is the assumed average
+  /// leaf-value volatility, so a child less (more) volatile than average is treated as if
+  /// MORE (FEWER) visits had been performed to it - shrinking (growing) its deficit and
+  /// thereby steering exploration toward the less-settled, more volatile children.
+  ///
+  /// Requires ParamsSearch.TrackLeafValueVolatility = true (enforced in ValidateAgainst).
+  /// 0 disables.
+  /// </summary>
+  public float CBGPUCT_SelectValueUncertaintyScalingFactor = 0;
 
   #endregion
 
@@ -558,11 +733,11 @@ public record ParamsSelect
   [CeresOption(Name = "power-mean-n-exponent", Desc = "Exponent applied against N for node to determine coefficient used in power mean calculation of Q for child selection", Default = "0")]
   public float PowerMeanNExponent = 0f;
 
-  [CeresOption(Name = "fpu-type", Desc = "Type of first play urgency (non-root nodes)", Default = "Reduction")]
-  public FPUType FPUMode = FPUType.Reduction;
+  [CeresOption(Name = "fpu-type", Desc = "Type of first play urgency (non-root nodes)", Default = "PolicyImputedRPO")]
+  public FPUType FPUMode = FPUType.PolicyImputedRPO;
 
-  [CeresOption(Name = "fpu-type", Desc = "Type of first play urgency (root nodes)", Default = "Same")]
-  public FPUType FPUModeAtRoot = FPUType.Same;
+  [CeresOption(Name = "fpu-type-at-root", Desc = "Type of first play urgency (root nodes)", Default = "PolicyImputedRPO")]
+  public FPUType FPUModeAtRoot = FPUType.PolicyImputedRPO;
 
   [CeresOption(Name = "fpu-value", Desc = "FPU constant used at root node", Default = "0.44")]
   public float FPUValue = USE_ZZTUNE ? 0.33f : 0.98416f;
@@ -733,6 +908,20 @@ public record ParamsSelect
     {
       ActionResortUnvisitedChildren = false;
     }
+
+    if (CBGPUCT_Mode != CBGPUCTModeType.None)
+    {
+      if (FPUMode != FPUType.PolicyImputedRPO
+       || FPUModeAtRoot != FPUType.PolicyImputedRPO
+       || RPOFPURegularization != RPORegularization.ForwardKLSoftmax)
+      {
+        throw new Exception($"CBGPUCT_Mode={CBGPUCT_Mode} requires "
+                          + $"FPUMode=PolicyImputedRPO, FPUModeAtRoot=PolicyImputedRPO, and "
+                          + $"RPOFPURegularization=ForwardKLSoftmax "
+                          + $"(have FPUMode={FPUMode}, FPUModeAtRoot={FPUModeAtRoot}, "
+                          + $"RPOFPURegularization={RPOFPURegularization}).");
+      }
+    }
   }
 
 
@@ -743,6 +932,12 @@ public record ParamsSelect
   /// <param name="paramsSearch"></param>
   internal void ValidateAgainst(ParamsSearch paramsSearch)
   {
+    if (CBGPUCT_SelectValueUncertaintyScalingFactor != 0 && !paramsSearch.TrackLeafValueVolatility)
+    {
+      throw new Exception("TrackLeafValueVolatility must be set to true when "
+                        + "CBGPUCT_SelectValueUncertaintyScalingFactor is nonzero.");
+    }
+
     if (CBGPUCT_Mode != CBGPUCTModeType.None)
     {
       if (!paramsSearch.EnableGraph)
@@ -758,7 +953,7 @@ public record ParamsSelect
       {
         Console.WriteLine($"[CBGPUCT] active mode={CBGPUCT_Mode} "
                         + $"select(C={CBGPUCT_SelectLambdaC:F3} sched={CBGPUCT_SelectLambdaSchedule} exp={CBGPUCT_SelectLambdaExp:F3} "
-                        +   $"cLogBase={CBGPUCT_SelectLambdaCLogBase:F0} cLogFactor={CBGPUCT_SelectLambdaCLogFactor:F3}) "
+                        + $"cLogBase={CBGPUCT_SelectLambdaCLogBase:F0} cLogFactor={CBGPUCT_SelectLambdaCLogFactor:F3}) "
                         + $"backup(C={CBGPUCT_BackupLambdaC:F3} sched={CBGPUCT_BackupLambdaSchedule} exp={CBGPUCT_BackupLambdaExp:F3}) "
                         + $"selDenom={CBGPUCT_SelectLambdaDenominatorBase} bkpDenom={CBGPUCT_BackupLambdaDenominatorBase} "
                         + $"CrossParentNFraction={CBGPUCT_SelectCrossParentNFraction:F3} "

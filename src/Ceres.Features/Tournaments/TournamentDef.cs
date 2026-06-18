@@ -22,6 +22,7 @@ using Ceres.Base.Misc;
 using Ceres.Chess;
 using Ceres.Chess.GameEngines;
 using Ceres.Features.GameEngines;
+using Ceres.Features.Tournaments.Streaming;
 using Ceres.MCTS.GameEngines;
 
 #endregion
@@ -190,6 +191,22 @@ namespace Ceres.Features.Tournaments
     public bool AdjudicateDrawByRepetitionImmediately = true;
 
     /// <summary>
+    /// If nonzero, enables blunder diagnostic dumps: after each move, if an engine's evaluation
+    /// improved by more than BlunderDumpThresholdCentipawns compared to its prior move (implying
+    /// the opponent just blundered), and the node count (N) of that move, the engine's prior move,
+    /// and the intervening opponent move are all at least this value, and the opponent is an
+    /// in-process Ceres MCGS engine, then the opponent engine's search graph is dumped to a
+    /// "blunder_info_NNN.txt" file in the current working directory for post-hoc analysis.
+    /// </summary>
+    public int BlunderDumpThresholdN = 5000;
+
+    /// <summary>
+    /// Minimum centipawn improvement in an engine's evaluation (versus its prior move) required
+    /// to trigger a blunder diagnostic dump (see BlunderDumpThresholdN).
+    /// </summary>
+    public int BlunderDumpThresholdCentipawns = 250;
+
+    /// <summary>
     /// The index of the processor group to which the engines should be affinitized. 
     /// </summary>
     public int ProcessGroupIndex = 0;
@@ -203,6 +220,50 @@ namespace Ceres.Features.Tournaments
     /// If the tournament has been instructed to shut down (e.g. Ctrl-C pressed).
     /// </summary>
     public bool ShouldShutDown = false;
+
+    /// <summary>
+    /// Optional callback invoked after each game is processed by any tournament thread.
+    ///
+    /// The callback is passed the TournamentResultStats accumulated so far (across all threads),
+    /// allowing it to monitor the progress and partial results of the tournament as it runs.
+    ///
+    /// If the callback returns true then an orderly (early) shutdown of the tournament is
+    /// requested: no further games are started and the tournament concludes once the games
+    /// already in progress have finished (equivalent to setting ShouldShutDown, the same
+    /// mechanism used by the Ctrl-C handler).
+    ///
+    /// The callback may be invoked from any of the worker threads. Invocations are serialized
+    /// (and the supplied statistics are stable for the duration of the call) because the callback
+    /// runs while holding the statistics lock; consequently it should return promptly and must
+    /// not block or perform expensive work, as doing so would stall the other tournament threads.
+    ///
+    /// Marked NonSerialized because TournamentDef is deep-cloned (via BinaryFormatter) per worker
+    /// thread; the callback is always resolved via parentDef so the per-thread clones need not
+    /// carry it (mirroring how ShouldShutDown is coordinated through parentDef).
+    /// </summary>
+    [NonSerialized] public Func<TournamentResultStats, bool> PerGameCallback;
+
+    /// <summary>
+    /// Optional, transport-agnostic observer that receives live tournament/game/move events.
+    /// Any consumer may attach (one example is the live streaming publisher used by the
+    /// EngineBattle GUI in REMOTE mode). Resolved via parentDef and null-checked at each call
+    /// site, exactly like PerGameCallback. When null there is zero behavioral change.
+    /// Marked NonSerialized because TournamentDef is deep-cloned per worker thread.
+    /// </summary>
+    [NonSerialized] public ITournamentObserver Observer;
+
+    /// <summary>
+    /// If true (the default), a live streaming TCP listener is started automatically when the
+    /// tournament runs, so any remote consumer can connect and watch games. Set false to
+    /// disable. NonSerialized (resolved via parentDef).
+    /// </summary>
+    [NonSerialized] public bool EnableLiveStreaming = true;
+
+    /// <summary>
+    /// TCP port on which the live streaming listener accepts subscriber connections.
+    /// NonSerialized (resolved via parentDef).
+    /// </summary>
+    [NonSerialized] public int LiveStreamPort = 7440;
 
     /// <summary>
     /// If this instance is the coordinator in a distributed tournament.
