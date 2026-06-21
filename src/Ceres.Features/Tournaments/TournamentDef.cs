@@ -201,10 +201,20 @@ namespace Ceres.Features.Tournaments
     public int BlunderDumpThresholdN = 5000;
 
     /// <summary>
-    /// Minimum centipawn improvement in an engine's evaluation (versus its prior move) required
-    /// to trigger a blunder diagnostic dump (see BlunderDumpThresholdN).
+    /// Minimum centipawn improvement in the moving (reference) engine's evaluation (versus its prior
+    /// move) required to flag a candidate blunder, and also the minimum amount by which the blundering
+    /// engine's own evaluation must subsequently fall (on its next move) to confirm the blunder before
+    /// a dump is written (see BlunderDumpThresholdN and BlunderDumpMaxPriorAbsCentipawns).
     /// </summary>
-    public int BlunderDumpThresholdCentipawns = 250;
+    public int BlunderDumpThresholdCentipawns = 100;
+
+    /// <summary>
+    /// Maximum absolute value (in centipawns) of the moving (reference) engine's evaluation BEFORE the
+    /// opponent's move for that move to be eligible as a blunder. If the position was already more
+    /// decisive than this (i.e. already clearly won or lost), the evaluation swing is treated as
+    /// "piling on" in an already-decided game and is ignored. Set very large to disable this filter.
+    /// </summary>
+    public int BlunderDumpMaxPriorAbsCentipawns = 250;
 
     /// <summary>
     /// The index of the processor group to which the engines should be affinitized. 
@@ -220,6 +230,15 @@ namespace Ceres.Features.Tournaments
     /// If the tournament has been instructed to shut down (e.g. Ctrl-C pressed).
     /// </summary>
     public bool ShouldShutDown = false;
+
+    /// <summary>
+    /// Optional controller coordinating a cooperative pause/resume of the tournament's worker
+    /// threads (driven by the Ctrl-P console command). Non-null only for local interactive
+    /// tournaments; worker threads reach it via parentDef and null-check at each call site,
+    /// exactly like ShouldShutDown. NonSerialized because TournamentDef is deep-cloned per
+    /// worker thread (the shared controller lives only on parentDef).
+    /// </summary>
+    [NonSerialized] public TournamentPauseController PauseController;
 
     /// <summary>
     /// Optional callback invoked after each game is processed by any tournament thread.
