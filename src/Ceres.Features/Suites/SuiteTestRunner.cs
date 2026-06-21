@@ -257,6 +257,11 @@ namespace Ceres.Features.Suites
 
     List<float> solvedPct1MinusPct2Samples = new();
 
+    // Per-position graded-score difference (engine 1 minus engine 2), in 0-10 points.
+    // Accumulated only when a second engine is present; used to compute the headline
+    // solution-quality z-score (a paired-difference significance test over the suite).
+    List<float> scoreDiffSamples = new();
+
     float totalTimeOther = 0;
     float totalTimeCeres1 = 0;
     float totalTimeCeres2 = 0;
@@ -297,6 +302,13 @@ namespace Ceres.Features.Suites
     // Per-engine evaluations-per-second (EPS), accumulated from each search result.
     long sumEPS1;
     long sumEPS2;
+
+    // Per-engine device backend ("in C++ interop") busy seconds and the matching search-loop
+    // elapsed seconds (denominator), accumulated only over moves where the metric is supported.
+    double sumBackendWait1;
+    double sumBackendWait2;
+    double sumBackendSearch1;
+    double sumBackendSearch2;
 
     // Number of positions in the test set actually run (after filtering/slicing).
     int numPositionsInRun;
@@ -624,6 +636,16 @@ namespace Ceres.Features.Suites
       float avgEPS1 = numSearches > 0 ? (float)sumEPS1 / numSearches : 0;
       float avgEPS2 = numSearches > 0 ? (float)sumEPS2 / numSearches : 0;
 
+      // Graded solution-quality difference (engine 1 minus engine 2) and its significance.
+      float[] scoreDiffArr = scoreDiffSamples.ToArray();
+      float scoreDiffMean = scoreDiffArr.Length > 0 ? (float)StatUtils.Average(scoreDiffArr) : 0;
+      float scoreDiffSE = scoreDiffArr.Length > 1 ? (float)StatUtils.StdDev(scoreDiffArr) / MathF.Sqrt(scoreDiffArr.Length) : 0;
+
+      // Nodes-to-solution speed difference (difference in fraction of nodes when top move chosen).
+      float[] fasterArr = solvedPct1MinusPct2Samples.ToArray();
+      float fasterMean = fasterArr.Length > 0 ? (float)StatUtils.Average(fasterArr) : 0;
+      float fasterSE = fasterArr.Length > 1 ? (float)StatUtils.StdDev(fasterArr) / MathF.Sqrt(fasterArr.Length) : 0;
+
       return new SuiteTestResult(Def)
       {
         AvgScore1 = (float)accCeres1 / numSearches,
@@ -635,6 +657,11 @@ namespace Ceres.Features.Suites
         TotalRuntimeLC0 = totalTimeOther,
         TotalRuntime1 = totalTimeCeres1,
         TotalRuntime2 = totalTimeCeres2,
+
+        TotalBackendWait1 = sumBackendWait1,
+        TotalBackendWait2 = sumBackendWait2,
+        TotalBackendSearch1 = sumBackendSearch1,
+        TotalBackendSearch2 = sumBackendSearch2,
 
         FinalQ1 = finalQ1.ToArray(),
         FinalQ2 = finalQ2?.ToArray(),
@@ -690,7 +717,18 @@ namespace Ceres.Features.Suites
         CountPolicyKLDPositions = countPolicyKLD,
         AvgEPS1 = avgEPS1,
         AvgEPS2 = avgEPS2,
-        RelativeEPSPct = avgEPS2 > 0 ? (avgEPS1 / avgEPS2 - 1.0f) * 100.0f : 0
+        RelativeEPSPct = avgEPS2 > 0 ? (avgEPS1 / avgEPS2 - 1.0f) * 100.0f : 0,
+
+        // Graded solution-quality difference (the headline decision statistic).
+        ScoreDiffMean = scoreDiffMean,
+        ScoreDiffStdErr = scoreDiffSE,
+        ScoreDiffNumSamples = scoreDiffArr.Length,
+        ScoreDiffZ = scoreDiffSE > 0 ? scoreDiffMean / scoreDiffSE : 0,
+
+        // Nodes-to-solution speed difference (negative favors engine 1).
+        NodesToFindFasterMean = fasterMean,
+        NodesToFindFasterStdErr = fasterSE,
+        NodesToFindFasterZ = fasterSE > 0 ? fasterMean / fasterSE : 0
       };
 
     }
@@ -1104,12 +1142,18 @@ namespace Ceres.Features.Suites
       readonly double[] sumCV;    readonly int[] cntCV;
       readonly double[] sumQDiff; readonly int[] cntQDiff;
       readonly double[] sumKLD;   readonly int[] cntKLD;
+      // Paired graded solution-quality difference vs the baseline (this engine minus baseline, 0-10
+      // graded points). Running sum and sum-of-squares per engine let Snapshot() compute the
+      // per-column z-score (mean / standard-error) without retaining the full per-position samples.
+      readonly double[] sumScoreDiff; readonly double[] sumScoreDiffSq; readonly int[] cntScoreDiff;
       readonly long[] totNodes;
       readonly double[] totTime;
       readonly long[] totNNEvals;
       readonly long[] totTB;
       readonly double[] sumDepth; readonly int[] cntDepth;
       readonly double[] sumEnt;   readonly int[] cntEnt;
+      readonly double[] totBackendWait;   // device backend busy seconds (supported moves only)
+      readonly double[] totBackendSearch; // matching search-loop elapsed seconds (denominator)
 
       public MultiEngineAccumulator(List<MultiEngineEntry> entriesList, int baselineIndex)
       {
@@ -1131,12 +1175,15 @@ namespace Ceres.Features.Suites
         sumCV = new double[n];    cntCV = new int[n];
         sumQDiff = new double[n]; cntQDiff = new int[n];
         sumKLD = new double[n];   cntKLD = new int[n];
+        sumScoreDiff = new double[n]; sumScoreDiffSq = new double[n]; cntScoreDiff = new int[n];
         totNodes = new long[n];
         totTime = new double[n];
         totNNEvals = new long[n];
         totTB = new long[n];
         sumDepth = new double[n]; cntDepth = new int[n];
         sumEnt = new double[n];   cntEnt = new int[n];
+        totBackendWait = new double[n];
+        totBackendSearch = new double[n];
       }
 
       public void AddPosition(GameEngineSearchResult[] results, EPDEntry epd)
@@ -1145,6 +1192,26 @@ namespace Ceres.Features.Suites
 
         Position position = epd.Position;
         GameEngineSearchResult baseR = (baselineIndex >= 0 && baselineIndex < results.Length) ? results[baselineIndex] : null;
+
+        // Baseline's graded solve score (0..10) for this position, computed once so each engine's
+        // paired solution-quality difference (engine minus baseline) can be accumulated below
+        // regardless of engine ordering within the loop.
+        int baselineScore = 0;
+        bool haveBaselineScore = false;
+        if (baseR != null)
+        {
+          Move baseBM = default;
+          try
+          {
+            baseBM = Move.FromUCI(in position, baseR.MoveString);
+          }
+          catch
+          {
+            // Unparseable move (counts as not solved).
+          }
+          baselineScore = baseBM.IsNull ? 0 : epd.CorrectnessScore(baseBM, 10);
+          haveBaselineScore = true;
+        }
 
         for (int k = 0; k < n; k++)
         {
@@ -1188,6 +1255,15 @@ namespace Ceres.Features.Suites
           totTime[k] += r.TimingStats.ElapsedTimeSecs;
           totNNEvals[k] += r.NumNNNodes;
           totTB[k] += r.CountSearchContinuations > 0 ? 0 : r.CountTablebaseHits;
+
+          // Device backend ("in C++ interop") busy time, accumulated only over moves where the
+          // metric is supported (NNEvaluatorTensorRT / NNEvaluatorCUDA), with the matching search-loop
+          // elapsed time as the denominator for the backend-busy fraction.
+          if (!double.IsNaN(r.TimeDeviceBackendWaitSeconds))
+          {
+            totBackendWait[k] += r.TimeDeviceBackendWaitSeconds;
+            totBackendSearch[k] += r.TimeElapsedTotalSeconds;
+          }
           if (r.AvgDepth > 0)
           {
             sumDepth[k] += r.AvgDepth; cntDepth[k]++;
@@ -1200,6 +1276,15 @@ namespace Ceres.Features.Suites
           // Baseline-relative difference statistics (skipped for the baseline engine itself).
           if (k != baselineIndex && baseR != null)
           {
+            // Paired graded solution-quality difference (this engine minus baseline, 0-10 points).
+            if (haveBaselineScore)
+            {
+              double scoreDiff = score - baselineScore;
+              sumScoreDiff[k] += scoreDiff;
+              sumScoreDiffSq[k] += scoreDiff * scoreDiff;
+              cntScoreDiff[k]++;
+            }
+
             sumQDiff[k] += Math.Abs(r.ScoreQ - baseR.ScoreQ); cntQDiff[k]++;
             if (r.VerboseMoveStats != null && baseR.VerboseMoveStats != null)
             {
@@ -1218,6 +1303,20 @@ namespace Ceres.Features.Suites
         MultiEngineEngineResult[] outArr = new MultiEngineEngineResult[n];
         for (int k = 0; k < n; k++)
         {
+          // Per-column z-score of the paired graded solution-quality difference vs the baseline.
+          // Uses population standard deviation (/cnt) divided by sqrt(cnt) for the standard error,
+          // matching the headline two-engine statistic (StatUtils.StdDev / sqrt(n)).
+          float gradedScoreDiffZ = float.NaN;
+          if (k != baselineIndex && cntScoreDiff[k] > 1)
+          {
+            double cnt = cntScoreDiff[k];
+            double mean = sumScoreDiff[k] / cnt;
+            double ss = sumScoreDiffSq[k] - sumScoreDiff[k] * sumScoreDiff[k] / cnt;
+            double sd = ss > 0 ? Math.Sqrt(ss / cnt) : 0;
+            double se = sd / Math.Sqrt(cnt);
+            gradedScoreDiffZ = se > 0 ? (float)(mean / se) : 0f;
+          }
+
           outArr[k] = new MultiEngineEngineResult
           {
             ID = entries[k].ID,
@@ -1231,13 +1330,15 @@ namespace Ceres.Features.Suites
             AvgQ = cntQ[k] > 0 ? (float)(sumQ[k] / cntQ[k]) : float.NaN,
             AvgAbsQDiffVsBaseline = (k == baselineIndex || cntQDiff[k] == 0) ? float.NaN : (float)(sumQDiff[k] / cntQDiff[k]),
             AvgPolicyKLDVsBaseline = (k == baselineIndex || cntKLD[k] == 0) ? float.NaN : (float)(sumKLD[k] / cntKLD[k]),
+            GradedScoreDiffZVsBaseline = gradedScoreDiffZ,
             AvgCorrectMoveVisitPct = cntCV[k] > 0 ? (float)(sumCV[k] / cntCV[k]) : float.NaN,
             TotalNodes = totNodes[k],
             TotalTimeSecs = (float)totTime[k],
             TotalNNEvals = totNNEvals[k],
             TotalTablebaseHits = totTB[k],
             AvgDepth = cntDepth[k] > 0 ? (float)(sumDepth[k] / cntDepth[k]) : float.NaN,
-            AvgVisitEntropy = cntEnt[k] > 0 ? (float)(sumEnt[k] / cntEnt[k]) : float.NaN
+            AvgVisitEntropy = cntEnt[k] > 0 ? (float)(sumEnt[k] / cntEnt[k]) : float.NaN,
+            BackendBusyFraction = totBackendSearch[k] > 0 ? (float)(totBackendWait[k] / totBackendSearch[k]) : float.NaN
           };
         }
         return outArr;
@@ -1299,6 +1400,15 @@ namespace Ceres.Features.Suites
       }
 
       Def.Output.WriteLine();
+      // Device backend busy fraction (time inside C++ interop / search-loop wall-clock; target 1.0).
+      // Only reported where supported (NNEvaluatorTensorRT / NNEvaluatorCUDA); otherwise shown as "-".
+      Def.Output.WriteLine($"Backend busy C1         {(sumBackendSearch1 > 0 ? (sumBackendWait1 / sumBackendSearch1).ToString("F3") : "-"),8}");
+      if (Def.CeresEngine2Def != null)
+      {
+        Def.Output.WriteLine($"Backend busy C2         {(sumBackendSearch2 > 0 ? (sumBackendWait2 / sumBackendSearch2).ToString("F3") : "-"),8}");
+      }
+
+      Def.Output.WriteLine();
 
       Def.Output.WriteLine($"Num all evaluations      :   {NNEvaluatorStats.TotalPosEvaluations,12:N0}");
 
@@ -1316,6 +1426,17 @@ namespace Ceres.Features.Suites
       float avgFaster = (float) StatUtils.Average(solvedPct1MinusPct2Samples);
       float stdFaster = (float)StatUtils.StdDev(solvedPct1MinusPct2Samples) / MathF.Sqrt(solvedPct1MinusPct2Samples.Count);
       Def.Output.WriteLine($"Ceres1 time required to solve vs. Ceres2 (%) {(100* avgFaster),5:F2} +/-{(100 * stdFaster),5:F2}");
+
+      if (Def.CeresEngine2Def != null && scoreDiffSamples.Count > 0)
+      {
+        // Headline decision statistic: paired graded-score difference (Ceres1 - Ceres2) over the suite.
+        // With weighted EPDs this is a continuous solution-quality signal; |z| >~ 2 is significant.
+        float sdMean = (float)StatUtils.Average(scoreDiffSamples);
+        float sdSE = scoreDiffSamples.Count > 1 ? (float)StatUtils.StdDev(scoreDiffSamples) / MathF.Sqrt(scoreDiffSamples.Count) : 0;
+        float sdZ = sdSE > 0 ? sdMean / sdSE : 0;
+        Def.Output.WriteLine();
+        Def.Output.WriteLine($"Graded solution-quality difference (Ceres1 - Ceres2, 0-10 pts) {sdMean,6:F3} +/-{sdSE,5:F3}  z= {sdZ,5:F2}  (n={scoreDiffSamples.Count})");
+      }
 
       if (Def.CeresEngine2Def != null)
       {
@@ -1736,6 +1857,11 @@ namespace Ceres.Features.Suites
         sumEvalNumPos1 += evalNumPos1;
         sumTablebaseHits1 += search1.CountSearchContinuations > 0 ? 0 : search1.CountTablebaseHits;
         sumEPS1 += search1.EPS;
+        if (!double.IsNaN(search1.TimeDeviceBackendWaitSeconds))
+        {
+          sumBackendWait1 += search1.TimeDeviceBackendWaitSeconds;
+          sumBackendSearch1 += search1.TimeElapsedTotalSeconds;
+        }
 
         if (Def.RunCeres2Engine)
         {
@@ -1745,6 +1871,11 @@ namespace Ceres.Features.Suites
           sumEvalNumPos2 += evalNumPos2;
           sumTablebaseHits2 += search2.CountSearchContinuations > 0 ? 0 : search2.CountTablebaseHits;
           sumEPS2 += search2.EPS;
+          if (!double.IsNaN(search2.TimeDeviceBackendWaitSeconds))
+          {
+            sumBackendWait2 += search2.TimeDeviceBackendWaitSeconds;
+            sumBackendSearch2 += search2.TimeElapsedTotalSeconds;
+          }
         }
 
         // Correct-move-visit comparison: which engine placed a larger fraction of its visits on
@@ -2105,6 +2236,14 @@ namespace Ceres.Features.Suites
       {
         accCeres1 += scoreCeres1;
         accCeres2 += scoreCeres2;
+
+        // Paired graded-score difference (only meaningful when a second engine is present).
+        // scoreCeres1/scoreCeres2 are graded (0-10) when the EPD carries weighted ScoredMoves,
+        // so this captures solution-quality differences continuously rather than just solved/unsolved.
+        if (search2 != null)
+        {
+          scoreDiffSamples.Add(scoreCeres1 - scoreCeres2);
+        }
 
         // Accumulate how many nodes were required to find one of the correct moves
         // (only in cases where both engines found correct move at some point).

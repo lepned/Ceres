@@ -129,6 +129,10 @@ namespace Ceres.Features.Tournaments
           {
             ceresEngine.GatherVerboseMoveStats = true;
           }
+          else if (engine is Ceres.MCGS.GameEngines.GameEngineCeresMCGSInProcess mcgsEngine)
+          {
+            mcgsEngine.GatherVerboseMoveStats = true;
+          }
         }
       });
 
@@ -876,6 +880,10 @@ namespace Ceres.Features.Tournaments
       long nodesEngine2Tot = 0;
       long evalsEngine1Tot = 0;
       long evalsEngine2Tot = 0;
+      double backendWaitEngine1Tot = 0;
+      double backendWaitEngine2Tot = 0;
+      double backendSearchEngine1Tot = 0;
+      double backendSearchEngine2Tot = 0;
       int movesEngine1 = 0;
       int movesEngine2 = 0;
       bool engine1ShouldHaveForfieted = false;
@@ -921,6 +929,10 @@ namespace Ceres.Features.Tournaments
           TotalNodesEngine2 = nodesEngine2Tot,
           TotalEvaluationsEngine1 = evalsEngine1Tot,
           TotalEvaluationsEngine2 = evalsEngine2Tot,
+          BackendWaitSecondsEngine1 = backendWaitEngine1Tot,
+          BackendWaitSecondsEngine2 = backendWaitEngine2Tot,
+          BackendSearchSecondsEngine1 = backendSearchEngine1Tot,
+          BackendSearchSecondsEngine2 = backendSearchEngine2Tot,
           NumMovesForcedDeterministic = numNodesForcedDeterministic,
           RemainingTimeEngine1 = RemainingTime(searchLimitEngine1, movesEngine1, timeEngine1Tot),
           RemainingTimeEngine2 = RemainingTime(searchLimitEngine2, movesEngine2, timeEngine2Tot),
@@ -1028,7 +1040,8 @@ namespace Ceres.Features.Tournaments
         {
           info = DoMove(engine2, engineCheckAgainstEngine2,
                         gameMoveHistory, searchLimitWithIncrementsEngine2, scoresEngine2,
-                        ref nodesEngine2Tot, ref visitsEngine2Tot, ref timeEngine2Tot, ref evalsEngine2Tot, ref numNodesForcedDeterministic);
+                        ref nodesEngine2Tot, ref visitsEngine2Tot, ref timeEngine2Tot, ref evalsEngine2Tot,
+                        ref backendWaitEngine2Tot, ref backendSearchEngine2Tot, ref numNodesForcedDeterministic);
           movesEngine2++;
 
           if (engine2IsWhite)
@@ -1046,7 +1059,8 @@ namespace Ceres.Features.Tournaments
         {
           info = DoMove(engine1, null,
                         gameMoveHistory, searchLimitWithIncrementsEngine1, scoresEngine1,
-                        ref nodesEngine1Tot, ref visitsEngine1Tot, ref timeEngine1Tot, ref evalsEngine1Tot, ref numNodesForcedDeterministic);
+                        ref nodesEngine1Tot, ref visitsEngine1Tot, ref timeEngine1Tot, ref evalsEngine1Tot,
+                        ref backendWaitEngine1Tot, ref backendSearchEngine1Tot, ref numNodesForcedDeterministic);
           movesEngine1++;
           if (engine2IsWhite)
           {
@@ -1088,6 +1102,7 @@ namespace Ceres.Features.Tournaments
                                  SearchLimit searchLimit, List<float> scoresCP,
                                  ref long totalNodesUsed, ref long totalVisitsUsed, ref float totalTimeUsed,
                                  ref long totalEvalsUsed,
+                                 ref double totalBackendWaitUsed, ref double totalBackendSearchUsed,
                                  ref int numNodesForcedDeterministic)
       {
         SearchLimit thisMoveSearchLimit = searchLimit.Type switch
@@ -1110,7 +1125,62 @@ namespace Ceres.Features.Tournaments
           _ => throw new Exception($"Internal error, unknown SearchLimit.LimitType {searchLimit.Type}")
         };
 
-        GameEngineSearchResult engineMove = engine.Search(curPositionAndMoves, thisMoveSearchLimit, gameMoveHistory);
+        // Build a throttled progress callback that streams transient interim (mid-search) snapshots
+        // to any live observer while the engine is still thinking, so the viewer's stats/eval/TopQ
+        // update ~1s instead of freezing until the move completes. Costs nothing when nobody streams
+        // (gated by a null observer, interval <= 0, and the cheap WantsInterim check).
+        ITournamentObserver interimObserver = Def.parentDef?.Observer;
+        int interimIntervalMs = Def.parentDef?.LiveStreamInterimIntervalMs ?? 0;
+        GameEngine.ProgressCallback progressCb = null;
+        if (interimObserver != null && interimIntervalMs > 0)
+        {
+          bool interimSideIsWhite = curPositionAndMoves.FinalPosition.MiscInfo.SideToMove == SideType.White;
+          int interimPly = plyCount;
+          DateTime interimSearchStart = DateTime.UtcNow;
+          DateTime interimLastEmit = DateTime.MinValue;
+          progressCb = (object ctx) =>
+          {
+            try
+            {
+              DateTime now = DateTime.UtcNow;
+              double elapsedSec = (now - interimSearchStart).TotalSeconds;
+              if (interimLastEmit == DateTime.MinValue)
+              {
+                // Quick first update so the panel populates shortly after the move begins.
+                if (elapsedSec * 1000.0 < Math.Min(300, interimIntervalMs))
+                {
+                  return;
+                }
+              }
+              else
+              {
+                // Graduated cadence: faster early, easing off for very long thinks.
+                double reqMs = elapsedSec < 5 ? interimIntervalMs * 0.5
+                             : elapsedSec < 30 ? interimIntervalMs
+                             : interimIntervalMs * 3.0;
+                if ((now - interimLastEmit).TotalMilliseconds < reqMs)
+                {
+                  return;
+                }
+              }
+
+              interimLastEmit = now;
+              if (!interimObserver.WantsInterim(ThreadIndex))
+              {
+                return;
+              }
+
+              InterimDTO interimDto = DtoMappers.ToInterim(ctx, interimPly, interimSideIsWhite);
+              if (interimDto != null)
+              {
+                interimObserver.OnInterim(ThreadIndex, interimDto);
+              }
+            }
+            catch { }
+          };
+        }
+
+        GameEngineSearchResult engineMove = engine.Search(curPositionAndMoves, thisMoveSearchLimit, gameMoveHistory, progressCb);
         float engineTime = (float)engineMove.TimingStats.ElapsedTimeSecs;
 
         // Check for time forfeit
@@ -1208,6 +1278,15 @@ namespace Ceres.Features.Tournaments
         if (engineMove.EPS > 0)
         {
           totalEvalsUsed += (long)MathF.Round(engineMove.EPS * engineTime);
+        }
+
+        // Accumulate device backend ("in C++ interop") busy time for this move (only where the
+        // backend supports the metric, i.e. NNEvaluatorTensorRT). The search-loop elapsed time is
+        // accumulated alongside as the matching denominator so the aggregate fraction is well-defined.
+        if (!double.IsNaN(engineMove.TimeDeviceBackendWaitSeconds))
+        {
+          totalBackendWaitUsed += engineMove.TimeDeviceBackendWaitSeconds;
+          totalBackendSearchUsed += engineMove.TimeElapsedTotalSeconds;
         }
         if (isWhite)
         {

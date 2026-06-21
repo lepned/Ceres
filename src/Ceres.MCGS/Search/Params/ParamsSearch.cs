@@ -261,15 +261,34 @@ public record ParamsSearch
   //   3.0 --> -42 Elo
   //   5.0 --> -50 Elo
   //  20.0 --> -52 Elo
-  public float TranspositionStopMinSupportRatioPositionAndHistoryMode = 3f;
+  public float TranspositionStopMinSupportRatioPositionAndHistoryMode = 4f;
 
 
   /// <summary>
   /// MinSupportRatio when running in Position mode.
-  /// Because visits are coalesced across all transposition paths,
-  /// the expectation for subgraph size is typically higher than with PositionAndHistory mode.
+  /// Note that the setting of RedescentStochasticProbability (if nonzero) will also
+  /// impact the frequency of descent stopping on transposition nodes.
   /// </summary>
-  public float TranspositionStopMinSupportRatioPositionMode = 4f;
+  public float TranspositionStopMinSupportRatioPositionMode = 3f;
+
+
+  /// <summary>
+  /// Stochastic redescent mode (default 0, disabled). When set to a fractional value in (0, 1],
+  /// the decision of whether to stop descent at an already sufficiently visited transposition node
+  /// (see <see cref="MCGSSelect"/> IsTranspositionSufficientN) is augmented so that descent is
+  /// instead FORCED to continue ("redescend") in two additional cases:
+  ///   (1) with this fractional probability, unconditionally - sending occasional visits deeper
+  ///       even through nodes that would otherwise short-circuit to their cached subtree value; and
+  ///   (2) always while the parent node is still sparsely visited
+  ///       (parent N &lt; <see cref="MCGSParamsFixed.REDESCENT_STOCHASTIC_FORCE_BELOW_PARENT_N"/>),
+  ///       a warmup that guarantees some genuine deepening before the transposition-stop
+  ///       short-circuit is permitted to apply.
+  /// At 0 the transposition-stop logic is completely unchanged (a single predictable
+  /// branch is the only added cost on the hot path; the RNG is sampled only when the mode is active).
+  /// Intended as an exploration knob to counteract over-reliance on cached transposition values
+  /// (which can leave deep lines under-resolved when many parents share a heavily visited subgraph).
+  /// </summary>
+  public float RedescentStochasticProbability = 0.3f;
 
 
   /// <summary>
@@ -726,6 +745,11 @@ public record ParamsSearch
     if (RedescentScaleByVolatility && !TrackLeafValueVolatility)
     {
       throw new Exception("TrackLeafValueVolatility must be set to true when RedescentScaleByVolatility is true");
+    }
+
+    if (RedescentStochasticProbability < 0 || RedescentStochasticProbability > 1)
+    {
+      throw new Exception("RedescentStochasticProbability must be in the range [0, 1].");
     }
 
     if (OffPathBackupNumAdditionalLevelsToPropagate > 1

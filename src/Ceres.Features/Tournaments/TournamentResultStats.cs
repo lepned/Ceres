@@ -105,11 +105,11 @@ namespace Ceres.Features.Tournaments
       TextWriter writer = def.Logger;
       string referenceId = def.ReferenceEngineId;
 
-      int maxWidth = 155;
+      int maxWidth = 168;
       PrintLine(writer, maxWidth - 1);
       List<(string, int)> header = new List<(string, int)>
         { ("Player",25), ("Elo", 8), ("+/-",5), ("CFS(%)", 8),
-          ("Played", 8), ("W-D-L", 13), ("D(%)",5), ("Time",12), ("Nodes",18), ("NPS-avg", 14), ("EPS-avg", 14), ("NPS-med", 11) };
+          ("Played", 8), ("W-D-L", 13), ("D(%)",5), ("Time",12), ("Nodes",18), ("NPS-avg", 14), ("EPS-avg", 14), ("NPS-med", 11), ("GPU-busy", 12) };
       PrintHeaderRow(writer, header, maxWidth);
       PrintLine(writer, maxWidth - 1);
       bool twoPlayers = Players.Count == 2 && string.IsNullOrEmpty(referenceId);
@@ -173,6 +173,9 @@ namespace Ceres.Features.Tournaments
       // Average evaluations per second (neural network position evaluations), shown where reported.
       string epsAvg = player.PlayerTotalEvaluations > 0 && time > 0
                     ? (player.PlayerTotalEvaluations / time).ToString("N0") + " " : "-";
+      // Fraction of search-loop wall-clock the device backend was busy (target 1.0); "-" if unsupported.
+      // Append the trailing space in both cases so the placeholder right-aligns like the numeric values.
+      string gpuBusy = (double.IsNaN(player.BackendBusyFraction) ? "-" : player.BackendBusyFraction.ToString("F3")) + " ";
 
       List<(string, int)> rowItems = new()
       {
@@ -187,7 +190,8 @@ namespace Ceres.Features.Tournaments
         { (nodes.ToString("N0") + " ", 18) },
         { ((nodes / time).ToString("N0") + " ", 14) },
         { (epsAvg, 14) },
-        { ((player.MedianNPSAverage).ToString("N0") + " ", 11) }
+        { ((player.MedianNPSAverage).ToString("N0") + " ", 11) },
+        { (gpuBusy, 12) }
 
       };
       PrintEngineRow(writer, rowItems, width);
@@ -559,6 +563,10 @@ namespace Ceres.Features.Tournaments
         playerBlack.PlayerTotalEvaluations += thisResult.TotalEvaluationsEngine1;
         playerWhite.PlayerTotalTime += thisResult.TotalTimeEngine2;
         playerBlack.PlayerTotalTime += thisResult.TotalTimeEngine1;
+        playerWhite.PlayerTotalBackendWaitSeconds += thisResult.BackendWaitSecondsEngine2;
+        playerBlack.PlayerTotalBackendWaitSeconds += thisResult.BackendWaitSecondsEngine1;
+        playerWhite.PlayerTotalBackendSearchSeconds += thisResult.BackendSearchSecondsEngine2;
+        playerBlack.PlayerTotalBackendSearchSeconds += thisResult.BackendSearchSecondsEngine1;
       }
       else
       {
@@ -568,6 +576,10 @@ namespace Ceres.Features.Tournaments
         playerBlack.PlayerTotalEvaluations += thisResult.TotalEvaluationsEngine2;
         playerWhite.PlayerTotalTime += thisResult.TotalTimeEngine1;
         playerBlack.PlayerTotalTime += thisResult.TotalTimeEngine2;
+        playerWhite.PlayerTotalBackendWaitSeconds += thisResult.BackendWaitSecondsEngine1;
+        playerBlack.PlayerTotalBackendWaitSeconds += thisResult.BackendWaitSecondsEngine2;
+        playerWhite.PlayerTotalBackendSearchSeconds += thisResult.BackendSearchSecondsEngine1;
+        playerBlack.PlayerTotalBackendSearchSeconds += thisResult.BackendSearchSecondsEngine2;
       }
     }
 
@@ -644,10 +656,12 @@ namespace Ceres.Features.Tournaments
       int numberOfColumns = columns.Count();
       string row = "|";
 
+      // Right-align the trailing numeric columns (Nodes, NPS-avg, EPS-avg, NPS-med, GPU-busy);
+      // center-align the leading descriptive columns.
       for (int i = 0; i < numberOfColumns; i++)
       {
         var (txt, width) = columns[i];
-        if (i > numberOfColumns - 5)
+        if (i > numberOfColumns - 6)
           row += AlignRight(txt, width) + "|";
         else
           row += AlignCentre(txt, width) + "|";

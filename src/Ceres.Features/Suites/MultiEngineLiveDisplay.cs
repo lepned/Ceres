@@ -36,6 +36,8 @@ namespace Ceres.Features.Suites
   ///                                   (blank separator line)
   ///   Solve score                   - average solve score percent    (true value, higher=better)
   ///   Solve correct move visits (3%)- average % of root visits on correct move(s) (higher=better)
+  ///   Graded solution-quality difference - z-score of the paired graded-score difference vs the
+  ///                                   baseline (baseline blank; positive=this engine better, higher=better)
   ///
   /// On each refresh the "best" cell of every row is colored green and the "worst" red (where
   /// for the two difference rows the engine closest to the baseline is considered best).
@@ -47,7 +49,7 @@ namespace Ceres.Features.Suites
   /// </summary>
   internal sealed class MultiEngineLiveDisplay
   {
-    const int LABEL_WIDTH = 32;
+    const int LABEL_WIDTH = 36;
     const int COL_WIDTH = 12;
 
     readonly TextWriter output;
@@ -114,9 +116,11 @@ namespace Ceres.Features.Suites
         RowDef.Separator(),
         new RowDef { Label = "Search time (average sec)",      Selector = r => r.AvgTimeSecs,            Format = "0.00",   LowerIsBetter = true,  BaselineRelativeDelta = true, DeltaAsPercent = true, DeltaFormat = "+0.0%;-0.0%;0.0%" },
         new RowDef { Label = "Evaluation intensity (EPS)",     Selector = r => r.AvgEPS,                 Format = "N0",     LowerIsBetter = false, BaselineRelativeDelta = true, DeltaAsPercent = true, DeltaFormat = "+0.0%;-0.0%;0.0%" },
+        new RowDef { Label = "Backend busy fraction",          Selector = r => r.BackendBusyFraction,    Format = "0.000",  LowerIsBetter = false },
         RowDef.Separator(),
         new RowDef { Label = "Solve score",                    Selector = r => r.AvgSolveScorePct,       Format = "0.0",    LowerIsBetter = false },
         new RowDef { Label = "Solve correct move visits (3%)", Selector = r => r.AvgCorrectMoveVisitPct, Format = "0.0",    LowerIsBetter = false },
+        new RowDef { Label = "Graded solution-quality difference", Selector = r => r.GradedScoreDiffZVsBaseline, Format = "0.0", LowerIsBetter = false },
       };
     }
 

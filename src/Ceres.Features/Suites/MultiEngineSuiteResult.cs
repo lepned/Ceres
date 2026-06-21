@@ -88,6 +88,14 @@ namespace Ceres.Features.Suites
     /// </summary>
     public float AvgPolicyKLDVsBaseline = float.NaN;
 
+    /// <summary>
+    /// Z-score of the paired per-position graded solution-quality difference (this engine minus the
+    /// baseline, in 0-10 graded points). Positive means this engine scores better than the baseline;
+    /// |z| >~ 2 is significant. NaN for the baseline engine itself (and when fewer than two positions
+    /// were compared). This is the per-column analogue of the headline two-engine z-score.
+    /// </summary>
+    public float GradedScoreDiffZVsBaseline = float.NaN;
+
     // --- Additional "true value" statistic available only for engines exposing root visit stats ---
 
     /// <summary>Average percentage of total root visits placed on the correct move(s) (NaN if unavailable).</summary>
@@ -112,6 +120,13 @@ namespace Ceres.Features.Suites
 
     /// <summary>Average visit-distribution entropy (NaN if unavailable, e.g. MCTS / external).</summary>
     public float AvgVisitEntropy = float.NaN;
+
+    /// <summary>
+    /// Fraction of search-loop wall-clock during which the device backend ("in C++ interop") was
+    /// busy, aggregated across all positions where the metric is supported. Approaches 1.0 as
+    /// searches become GPU-bound. NaN if unsupported (NNEvaluatorTensorRT / NNEvaluatorCUDA report it).
+    /// </summary>
+    public float BackendBusyFraction = float.NaN;
 
     public override string ToString()
       => $"<MultiEngineEngineResult {ID}{(IsBaseline ? "*" : "")} {Kind} solve={AvgSolveScorePct:F1}% EPS={AvgEPS:N0} Q={AvgQ:F3}>";
