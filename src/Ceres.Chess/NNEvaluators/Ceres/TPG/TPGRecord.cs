@@ -101,7 +101,14 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
     /// conversion time so training has zero per-batch CPU cost. Toggling this flag requires
     /// regenerating the TPG corpus from TAR.
     /// </summary>
+    // V3 (the 4 aux feature bytes) is an experimental layer on top of upstream V2.
+    // Toggle it via the USE_V3_TPG_RECORD preprocessor define (Ceres.Chess.csproj),
+    // mirroring USE_V2_TPG_RECORD. Undefined => upstream V2 (137/sq, 9378 bytes).
+#if USE_V3_TPG_RECORD
     public const bool USE_V3_TPG_RECORD = true;
+#else
+    public const bool USE_V3_TPG_RECORD = false;
+#endif
     internal const int NUM_AUX_FEATURE_BYTES_PER_SQUARE = USE_V3_TPG_RECORD ? 4 : 0;
 
     /// <summary>

@@ -345,7 +345,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
       // still below int8_validate.py's 99.69% top-1 baseline but at least
       // runnable. The single-profile script doesn't need the markers because
       // it's a different code path entirely. Diagnosis WIP — see TODO.
-      options.UseInt8 = 1;
+      // options.UseInt8 = 1;  // TEMP-DISABLED: wrapper DLL update unpushed; restore after pushing UseInt8 field on TensorRTBuildOptions.
       options.UseFP16 = 1;
       options.UseBF16 = 0;
     }
@@ -362,7 +362,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
 
     options.Validate();
 
-    Console.WriteLine($"  Build options: FP16={options.UseFP16}, BF16={options.UseBF16}, INT8={options.UseInt8}, FP32PostAttentionNorm={options.FP32PostAttentionNorm}, FP32Softmax={options.FP32Softmax}, FP32AllNorms={options.FP32AllNorms}, UseCUDAGraphs={options.UseCudaGraphs}");
+    Console.WriteLine($"  Build options: FP16={options.UseFP16}, BF16={options.UseBF16}, /* INT8=TEMP-DISABLED, */ FP32PostAttentionNorm={options.FP32PostAttentionNorm}, FP32Softmax={options.FP32Softmax}, FP32AllNorms={options.FP32AllNorms}, UseCUDAGraphs={options.UseCudaGraphs}");
 
     const int MIN_BATCH_SIZE_PER_GPU = 6;
     pool = new MultiGPUEnginePool(trt, onnxFileName, effectiveSizesPerGPU, poolMode, options, 0, 0, GpuIDs, MIN_BATCH_SIZE_PER_GPU, cacheDir);

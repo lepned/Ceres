@@ -206,15 +206,19 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
     /// Computed via Ceres.Chess.PositionDataInfo.PerSquareAttacks. Zero per-batch
     /// CPU cost at training time (just disk read).
     /// </summary>
+#if USE_V3_TPG_RECORD
     fixed byte auxFeatureBytes[TPGRecord.NUM_AUX_FEATURE_BYTES_PER_SQUARE];
+#endif
 
     #endregion
 
+#if USE_V3_TPG_RECORD
     public Span<byte> AuxFeatureBytesSetter
       => MemoryMarshal.CreateSpan(ref auxFeatureBytes[0], TPGRecord.NUM_AUX_FEATURE_BYTES_PER_SQUARE);
 
     public ReadOnlySpan<byte> AuxFeatureBytesReadOnly
       => MemoryMarshal.CreateReadOnlySpan(ref auxFeatureBytes[0], TPGRecord.NUM_AUX_FEATURE_BYTES_PER_SQUARE);
+#endif
 
     public ReadOnlySpan<ByteScaled> PieceTypeHistory(int historyPosIndex)
     {
@@ -391,6 +395,7 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
         // V3 layout: append the 4 aux feature bytes for this square.
         // All four are SIDE-AGNOSTIC properties of the piece on the square (no us/opp flip).
         // The 3 attacker channels and SEE were tested and dropped (see TPGRecord.cs comment).
+#if USE_V3_TPG_RECORD
         if (TPGRecord.USE_V3_TPG_RECORD)
         {
           Span<byte> aug = pieceRecord.AuxFeatureBytesSetter;
@@ -399,6 +404,7 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
           aug[2] = isPinned[squareNum];
           aug[3] = isThreatened[squareNum];
         }
+#endif
 
         if (pos.SideToMove == SideType.White)
         {
