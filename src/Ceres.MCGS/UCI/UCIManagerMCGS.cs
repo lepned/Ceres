@@ -95,7 +95,38 @@ public partial class UCIManagerMCGS
   /// </summary>
   public GameEngineCeresMCGSInProcess CeresEngine;
 
+  /// <summary>
+  /// Optional handler for the custom "tcec" command, which launches the live TCEC
+  /// broadcast monitor (continuous analysis that auto-follows the live game). The
+  /// implementation lives in Ceres.Features (which references Ceres.MCGS), so it is
+  /// injected here by the host (DispatchCommands) rather than referenced directly to
+  /// avoid a circular project dependency. Invoked with the initialized engine instance.
+  /// </summary>
+  public Action<GameEngineCeresMCGSInProcess> TCECMonitorHandler;
+
   GameEngineSearchResultCeresMCGS lastSearchResult;
+
+  /// <summary>
+  /// Principal position set collected by the most recent dump-pp command
+  /// (used as the start nodes for the deep-rollout command).
+  /// </summary>
+  PrincipalPosSet lastDumpPPSet;
+
+  /// <summary>
+  /// Search manager from which lastDumpPPSet was collected
+  /// (deep-rollout requires that the set be from the current search).
+  /// </summary>
+  MCGSManager lastDumpPPManager;
+
+  /// <summary>
+  /// Results of the most recent deep-rollout command.
+  /// </summary>
+  public DeepRolloutSet LastDeepRolloutSet { get; private set; }
+
+  /// <summary>
+  /// Results of the most recent revalue-root command.
+  /// </summary>
+  public PrincipalRevaluationResult LastRevaluation { get; private set; }
 
   volatile Task<GameEngineSearchResultCeresMCGS> taskSearchCurrentlyExecuting;
 
@@ -157,6 +188,20 @@ public partial class UCIManagerMCGS
   /// Optional override select parameters.
   /// </summary>
   public ParamsSelect OverrideParamsSelect;
+
+
+  /// <summary>
+  /// Search parameters loaded from a file via the "load-params" UCI command (or null if none).
+  /// When set, these take complete precedence: they are used verbatim for all future searches,
+  /// bypassing the per-field setoption overlays normally applied by the ParamsSearch getter.
+  /// </summary>
+  ParamsSearch loadedParamsSearch;
+
+  /// <summary>
+  /// Select parameters loaded from a file via the "load-params" UCI command (or null if none).
+  /// See <see cref="loadedParamsSearch"/> for precedence semantics.
+  /// </summary>
+  ParamsSelect loadedParamsSelect;
 
 
 
@@ -246,11 +291,13 @@ public partial class UCIManagerMCGS
 
   /// <summary>
   /// Outputs line to UCI.
+  /// When a game-analyze capture writer is active (used to compute a position's output in the
+  /// background without it interleaving with the console), the line is redirected there instead.
   /// </summary>
   /// <param name="result"></param>
   void UCIWriteLine(string result = null)
   {
-    OutStream.WriteLine(result);
+    (gameAnalyzeCaptureWriter ?? OutStream).WriteLine(result);
     if (uciLogWriter != null)
     {
       LogWriteLine("OUT:", result);
@@ -262,6 +309,12 @@ public partial class UCIManagerMCGS
   {
     get
     {
+      // Params loaded from a file are authoritative: use them verbatim, bypassing the overlays below.
+      if (loadedParamsSelect != null)
+      {
+        return loadedParamsSelect;
+      }
+
       ParamsSelect parms = OverrideParamsSelect ?? new ParamsSelect();
       parms.CPUCT = cpuct;
       parms.CPUCTBase = cpuctBase;
@@ -290,6 +343,12 @@ public partial class UCIManagerMCGS
   {
     get
     {
+      // Params loaded from a file are authoritative: use them verbatim, bypassing the overlays below.
+      if (loadedParamsSearch != null)
+      {
+        return loadedParamsSearch;
+      }
+
       ParamsSearch parms = OverrideParamsSearch ?? new ParamsSearch();
       parms.MoveOverheadSeconds = moveOverheadSeconds;
       parms.EnableTablebases = parms.EnableTablebases && tablebaseDirectory != null;
@@ -316,9 +375,23 @@ public partial class UCIManagerMCGS
   /// <summary>
   /// Runs the UCI loop.
   /// </summary>
-  public void PlayUCI()
+  /// <param name="gameAnalyzeStartupArgs">
+  /// If non-null, a "game-analyze" specification ("&lt;pgn&gt; &lt;move&gt; &lt;time&gt;") which is
+  /// executed once after reset and before the interactive loop begins (used by the
+  /// "game-analyze" command-line verb to leave the console in UCI mode pre-positioned).
+  /// </param>
+  public void PlayUCI(string gameAnalyzeStartupArgs = null, string gameAnalyzeLC0StartupArgs = null)
   {
     ResetGame();
+
+    if (gameAnalyzeStartupArgs != null)
+    {
+      ProcessGameAnalyzeInteractive("game-analyze " + gameAnalyzeStartupArgs);
+    }
+    else if (gameAnalyzeLC0StartupArgs != null)
+    {
+      ProcessGameAnalyzeLC0Interactive("game-analyze-lc0 " + gameAnalyzeLC0StartupArgs);
+    }
 
     while (true)
     {
@@ -345,16 +418,23 @@ public partial class UCIManagerMCGS
           UCIWriteLine("download <ID>   - attempt to download Ceres network from CeresNets repository");
           UCIWriteLine("backendbench    - benchmark of speed of network backend evaluator, optionally [from <int>] [to <int>] [by <int>]");
           UCIWriteLine("benchmark       - search benchmark with specified number of seconds per position, e.g. \"benchmark 10\"");
+          UCIWriteLine("deep-rollout    - runs deep rollouts from principal positions of last dump-pp and redisplays table with rollout statistics (optional rollouts per position and exploration multiplier, e.g. \"deep-rollout 100 0.05\")");
           UCIWriteLine("dump-fen        - shows FEN of most recently searched position");
           UCIWriteLine("dump-move-stats - dumps information top level candidate moves");
           UCIWriteLine("dump-pv         - dumps principal variation information from last search");
           UCIWriteLine("dump-pv-detail  - dumps principal variation information from last search (detailed)");
           UCIWriteLine("dump-pp         - dumps principal positions from last search (optional visit percentage and max Q deviation, e.g. \"1% 0.02\")");
           UCIWriteLine("dump-pp-html    - dumps principal positions from last search (like dump-pp but to HTML page)");
+          UCIWriteLine("revalue-root    - revalues root/move Q of last search via exploration-ladder deep rollouts from the visit frontier (optional rollouts/position/stage, ladder, dry-up rounds (0=off), e.g. \"revalue-root 50 0.15,0.04,0 12\")");
           UCIWriteLine("dump-info       - dump information about last search (top level candidate moves, principal variation, etc.)");
+          UCIWriteLine("dump-info-block - like dump-info but prefixed with a process/GC/machine header and wrapped in begin/end markers (used for programmatic capture)");
+          UCIWriteLine("game-analyze    - locate a position (or range) in a PGN by move number and analyze it (prompts for: <pgn file> <move number or range, e.g. 105, 105.., 1-9999, ..7-..12> <time, e.g. 10s>)");
+          UCIWriteLine("game-analyze-lc0- like game-analyze but runs the analysis with Lc0 (streaming its UCI output), then loads the position into Ceres without searching");
           UCIWriteLine("dump-time       - dump information about time manager's last decision");
           UCIWriteLine("dump-processor  - dump information about CPUs in this system");
           UCIWriteLine("dump-params     - dump configuration parameters currently in use for Ceres");
+          UCIWriteLine("save-params <f> - serialize the current ParamsSearch and ParamsSelect (as JSON) to the specified file");
+          UCIWriteLine("load-params <f> - load ParamsSearch and ParamsSelect from a JSON file; these then override all options for future searches");
           UCIWriteLine("dump-store {d}  - dumps full node store for tree from last search (optionally with max depth specifier)");
           UCIWriteLine("dump-trans-pos  - dumps transpositions list (standalone hash)");
           UCIWriteLine("dump-nvidia     - dumps information about NVIDIA CUDA devices detected in the system");
@@ -363,6 +443,7 @@ public partial class UCIManagerMCGS
           UCIWriteLine("graph [1-10]    - invokes graph feature to show the principal variations from last search (requires configuration), e.g. graph 7");
           UCIWriteLine("gamecomp        - invokes the game comparison feature to graph the divergence points in one or more games (requires configuration)");
           UCIWriteLine("plyviz          - generates HTML visualization of PlyBin distributions for current position");
+          UCIWriteLine("tcec            - live-analyze the current TCEC broadcast game, auto-following each new move (q/Esc to return)");
           UCIWriteLine("");
           break;
 
@@ -495,19 +576,42 @@ public partial class UCIManagerMCGS
           }
           break;
 
-        case "dump-info":
+        case string c when c.StartsWith("deep-rollout"):
           if (CeresEngine?.Search?.Manager != null)
           {
-            //MCGSearch search = CeresEngine.Search;
-            //DumpFullInfo(GameEngineSearchResultCeresMCGS searchResult, TextWriter writer, string description)
-
-            CeresEngine.Search.Manager.DumpFullInfo(lastSearchResult, Console.Out, "UCI");
-            //               CeresEngine.Search.Manager.DumpFullInfo(search.BestMove, search.SearchRootNode,
-            //                                                      search.LastReuseDecision, search.LastMakeNewRootTimingStats,
-            //                                                      search.LastGameLimitInputs, Console.Out, "UCI");
+            ProcessDeepRolloutCommand(c);
           }
           else
+          {
             UCIWriteLine("info string No search manager created");
+          }
+          break;
+
+        case string c when c.StartsWith("revalue-root"):
+          if (CeresEngine?.Search?.Manager != null)
+          {
+            ProcessRevalueRootCommand(c);
+          }
+          else
+          {
+            UCIWriteLine("info string No search manager created");
+          }
+          break;
+
+        case "dump-info":
+          ProcessDumpInfoCommand(blockFormat: false);
+          break;
+
+        case "dump-info-block":
+          ProcessDumpInfoCommand(blockFormat: true);
+          break;
+
+        case string c when c.StartsWith("game-analyze-lc0"):
+          ProcessGameAnalyzeLC0Interactive(c);
+          break;
+
+        case string c when c.StartsWith("game-analyze"):
+          ProcessGameAnalyzeInteractive(c);
           break;
 
         case string c when c.StartsWith("graph"):
@@ -567,7 +671,19 @@ public partial class UCIManagerMCGS
             CeresEngine.Search.Manager.DumpParams();
           }
           else
-            UCIWriteLine("info string No search manager created");
+          {
+            // No search has run yet; dump the parameters that would be used for the next search
+            // (this reflects any params loaded via "load-params").
+            DumpPendingParams();
+          }
+          break;
+
+        case string c when c.StartsWith("load-params"):
+          ProcessLoadParamsCommand(c);
+          break;
+
+        case string c when c.StartsWith("save-params"):
+          ProcessSaveParamsCommand(c);
           break;
 
         case string c when c.StartsWith("forward"):
@@ -766,6 +882,23 @@ public partial class UCIManagerMCGS
           taskSearchCurrentlyExecuting?.Wait();
           break;
 
+        case "tcec":
+          // Launch the live TCEC broadcast monitor (implementation injected by the host
+          // via TCECMonitorHandler). Runs synchronously and returns here when the user
+          // quits (q/Esc), resuming normal UCI command processing.
+          if (InitializeEngineIfNeeded())
+          {
+            if (TCECMonitorHandler != null)
+            {
+              TCECMonitorHandler(CeresEngine);
+            }
+            else
+            {
+              UCIWriteLine("info string TCEC monitor handler not registered");
+            }
+          }
+          break;
+
         default:
           UCIWriteLine($"error Unknown command: {command}");
           break;
@@ -810,6 +943,10 @@ public partial class UCIManagerMCGS
                                                                          (int)(CeresEngine.Search.SearchRootNode.N * minVisitsFraction),
                                                                          maxQDeviation);
 
+    // Retain for possible subsequent deep-rollout command.
+    lastDumpPPSet = pp;
+    lastDumpPPManager = CeresEngine.Search.Manager;
+
     if (useHTML)
     {
       PrincipalPosSetDumperHTML.DumpToGraphHTML(pp, CeresEngine.Search.BestMove);
@@ -818,6 +955,171 @@ public partial class UCIManagerMCGS
     {
       PrincipalPosSetDumper.DumpToConsoleGraphical(pp, CeresEngine.Search.BestMove);
     }
+  }
+
+
+  /// <summary>
+  /// Processes the deep-rollout command: runs deep rollouts from the principal positions
+  /// collected by the most recent dump-pp command, then redisplays the principal position
+  /// tables augmented with columns characterizing the rollout results.
+  ///
+  /// Arguments: deep-rollout [num rollouts per position] [exploration multiplier]
+  /// </summary>
+  /// <param name="c"></param>
+  private void ProcessDeepRolloutCommand(string c)
+  {
+    const int DEFAULT_NUM_ROLLOUTS = 100;
+    const float DEFAULT_EXPLORATION_MULTIPLIER = 0.05f;
+
+    // Make sure any search still executing has completed (the graph must be quiescent).
+    taskSearchCurrentlyExecuting?.Wait();
+
+    if (lastDumpPPSet == null || lastDumpPPManager != CeresEngine.Search.Manager)
+    {
+      UCIWriteLine("info string No principal positions available for current search, run dump-pp first");
+      return;
+    }
+
+    if (lastDumpPPSet.Members.Count == 0)
+    {
+      UCIWriteLine("info string Last dump-pp found no principal positions, nothing to roll out");
+      return;
+    }
+
+    string[] partsDR = c.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+    int numRollouts = DEFAULT_NUM_ROLLOUTS;
+    if (partsDR.Length > 1
+     && (!int.TryParse(partsDR[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out numRollouts) || numRollouts <= 0))
+    {
+      UCIWriteLine($"info string Invalid number of rollouts: {partsDR[1]}");
+      return;
+    }
+
+    float explorationMultiplier = DEFAULT_EXPLORATION_MULTIPLIER;
+    if (partsDR.Length > 2
+     && (!float.TryParse(partsDR[2], NumberStyles.Float, CultureInfo.InvariantCulture, out explorationMultiplier) || explorationMultiplier < 0))
+    {
+      UCIWriteLine($"info string Invalid exploration multiplier: {partsDR[2]}");
+      return;
+    }
+
+    UCIWriteLine($"info string Running deep rollouts: {lastDumpPPSet.Members.Count} principal positions x {numRollouts} rollouts,"
+               + $" exploration multiplier {explorationMultiplier}");
+
+    LastDeepRolloutSet = DeepRolloutSet.Run(lastDumpPPManager, lastDumpPPSet, numRollouts, explorationMultiplier);
+
+    UCIWriteLine($"info string Deep rollouts complete in {LastDeepRolloutSet.TimingStats.ElapsedTimeSecs:F2} sec");
+    UCIWriteLine();
+
+    // Redisplay the principal position tables, now augmented with deep rollout statistics columns.
+    DeepRolloutSet drSet = LastDeepRolloutSet;
+    string StatText(PrincipalPos pos, Func<DeepRolloutNodeStats, string> formatter)
+      => drSet.TryGetStats(pos.LeafNode.Index, out DeepRolloutNodeStats drStats) && drStats.NumDistinctPaths > 0
+           ? formatter(drStats)
+           : "";
+
+    (string colName, Func<PrincipalPos, string> calcFunc)[] drColumns =
+    [
+      ("DRCount", pos => StatText(pos, s => s.NumDistinctPaths.ToString())),
+      ("DRDepth", pos => StatText(pos, s => s.MedianDepthBelowNode.ToString("0.#"))),
+      ("DRAvg", pos => StatText(pos, s =>
+        {
+          // Convert from the principal position's side-to-move perspective to the root player's.
+          bool isRootPlayerPerspective = (pos.PathFromRoot.Count % 2) == 1;
+          return PrincipalPosSetDumper.FormatQValue(isRootPlayerPerspective ? s.AvgLeafQ : -s.AvgLeafQ);
+        })),
+      ("DRStd", pos => StatText(pos, s => s.StdDevLeafQ.ToString("F3"))),
+    ];
+
+    PrincipalPosSetDumper.DumpToConsoleGraphical(lastDumpPPSet, CeresEngine.Search.BestMove, drColumns);
+
+    Spectre.Console.AnsiConsole.MarkupLine("[yellow]DRCount[/]       - Number of distinct deep rollout lines explored below this principal position");
+    Spectre.Console.AnsiConsole.MarkupLine("[yellow]DRDepth[/]       - Median depth (plies below the principal position) of those lines");
+    Spectre.Console.AnsiConsole.MarkupLine("[yellow]DRAvg[/]         - Average leaf Q of those lines (root player's perspective)");
+    Spectre.Console.AnsiConsole.MarkupLine("[yellow]DRStd[/]         - Standard deviation of leaf Q across those lines");
+    Spectre.Console.AnsiConsole.WriteLine();
+  }
+
+
+  /// <summary>
+  /// Processes the revalue-root command: collects the frontier of the well-visited subtree of
+  /// the last search, runs an exploration ladder of deep rollouts from each frontier position,
+  /// and displays revalued root and per-move Q estimates under a family of backup operators
+  /// (visit-weighted average, negamax, soft-minimax) along with classifications of the
+  /// frontier evidence.
+  ///
+  /// Arguments: revalue-root [rollouts per position per stage] [epsilon ladder, comma-separated] [dry-up rounds, 0=off]
+  /// </summary>
+  /// <param name="c"></param>
+  private void ProcessRevalueRootCommand(string c)
+  {
+    const int DEFAULT_ROUNDS_PER_STAGE = 20;
+
+    // For interactive analysis use a much more generous dry-up threshold than in play:
+    // repeated rollouts of a known line still back up (sequential refinement) and may
+    // re-route it, so saturation deserves more patience here.
+    const int DEFAULT_DRY_UP_ROUNDS = PrincipalRevaluation.ANALYSIS_DRY_UP_ROUNDS;
+
+    // Make sure any search still executing has completed (the graph must be quiescent).
+    taskSearchCurrentlyExecuting?.Wait();
+
+    MCGSManager manager = CeresEngine.Search.Manager;
+
+    string[] parts = c.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+    int roundsPerStage = DEFAULT_ROUNDS_PER_STAGE;
+    if (parts.Length > 1
+     && (!int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out roundsPerStage) || roundsPerStage <= 0))
+    {
+      UCIWriteLine($"info string Invalid rollouts per position per stage: {parts[1]}");
+      return;
+    }
+
+    float[] epsilonLadder = null;
+    if (parts.Length > 2)
+    {
+      string[] epsParts = parts[2].Split(',', StringSplitOptions.RemoveEmptyEntries);
+      epsilonLadder = new float[epsParts.Length];
+      for (int i = 0; i < epsParts.Length; i++)
+      {
+        if (!float.TryParse(epsParts[i], NumberStyles.Float, CultureInfo.InvariantCulture, out epsilonLadder[i]) || epsilonLadder[i] < 0)
+        {
+          UCIWriteLine($"info string Invalid epsilon ladder entry: {epsParts[i]}");
+          return;
+        }
+      }
+    }
+
+    int dryUpRounds = DEFAULT_DRY_UP_ROUNDS;
+    if (parts.Length > 3
+     && (!int.TryParse(parts[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out dryUpRounds) || dryUpRounds < 0))
+    {
+      UCIWriteLine($"info string Invalid dry-up rounds: {parts[3]}");
+      return;
+    }
+
+    UCIWriteLine($"info string Running revaluation: ladder [{string.Join(", ", epsilonLadder ?? PrincipalRevaluation.DEFAULT_EPSILON_LADDER)}]"
+               + $" x {roundsPerStage} rollouts/position/stage"
+               + $" (dry-up after {(dryUpRounds == 0 ? "never" : dryUpRounds.ToString())} repeat rounds)");
+
+    LastRevaluation = PrincipalRevaluation.Run(manager, roundsPerStage, epsilonLadder, dryUpRounds: dryUpRounds);
+
+    UCIWriteLine($"info string Revaluation complete in {LastRevaluation.ElapsedSecs:F2} sec"
+               + $" ({LastRevaluation.NumRolloutVisits} rollout visits over {LastRevaluation.NumFrontier} frontier positions)");
+    UCIWriteLine();
+
+    PrincipalRevaluationDumper.DumpToConsole(LastRevaluation, CeresEngine.Search.BestMove);
+
+    // Purely informational: report whether the rollout evidence would prefer a different move
+    // (the blended-Q comparison; move choice during play is never affected).
+    GNode revalRootNode = manager.Engine.SearchRootNode;
+    BestMoveInfoMCGS provisional = new ManagerChooseBestMoveMCGS(manager, revalRootNode, false, default, false).BestMoveCalc;
+    RevaluationSwitchDecision decision = PrincipalRevaluation.CalcBlendedQSwitchDecision(
+                                           manager, revalRootNode, provisional, LastRevaluation);
+    UCIWriteLine(decision.WouldSwitch
+      ? $"info string reval decision: rollout evidence would prefer {decision.CandidateMove} over {decision.BaselineMove} ({decision.Description})"
+      : $"info string reval decision: rollout evidence keeps {decision.BaselineMove} ({decision.Description})");
   }
 
 
@@ -865,6 +1167,140 @@ public partial class UCIManagerMCGS
 
     CeresEngine = null;
     haveInitializedEngine = false;
+  }
+
+
+  /// <summary>
+  /// Handles the "dump-info" / "dump-info-block" commands. If a search is currently in progress the
+  /// dump is deferred to the engine's next quiescent point (so the mutating graph is never read from
+  /// this UCI input thread); otherwise it is emitted immediately. When blockFormat is true the dump
+  /// is prefixed with a process/GC/machine header and wrapped in begin/end markers.
+  /// </summary>
+  void ProcessDumpInfoCommand(bool blockFormat)
+  {
+    // If a search is running, route through the engine's thread-safe (quiescent) dump mechanism.
+    if (CeresEngine != null && CeresEngine.IsSearching)
+    {
+      CeresEngine.RequestDumpInfo("UCI",
+        blockFormat ? GameEngineCeresMCGSInProcess.DumpInfoFormat.Block
+                    : GameEngineCeresMCGSInProcess.DumpInfoFormat.Plain);
+      return;
+    }
+
+    // No search active: safe to read and dump immediately on this thread.
+    if (blockFormat)
+    {
+      DiagnosticsBlock.WriteBlock(Console.Out, w =>
+      {
+        if (CeresEngine?.Search?.Manager != null)
+        {
+          CeresEngine.Search.Manager.DumpFullInfo(lastSearchResult, w, "UCI");
+        }
+        else
+        {
+          w.WriteLine("info string No search manager created");
+        }
+      });
+    }
+    else
+    {
+      if (CeresEngine?.Search?.Manager != null)
+      {
+        CeresEngine.Search.Manager.DumpFullInfo(lastSearchResult, Console.Out, "UCI");
+      }
+      else
+      {
+        UCIWriteLine("info string No search manager created");
+      }
+    }
+  }
+
+
+  /// <summary>
+  /// Dumps the ParamsSelect / ParamsSearch / ParamsSearchExecution that would be used for the next
+  /// search (reflecting any params loaded via "load-params"). Used by "dump-params" when no search
+  /// manager has yet been created.
+  /// </summary>
+  void DumpPendingParams()
+  {
+    ParamsSelect pendingSelect = ParamsSelect;
+    ParamsSearch pendingSearch = ParamsSearch;
+    Console.WriteLine(ObjUtils.FieldValuesDumpString<ParamsSelect>(pendingSelect, new ParamsSelect(), false));
+    Console.WriteLine(ObjUtils.FieldValuesDumpString<ParamsSearch>(pendingSearch, new ParamsSearch(), false));
+    Console.WriteLine(ObjUtils.FieldValuesDumpString<ParamsSearchExecution>(pendingSearch.Execution, new ParamsSearchExecution(), false));
+    Console.WriteLine(ObjUtils.FieldValuesDumpString<ParamsRootMinimaxBlend>(pendingSearch.RootMinimaxBlend, new ParamsRootMinimaxBlend(), false));
+  }
+
+
+  /// <summary>
+  /// Handles the "load-params &lt;filename&gt;" command: loads serialized ParamsSearch and ParamsSelect
+  /// from the specified JSON file, makes them authoritative for all future searches, and clears the
+  /// currently-loaded search engine so the next search rebuilds with them.
+  /// </summary>
+  void ProcessLoadParamsCommand(string command)
+  {
+    string fileName = command.Substring("load-params".Length).Trim();
+    if (string.IsNullOrEmpty(fileName))
+    {
+      UCIWriteLine("info string load-params requires a filename, e.g. load-params my.ceres.params");
+      return;
+    }
+
+    try
+    {
+      ParamsFileContents contents = ParamsFileSerializer.Load(fileName);
+      loadedParamsSearch = contents.ParamsSearch;
+      loadedParamsSelect = contents.ParamsSelect;
+
+      // Clear the currently-loaded search engine (if any) so the next search rebuilds with these params.
+      ReinitializeEngine();
+
+      ConsoleUtils.WriteLineColored(ConsoleColor.Yellow,
+        $"Loaded search params from {fileName} - these now override all UCI options for future searches.");
+    }
+    catch (Exception exc)
+    {
+      UCIWriteLine($"info string load-params failed: {exc.Message}");
+    }
+  }
+
+
+  /// <summary>
+  /// Handles the "save-params &lt;filename&gt;" command: serializes the current ParamsSearch and
+  /// ParamsSelect (those in use by the active search if any, else those that would be used next)
+  /// to the specified JSON file. Useful for generating an editable template to later load-params.
+  /// </summary>
+  void ProcessSaveParamsCommand(string command)
+  {
+    string fileName = command.Substring("save-params".Length).Trim();
+    if (string.IsNullOrEmpty(fileName))
+    {
+      UCIWriteLine("info string save-params requires a filename, e.g. save-params my.ceres.params");
+      return;
+    }
+
+    try
+    {
+      ParamsSearch searchToSave;
+      ParamsSelect selectToSave;
+      if (CeresEngine?.Search?.Manager != null)
+      {
+        searchToSave = CeresEngine.Search.Manager.ParamsSearch;
+        selectToSave = CeresEngine.Search.Manager.ParamsSelect;
+      }
+      else
+      {
+        searchToSave = ParamsSearch;
+        selectToSave = ParamsSelect;
+      }
+
+      ParamsFileSerializer.Save(fileName, searchToSave, selectToSave);
+      ConsoleUtils.WriteLineColored(ConsoleColor.Yellow, $"Saved current search params to {fileName}.");
+    }
+    catch (Exception exc)
+    {
+      UCIWriteLine($"info string save-params failed: {exc.Message}");
+    }
   }
 
 
@@ -953,7 +1389,8 @@ public partial class UCIManagerMCGS
 
       // Create the engine (to be subsequently reused).
       CeresEngine = new GameEngineCeresMCGSInProcess("CeresV2", EvaluatorDef, ParamsSearch, ParamsSelect,
-                                                        logFileName: searchLogFileName, infoLogger: InfoLogger)
+                                                        logFileName: searchLogFileName, infoLogger: InfoLogger,
+                                                        emitMiniLog: enableMiniLog)
       {
         // Disable verbose move stats from the engine since 
         // this class manages the possibly dumping of verbose move stats itself.

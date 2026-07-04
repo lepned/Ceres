@@ -34,7 +34,18 @@ public interface IManagerGameLimit
   /// <param name="search"></param>
   /// <param name="inputs"></param>
   /// <returns></returns>
-  public ManagerGameLimitOutputs ComputeMoveAllocation(/*MCTSearch search, */ManagerGameLimitInputs inputs);
+  public ManagerGameLimitOutputs ComputeMoveAllocation(ManagerGameLimitInputs inputs, bool applyEarlySmoothing = true);
+
+
+  /// <summary>
+  /// If set, the manager should build a human-readable diagnostic string describing how each move's
+  /// allocation was derived and attach it to the outputs (ManagerGameLimitOutputs.DiagnosticText), so
+  /// callers (e.g. the diagnostic game move-log) can record it near the move header. This is
+  /// independent of any console dumping, which is governed separately (and unconditionally) by
+  /// MCGSParamsFixed.DUMP_LIMIT_CALC. Default implementation is a no-op for managers that do not
+  /// produce diagnostics.
+  /// </summary>
+  public bool CaptureDiagnostics { get => false; set { } }
 
 
   /// <summary>
@@ -45,7 +56,7 @@ public interface IManagerGameLimit
   /// <param name="newRoot"></param>
   /// <param name="inputs"></param>
   /// <returns></returns>
-  public LimitsManagerInstamoveDecision CheckInstamove(/*MCTSearch search, MCTSNode newRoot,*/ ManagerGameLimitInputs inputs)
+  public LimitsManagerInstamoveDecision CheckInstamove(ManagerGameLimitInputs inputs)
     => LimitsManagerInstamoveDecision.NoDecision;
 
 

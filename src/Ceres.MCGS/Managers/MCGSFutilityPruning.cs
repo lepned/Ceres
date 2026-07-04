@@ -174,9 +174,8 @@ public class MCGSFutilityPruning
     }
 
     // Allocate (or reallocate if undersized) the per-root pruning array.
-    if (Manager.Engine.SearchRootNode.N > 1
-        && (Manager.RootMovesPruningStatus == null
-            || Manager.RootMovesPruningStatus.Length < SearchRoot.NumPolicyMoves))
+    if (Manager.RootMovesPruningStatus == null
+        || Manager.RootMovesPruningStatus.Length < SearchRoot.NumPolicyMoves)
     {
       Manager.RootMovesPruningStatus = new MCGSFutilityPruningStatus[SearchRoot.NumPolicyMoves];
     }
@@ -198,7 +197,17 @@ public class MCGSFutilityPruning
     // Don't prune any more if we disallow stop search from pruning
     // and we are already down to 2 remaining unpruned moves.
     bool okToPrune = true;
-    int numNotPruned = Manager.RootMovesPruningStatus.Sum(p => p == Managers.MCGSFutilityPruningStatus.NotPruned ? 1 : 0);
+    // Count not-yet-pruned root moves with a plain loop rather than LINQ Sum, which allocates an
+    // enumerator on every call (this runs frequently while the graph/backup lock is held).
+    int numNotPruned = 0;
+    var pruningStatus = Manager.RootMovesPruningStatus;
+    for (int i = 0; i < pruningStatus.Length; i++)
+    {
+      if (pruningStatus[i] == Managers.MCGSFutilityPruningStatus.NotPruned)
+      {
+        numNotPruned++;
+      }
+    }
     if (!Manager.ParamsSearch.FutilityPruningStopSearchEnabled && numNotPruned <= 2)
     {
       okToPrune = false;
@@ -225,11 +234,6 @@ public class MCGSFutilityPruning
     GEdge bestQEdge = SearchRoot.EdgeWithMaxValue(n => -n.Q);
     float bestQ = (float)bestQEdge.Q;
     float qOfBestN = (float)bestNEdge.Q;
-
-    ManagerChooseBestMoveMCGS bestMoveChooser = new(Manager, Manager.Engine.SearchRootNode, false, default, false);
-
-    float MIN_BEST_N_FRAC_REQUIRED = ManagerChooseBestMoveMCGS.MIN_FRAC_N_REQUIRED_MIN;
-
 
     int numNewlyShutdown = 0;
     foreach ((GEdge edge, int indexChild) in SearchRoot.ChildEdgesExpandedWithIndex)
@@ -268,7 +272,14 @@ public class MCGSFutilityPruning
       }
       else
       {
-        int minNRequired = (int)(bestQEdge.N * MIN_BEST_N_FRAC_REQUIRED);
+        // Under the TopQ modes a move can still become best once its N reaches the
+        // mode's minimum fraction floor of the most-visited child's N (the same
+        // reference DoCalcBestMove uses for qualification). The floor (rather than
+        // the Q-difference-dependent curve) is used because the move's Q gap may
+        // shrink with further search; the floor is the true lower bound.
+        // RPO modes have no N-threshold qualification; the strict floor is retained
+        // for them as a conservative proxy.
+        int minNRequired = (int)(bestNEdge.N * ManagerChooseBestMoveMCGS.MinFracNFloor(Manager.ParamsSearch.BestMoveMode));
         earlyStopGapRaw = minNRequired - edge.N;
       }
 

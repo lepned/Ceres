@@ -22,6 +22,7 @@ using Ceres.Base.Misc;
 using Ceres.Chess;
 using Ceres.Chess.GameEngines;
 using Ceres.Features.GameEngines;
+using Ceres.Features.Tournaments.Streaming;
 using Ceres.MCTS.GameEngines;
 
 #endregion
@@ -49,6 +50,32 @@ namespace Ceres.Features.Tournaments
     /// Openings are drawn randomly without replacement for each game.
     /// </summary>
     Randomize
+  }
+
+
+  /// <summary>
+  /// Controls whether per-engine diagnostic "minilog" files are written during a tournament
+  /// (applies only to in-process Ceres MCGS engines).
+  /// </summary>
+  [Serializable]
+  public enum MiniLogFilesMode
+  {
+    /// <summary>
+    /// Never write minilog files.
+    /// </summary>
+    Never,
+
+    /// <summary>
+    /// Always write a minilog file for every participating in-process Ceres MCGS engine.
+    /// </summary>
+    Always,
+
+    /// <summary>
+    /// Write a minilog file only for engines whose assigned search limit implies a long game,
+    /// i.e. the estimated total search for the game exceeds ~1,000,000 nodes or ~3 minutes of
+    /// thinking time (heuristic estimate from the SearchLimit).
+    /// </summary>
+    IfLongSearchLimits
   }
 
 
@@ -103,6 +130,15 @@ namespace Ceres.Features.Tournaments
     /// If each move in each game should be output to the log/console.
     /// </summary>
     public bool ShowGameMoves = true;
+
+    /// <summary>
+    /// Controls whether each participating in-process Ceres MCGS engine writes a per-tournament
+    /// diagnostic "minilog" text file (header, one line per move, per-game result footers).
+    /// The file shares the PGN base name with a ".{engineID}.minilog.txt" suffix (with a companion
+    /// ".{engineID}.minilog.html" rendering). Globally gated by CeresUserSettings.EnableMiniLog.
+    /// Defaults to IfLongSearchLimits (write only for engines whose limit implies a long game).
+    /// </summary>
+    public MiniLogFilesMode MiniLogFiles = MiniLogFilesMode.IfLongSearchLimits;
 
     /// <summary>
     /// If moves played by reference engine are forced to be same (for same position)
@@ -190,6 +226,34 @@ namespace Ceres.Features.Tournaments
     public bool AdjudicateDrawByRepetitionImmediately = true;
 
     /// <summary>
+    /// If nonzero, enables blunder diagnostic dumps: after each move, if an engine's evaluation
+    /// improved by more than BlunderDumpThresholdQ compared to its prior move (implying
+    /// the opponent just blundered), and the node count (N) of that move, the engine's prior move,
+    /// and the intervening opponent move are all at least this value, and the opponent is an
+    /// in-process Ceres MCGS engine, then the opponent engine's search graph is dumped to a
+    /// "blunder_info_NNN.txt" file in the current working directory for post-hoc analysis.
+    /// </summary>
+    public int BlunderDumpThresholdN = 5000;
+
+    /// <summary>
+    /// Minimum improvement (in units of Q, the win probability in [-1, 1]) in the moving (reference)
+    /// engine's evaluation (versus its prior move) required to flag a candidate blunder, and also the
+    /// minimum amount by which the blundering engine's own Q evaluation must subsequently fall (on its
+    /// next move) to confirm the blunder before a dump is written (see BlunderDumpThresholdN and
+    /// BlunderDumpMaxPriorAbsQ).
+    /// </summary>
+    public float BlunderDumpThresholdQ = 0.12f;
+
+    /// <summary>
+    /// Maximum absolute value (in units of Q, the win probability in [-1, 1]) of the moving (reference)
+    /// engine's evaluation BEFORE the opponent's move for that move to be eligible as a blunder. If the
+    /// position was already more decisive than this (i.e. already clearly won or lost), the evaluation
+    /// swing is treated as "piling on" in an already-decided game and is ignored. Set to 1.0 (or larger)
+    /// to disable this filter.
+    /// </summary>
+    public float BlunderDumpMaxPriorAbsQ = 0.70f;
+
+    /// <summary>
     /// The index of the processor group to which the engines should be affinitized. 
     /// </summary>
     public int ProcessGroupIndex = 0;
@@ -203,6 +267,68 @@ namespace Ceres.Features.Tournaments
     /// If the tournament has been instructed to shut down (e.g. Ctrl-C pressed).
     /// </summary>
     public bool ShouldShutDown = false;
+
+    /// <summary>
+    /// Optional controller coordinating a cooperative pause/resume of the tournament's worker
+    /// threads (driven by the Ctrl-P console command). Non-null only for local interactive
+    /// tournaments; worker threads reach it via parentDef and null-check at each call site,
+    /// exactly like ShouldShutDown. NonSerialized because TournamentDef is deep-cloned per
+    /// worker thread (the shared controller lives only on parentDef).
+    /// </summary>
+    [NonSerialized] public TournamentPauseController PauseController;
+
+    /// <summary>
+    /// Optional callback invoked after each game is processed by any tournament thread.
+    ///
+    /// The callback is passed the TournamentResultStats accumulated so far (across all threads),
+    /// allowing it to monitor the progress and partial results of the tournament as it runs.
+    ///
+    /// If the callback returns true then an orderly (early) shutdown of the tournament is
+    /// requested: no further games are started and the tournament concludes once the games
+    /// already in progress have finished (equivalent to setting ShouldShutDown, the same
+    /// mechanism used by the Ctrl-C handler).
+    ///
+    /// The callback may be invoked from any of the worker threads. Invocations are serialized
+    /// (and the supplied statistics are stable for the duration of the call) because the callback
+    /// runs while holding the statistics lock; consequently it should return promptly and must
+    /// not block or perform expensive work, as doing so would stall the other tournament threads.
+    ///
+    /// Marked NonSerialized because TournamentDef is deep-cloned (via BinaryFormatter) per worker
+    /// thread; the callback is always resolved via parentDef so the per-thread clones need not
+    /// carry it (mirroring how ShouldShutDown is coordinated through parentDef).
+    /// </summary>
+    [NonSerialized] public Func<TournamentResultStats, bool> PerGameCallback;
+
+    /// <summary>
+    /// Optional, transport-agnostic observer that receives live tournament/game/move events.
+    /// Any consumer may attach (one example is the live streaming publisher used by the
+    /// EngineBattle GUI in REMOTE mode). Resolved via parentDef and null-checked at each call
+    /// site, exactly like PerGameCallback. When null there is zero behavioral change.
+    /// Marked NonSerialized because TournamentDef is deep-cloned per worker thread.
+    /// </summary>
+    [NonSerialized] public ITournamentObserver Observer;
+
+    /// <summary>
+    /// If true (the default), a live streaming TCP listener is started automatically when the
+    /// tournament runs, so any remote consumer can connect and watch games. Set false to
+    /// disable. NonSerialized (resolved via parentDef).
+    /// </summary>
+    [NonSerialized] public bool EnableLiveStreaming = true;
+
+    /// <summary>
+    /// TCP port on which the live streaming listener accepts subscriber connections.
+    /// NonSerialized (resolved via parentDef).
+    /// </summary>
+    [NonSerialized] public int LiveStreamPort = 7440;
+
+    /// <summary>
+    /// Steady-state interval (milliseconds) at which transient mid-search interim snapshots are
+    /// streamed while an engine is thinking, so the live viewer updates instead of freezing between
+    /// moves. The actual cadence is graduated around this value (faster at the start of a move,
+    /// easing off for very long thinks). Set to 0 to disable interim updates (only completed-move
+    /// frames are sent). NonSerialized (resolved via parentDef).
+    /// </summary>
+    [NonSerialized] public int LiveStreamInterimIntervalMs = 1000;
 
     /// <summary>
     /// If this instance is the coordinator in a distributed tournament.

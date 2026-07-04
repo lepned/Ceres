@@ -784,6 +784,91 @@ public static unsafe class GraphRewriter
 
 
   /// <summary>
+  /// Finalizes a freshly built (copied) graph by running the shared rewrite tail phases
+  /// (parent store rebuild, N/Q/D recomputation, root/history setup, dictionary and sibling
+  /// rebuild, and final cleanup/validation).
+  ///
+  /// This is the integration point used by <see cref="GraphExtractor"/>: after the extractor
+  /// has copied the reachable subgraph into a new Graph's stores at contiguous indices
+  /// [1..numReachable] (the same compacted layout that Phases 2-4 produce in place), all of the
+  /// derived state is rebuilt here using the exact same code paths as the in-place rewrite,
+  /// so correctness is shared rather than reimplemented.
+  ///
+  /// PRECONDITIONS (caller, i.e. the extractor, must establish):
+  ///   - graph.NodesStore.nextFreeIndex == numReachable + 1 (null node at 0, root at 1).
+  ///   - Each retained node's GNodeStruct fields are copied (eval/hash/terminal/pieces/etc.).
+  ///   - Each retained node's edge headers are allocated in graph's own EdgeHeadersStore and
+  ///     expanded edges point (via ForceSetEdgeBlockIndex) to edge blocks in graph's own
+  ///     EdgesStore, with child indices already remapped to the new [1..numReachable] space.
+  ///   - ParentsHeader may be left arbitrary (it is fully rebuilt here).
+  /// The graph must be quiescent (no in-flight visits, nothing locked).
+  /// </summary>
+  /// <summary>
+  /// Per-phase timing breakdown (seconds) for the shared finalize tail, returned by
+  /// <see cref="FinalizeAfterCopy"/> for diagnostics.
+  /// </summary>
+  public record FinalizePhaseTimings(double Phase5Parents,
+                                     double Phase5aScale, double Phase5aFixup, double Phase5aQD, int Phase5aFixupPasses,
+                                     double Phase5bRoot, double Phase6Dicts, double Phase6cSiblings, double Phase7Cleanup);
+
+
+  /// <summary>
+  /// Sub-phase timing (seconds) within Phase 5a, plus the fixup pass count. Returned by
+  /// <see cref="Phase5aRecalculateNodeN(Graph, int, int*, out Phase5aTimings)"/>.
+  /// </summary>
+  internal record Phase5aTimings(double Scale, double Fixup, double QD, int FixupPasses);
+
+
+  internal static FinalizePhaseTimings FinalizeAfterCopy(Graph graph, int numReachable, PositionWithHistory newPriorMoves)
+  {
+    // Lazily create and size the scratch buffers on THIS (new) graph.
+    // Pass small sizes (numReachable+1) for both: the tail phases only use the retained-sized
+    // buffers (incomingN/visited/positions/runningHashes); OldToNew is unused here, so there is
+    // no O(old graph) zeroing cost.
+    int numTotalRetained = numReachable + 1;
+    graph.RewriterScratchBuffers ??= new GraphRewriterScratchBuffers();
+    GraphRewriterScratchBuffers scratch = graph.RewriterScratchBuffers;
+    scratch.EnsureCapacity(numTotalRetained, numTotalRetained);
+
+    // Bypass lock assertions during exclusive (single-threaded, quiescent) graph construction.
+    graph.Store.IsRewriting = true;
+
+    Stopwatch sw = Stopwatch.StartNew();
+
+    // Phase 5: Rebuild parent store from edges (also accumulates incoming edge.N into scratch.GeneralA).
+    Phase5RebuildParentStore(graph, numReachable, scratch);
+    double t1 = sw.Elapsed.TotalSeconds;
+
+    // Phase 5a: Recalculate node N (from incoming edge N) and Q/D (bottom-up from edges).
+    Phase5aRecalculateNodeN(graph, numReachable, scratch.GeneralAPtr, out Phase5aTimings p5a);
+    double t2 = sw.Elapsed.TotalSeconds;
+
+    // Phase 5b: Set root flags / cached pointers / history.
+    Phase5bSetupRootState(graph, newPriorMoves);
+    double t3 = sw.Elapsed.TotalSeconds;
+
+    // Phase 6: Rebuild transposition dictionaries and NodeIndexSet store.
+    Phase6RebuildDictionaries(graph, numReachable, scratch, out _, out _);
+    double t4 = sw.Elapsed.TotalSeconds;
+
+    // Phase 6c: Reconstruct pseudo-transposition sibling contributions (no-op in PositionEquivalence mode).
+    Phase6cPossiblyReconstructSiblingContributions(graph, numReachable);
+    double t5 = sw.Elapsed.TotalSeconds;
+
+    // Phase 7: Final cleanup (reset counters, resize stores to current usage, DEBUG validate).
+    Phase7FinalCleanup(graph);
+    double t6 = sw.Elapsed.TotalSeconds;
+
+    graph.Store.IsRewriting = false;
+
+    // Phase 5 timing includes the (small) scratch EnsureCapacity zeroing performed above.
+    // Phase 5a is broken out into scale / fixup / Q-D sub-timings (plus fixup pass count).
+    return new FinalizePhaseTimings(t1, p5a.Scale, p5a.Fixup, p5a.QD, p5a.FixupPasses,
+                                    t3 - t2, t4 - t3, t5 - t4, t6 - t5);
+  }
+
+
+  /// <summary>
   /// Phase 0: Materialize deferred policy copies on reachable nodes only.
   /// Deferred nodes are always leaf nodes (no expanded edges), so Phase 1 BFS
   /// can safely run first to determine reachability.
@@ -1980,8 +2065,26 @@ public static unsafe class GraphRewriter
   /// edge.N values by iteratively capping edge.N to child.N until convergence.
   /// </summary>
   static void Phase5aRecalculateNodeN(Graph graph, int numRetained, int* incomingN)
+    => Phase5aRecalculateNodeN(graph, numRetained, incomingN, out _);
+
+
+  /// <summary>
+  /// Timed variant of <see cref="Phase5aRecalculateNodeN(Graph, int, int*)"/> that splits Phase 5a into
+  /// scale / fixup / Q-D and returns the fixup pass count.
+  ///
+  /// The fixup and Q/D passes are memory-latency-bound on random child lookups scattered across the
+  /// 64-byte node store (which far exceeds L3 on large graphs, so each lookup misses to DRAM). To keep
+  /// those lookups L3-resident, node N/Q/D are mirrored into compact "dense" arrays (4/8/8 bytes each);
+  /// the passes read the mirror and dual-write both the node struct and the mirror. Same computation,
+  /// bit-identical results.
+  /// </summary>
+  static void Phase5aRecalculateNodeN(Graph graph, int numRetained, int* incomingN, out Phase5aTimings timings)
   {
     int numTotalRetained = numRetained + 1;
+    GraphRewriterScratchBuffers scratch = graph.RewriterScratchBuffers;
+    int* denseN = scratch.DenseNPtr;
+    DenseQD* denseQD = scratch.DenseQDPtr;
+    Stopwatch p5aSW = Stopwatch.StartNew();
 
     // Process root first: its N = sum(child edge N) + 1 (no incoming edges after rewrite).
     {
@@ -2014,6 +2117,18 @@ public static unsafe class GraphRewriter
       }
     }
 
+    // Populate the compact N/Q/D mirrors from the node store (one sequential-strided sweep). The random
+    // child lookups in the fixup / Q-D passes then hit these small L3-resident arrays instead of missing
+    // to DRAM on the full 64-byte node struct.
+    for (int i = GraphStore.ROOT_NODE_INDEX; i < numTotalRetained; i++)
+    {
+      ref GNodeStruct nr = ref graph.NodesBufferOS[i];
+      denseN[i] = nr.N;
+      denseQD[i].Q = nr.Q;
+      denseQD[i].D = nr.D;
+    }
+    double scaleSec = p5aSW.Elapsed.TotalSeconds;
+
     // Fixup pass: cap edge.N to child.N for all edges, recompute node.N.
     // In a DAG with transpositions, a higher-index node can have an edge to a
     // lower-index node. Processing high-to-low means the lower node's N hasn't
@@ -2022,8 +2137,12 @@ public static unsafe class GraphRewriter
     // The number of passes needed equals the longest back-edge chain in the DAG;
     // 3 is insufficient for large graphs (100K+ nodes). Since all values are
     // non-negative integers that can only decrease, convergence is guaranteed.
+    // child.N is read from the denseN mirror; node.N writes are mirrored into denseN so the two stay
+    // identical throughout (bit-identical to reading node.N directly).
+    int fixupPasses = 0;
     for (int pass = 0; pass < 100; pass++)
     {
+      fixupPasses = pass + 1;
       bool anyChange = false;
       for (int i = numTotalRetained - 1; i >= GraphStore.ROOT_NODE_INDEX; i--)
       {
@@ -2065,7 +2184,7 @@ public static unsafe class GraphRewriter
 
           if (edge.Type == GEdgeStruct.EdgeType.ChildEdge && !edge.ChildNodeIndex.IsNull)
           {
-            int childN = graph.NodesBufferOS[edge.ChildNodeIndex.Index].N;
+            int childN = denseN[edge.ChildNodeIndex.Index];
             if (edge.N > childN)
             {
               edge.N = childN;
@@ -2087,6 +2206,7 @@ public static unsafe class GraphRewriter
         if (nodeRef.N != newN)
         {
           nodeRef.N = newN;
+          denseN[i] = newN;
           anyChange = true;
         }
       }
@@ -2096,6 +2216,7 @@ public static unsafe class GraphRewriter
         break;
       }
     }
+    double fixupSec = p5aSW.Elapsed.TotalSeconds - scaleSec;
 
     // Q and D recomputation pass: bottom-up, compute Q and D from edges.
     // After fixup convergence, edge.N values are final. This pass computes
@@ -2145,8 +2266,9 @@ public static unsafe class GraphRewriter
         ref GEdgeStruct edge = ref cachedEdgeSpan2[offsetInBlock];
         if (edge.Type == GEdgeStruct.EdgeType.ChildEdge && !edge.ChildNodeIndex.IsNull)
         {
-          double childQ = graph.NodesBufferOS[edge.ChildNodeIndex.Index].Q;
-          double childD = graph.NodesBufferOS[edge.ChildNodeIndex.Index].D;
+          DenseQD cqd = denseQD[edge.ChildNodeIndex.Index];
+          double childQ = cqd.Q;
+          double childD = cqd.D;
           if (!double.IsNaN(childQ))
           {
             edge.QChild = childQ;
@@ -2205,7 +2327,15 @@ public static unsafe class GraphRewriter
           nodeRef2.Q = 0;
         }
       }
+
+      // Mirror the recomputed Q/D so a parent processed later (lower index) reads the fresh value,
+      // matching the serial pass's in-place read semantics exactly.
+      denseQD[i].Q = nodeRef2.Q;
+      denseQD[i].D = nodeRef2.D;
     }
+    double qdSec = p5aSW.Elapsed.TotalSeconds - scaleSec - fixupSec;
+
+    timings = new Phase5aTimings(scaleSec, fixupSec, qdSec, fixupPasses);
   }
 
 
@@ -2581,18 +2711,37 @@ public static unsafe class GraphRewriter
     // Reset NodeIndexSetStore.
     graph.NodeIndexSetStore.nextFreeIndex = GNodeIndexSetStore.FIRST_ALLOCATED_INDEX;
 
-    // Create fresh dictionaries upfront.
+    // Reuse the dictionaries already present on the graph instead of allocating fresh ones. Clearing
+    // in place retains their (already-grown) directory + bucket arrays, so the refill below does zero
+    // (or far fewer) bucket splits and directory doublings. This benefits every caller:
+    //   - the extract path: GraphExtractor has handed over the prior graph's larger dictionaries;
+    //   - the in-place rewrite paths: this is the graph's own live dictionary.
+    // Only when no dictionary is present (defensive; should not happen on these paths) do we allocate.
     const int DICTIONARY_CONCURRENCY = 16;
-    graph.transpositionsPosStandalone =
-      new Ceres.Base.DataTypes.ConcurrentDictionaryExtendible<PosHash64WithMove50AndReps, GNodeIndexSetIndex>(DICTIONARY_CONCURRENCY, numRetained);
+    if (graph.transpositionsPosStandalone != null)
+    {
+      graph.transpositionsPosStandalone.Clear();
+    }
+    else
+    {
+      graph.transpositionsPosStandalone =
+        new Ceres.Base.DataTypes.ConcurrentDictionaryExtendible<PosHash64WithMove50AndReps, GNodeIndexSetIndex>(DICTIONARY_CONCURRENCY, numRetained);
+    }
 
     bool needPosSeqDict = graph.GraphEnabled
                        && !(Graph.SINGLE_DICTIONARY_POSITION_MODE && graph.Store.UsesPositionEquivalenceMode);
 
     if (needPosSeqDict)
     {
-      graph.transpositionPositionAndSequence =
-        new Ceres.Base.DataTypes.ConcurrentDictionaryExtendible<PosHash96MultisetFinalized, int>(DICTIONARY_CONCURRENCY, numRetained);
+      if (graph.transpositionPositionAndSequence != null)
+      {
+        graph.transpositionPositionAndSequence.Clear();
+      }
+      else
+      {
+        graph.transpositionPositionAndSequence =
+          new Ceres.Base.DataTypes.ConcurrentDictionaryExtendible<PosHash96MultisetFinalized, int>(DICTIONARY_CONCURRENCY, numRetained);
+      }
     }
     else
     {
@@ -2658,9 +2807,33 @@ public static unsafe class GraphRewriter
     int collisionCount = 0;
 
     int maxDop = Math.Max(2, System.Environment.ProcessorCount / 3);
+
+    // In single-dictionary PositionEquivalence mode the standalone dict doubles as the
+    // node-identity dedup index, keyed by the POSITION-ONLY key (Move50Category=default,
+    // RepetitionCount=0) exactly as the live LookupOrCreateAndAcquire standaloneKey. The
+    // real-category insertion below already supplies that key for counter<=75 non-repetition
+    // nodes (their real category IS default), but not for repetition, counter>90 (skipped
+    // below), or counter 76-90 nodes (inserted under a non-default category). For those we
+    // also register the position-only key so the rebuilt dict matches a freshly-built one and
+    // the live dedup lookup finds the board after a rewrite/extract (else duplicate nodes).
+    bool posEquivSingleDict = Graph.SINGLE_DICTIONARY_POSITION_MODE && graph.Store.UsesPositionEquivalenceMode;
+
     Parallel.For(1, numTotalRetained, new ParallelOptions { MaxDegreeOfParallelism = maxDop }, newIdx =>
     {
       ref GNodeStruct nodeRef = ref graph.NodesBufferOS[newIdx];
+
+      // Position-only dedup key (see note above). First-wins; result ignored (in a coalesced
+      // graph there is one node per board, so this key does not contend with any other node's
+      // insertion). counter<=75 non-rep nodes are excluded because the real-category TryAdd
+      // below already inserts this exact (default) key - re-adding it would be miscounted as
+      // a collision and could trigger spurious sibling promotion.
+      if (posEquivSingleDict
+       && (nodeRef.miscFields.HasRepetitions || nodeRef.miscFields.Move50Category != Move50CategoryEnum.LessThan75))
+      {
+        graph.transpositionsPosStandalone.TryAdd(
+          MGPositionHashing.Hash64WithMove50AndRepsAdded(nodeRef.HashStandalone, 0, default),
+          GNodeIndexSetIndex.FromDirectNodeIndex(newIdx));
+      }
 
       if (nodeRef.miscFields.HasRepetitions)
       {
@@ -2685,7 +2858,10 @@ public static unsafe class GraphRewriter
     });
 
     // Pass 2: Sequential collision handling (NodeIndexSet creation/extension).
-    for (int c = 0; c < collisionCount; c++)
+    // Skipped when sibling sets are not maintained: each colliding node simply keeps the first
+    // (direct-index) registration from Pass 1, which is the sole representative ever needed.
+    int numCollisionsToProcess = graph.MaintainSiblingSets ? collisionCount : 0;
+    for (int c = 0; c < numCollisionsToProcess; c++)
     {
       int newIdx = collisionNodesPtr[c];
       ref GNodeStruct nodeRef = ref graph.NodesBufferOS[newIdx];
@@ -2727,9 +2903,20 @@ public static unsafe class GraphRewriter
   /// </summary>
   static void Phase6RebuildStandaloneDictSequential(Graph graph, int numTotalRetained)
   {
+    // See the position-only dedup key rationale in Phase6RebuildStandaloneDictParallel.
+    bool posEquivSingleDict = Graph.SINGLE_DICTIONARY_POSITION_MODE && graph.Store.UsesPositionEquivalenceMode;
+
     for (int newIdx = 1; newIdx < numTotalRetained; newIdx++)
     {
       ref GNodeStruct nodeRef = ref graph.NodesBufferOS[newIdx];
+
+      if (posEquivSingleDict
+       && (nodeRef.miscFields.HasRepetitions || nodeRef.miscFields.Move50Category != Move50CategoryEnum.LessThan75))
+      {
+        graph.transpositionsPosStandalone.TryAdd(
+          MGPositionHashing.Hash64WithMove50AndRepsAdded(nodeRef.HashStandalone, 0, default),
+          GNodeIndexSetIndex.FromDirectNodeIndex(newIdx));
+      }
 
       if (nodeRef.miscFields.HasRepetitions)
       {
@@ -2752,7 +2939,9 @@ public static unsafe class GraphRewriter
       {
         graph.transpositionsPosStandalone[key] = GNodeIndexSetIndex.FromDirectNodeIndex(newIdx);
       }
-      else if (existingEntry.IsDirectNodeIndex)
+      // The promotion branches below are skipped when sibling sets are not maintained: a colliding
+      // node keeps the first node's direct-index registration as the sole representative for the hash.
+      else if (graph.MaintainSiblingSets && existingEntry.IsDirectNodeIndex)
       {
         int existingNodeIdx = existingEntry.DirectNodeIndex;
         int newSetIndex = graph.NodeIndexSetStore.AllocateNext();
@@ -2762,7 +2951,7 @@ public static unsafe class GraphRewriter
         graph.NodeIndexSetStore.sets[newSetIndex] = siblingSet;
         graph.transpositionsPosStandalone[key] = GNodeIndexSetIndex.FromNodeSetIndex(newSetIndex);
       }
-      else
+      else if (graph.MaintainSiblingSets)
       {
         int setIndex = existingEntry.NodeSetIndex;
         NodeIndexSet siblingSet = graph.NodeIndexSetStore.sets[setIndex];

@@ -21,6 +21,7 @@ using Ceres.Base.Misc;
 using Ceres.Chess.MoveGen;
 using Ceres.Chess.NNEvaluators.LC0DLL;
 
+using Ceres.MCGS.Analysis;
 using Ceres.MCGS.Graphs;
 using Ceres.MCGS.Graphs.GEdges;
 using Ceres.MCGS.Graphs.GNodes;
@@ -39,7 +40,17 @@ namespace Ceres.MCGS.Managers;
 public class ManagerChooseBestMoveMCGS
 {
 
-  internal const float MIN_FRAC_N_REQUIRED_MIN = 0.325f;
+  /// <summary>
+  /// Absolute minimum fraction of N (relative to most visited move) ever required
+  /// for a move to qualify as best by Q (TopQIfSufficientN, the default mode).
+  /// </summary>
+  internal const float MIN_FRAC_N_REQUIRED_MIN = 0.18f;
+
+  /// <summary>
+  /// Absolute minimum fraction of N (relative to most visited move) ever required
+  /// for a move to qualify as best by Q (TopQIfSufficientNStrict mode).
+  /// </summary>
+  internal const float MIN_FRAC_N_REQUIRED_MIN_STRICT = 0.325f;
 
   public readonly GNode Node;
   public readonly MCGSManager Manager;
@@ -68,7 +79,23 @@ public class ManagerChooseBestMoveMCGS
 
 
   /// <summary>
-  /// Calculates the best move to play from root 
+  /// True only for the authoritative best-move calculation whose result is actually selected for
+  /// play, as opposed to the various secondary calculations that compute a best move without it
+  /// being the move played: periodic UCI info lines, PV extraction, the dump-move-stats display
+  /// command, etc.
+  ///
+  /// Those secondary calculations are not the real selection and set updateStatistics=false and/or
+  /// isFinalBestMoveCalc=false; only the genuine selection (MCGSManager search result and
+  /// GameEngine move emission) sets BOTH true. Note isFinalBestMoveCalc alone is insufficient:
+  /// dump-move-stats deliberately passes isFinalBestMoveCalc=true (so its displayed move reflects
+  /// the final overrides) while passing updateStatistics=false; conversely the secondary
+  /// GetBestMove peek passes updateStatistics=true but isFinalBestMoveCalc=false.
+  /// </summary>
+  private bool IsActualMoveSelection => IsFinalBestMoveCalc && UpdateStatistics;
+
+
+  /// <summary>
+  /// Calculates the best move to play from root
   /// given the current state of the search.
   /// </summary>
   public BestMoveInfoMCGS BestMoveCalc
@@ -218,7 +245,8 @@ public class ManagerChooseBestMoveMCGS
                                         secondBestEdge.Value.N,                   // BestN: N of substituted move
                                         baselineBestMoveInfo.BestMoveEdge.N,      // BestNSecond: N of rejected original best (now "second")
                                         secondBestEdge.Value,                     // BestNEdge: the substituted move
-                                        secondBestEdge.Value);                    // BestQEdge: the substituted move
+                                        secondBestEdge.Value)                     // BestQEdge: the substituted move
+            { SelectionNote = "drp-avoid" };
           }
           else if (DUMP_TO_CONSOLE)
           {
@@ -316,8 +344,7 @@ public class ManagerChooseBestMoveMCGS
 
     int thisMoveNum = Node.Graph.Store.NodesStore.PositionHistory.Moves.Count / 2; // convert ply to moves
 
-    // Never use Top Q for very small trees
-    const int MIN_N_USE_TOP_Q = 100;
+    // Never use Top Q for very small graphs
     if (Manager.ParamsSearch.BestMoveMode == ParamsSearch.BestMoveModeEnum.RegularizedPolicyOptimizationLow)
     {
       const float LAMBDA = 0.125f;
@@ -335,16 +362,15 @@ public class ManagerChooseBestMoveMCGS
       return new BestMoveInfoMCGS(BestMoveInfoMCGS.BestMoveReason.SearchResult, position, bestChildEdge, (float)-edgesSortedQ[0].Q, childrenSortedN[0].N,
                                    BestNSecond, childrenSortedN[0], edgesSortedQ[0]);
     }
-    else if (Manager.ParamsSearch.BestMoveMode == ParamsSearch.BestMoveModeEnum.TopN
-          || Node.N < MIN_N_USE_TOP_Q)
+    else if (Manager.ParamsSearch.BestMoveMode == ParamsSearch.BestMoveModeEnum.TopN)
     {
       // Just return best N (note that tiebreaks are already decided with sort logic above)
       BestMoveInfoMCGS result = new BestMoveInfoMCGS(BestMoveInfoMCGS.BestMoveReason.SearchResult, position, childrenSortedN[0], (float)-edgesSortedQ[0].Q, childrenSortedN[0].N,
                                   BestNSecond, childrenSortedN[0], edgesSortedQ[0]);
       return TryOverrideWithMoreIrreversibleMove(position, result, edgesSortedQ);
     }
-    else if (Manager.ParamsSearch.BestMoveMode == ParamsSearch.BestMoveModeEnum.TopQIfSufficientNPermissive
-          || Manager.ParamsSearch.BestMoveMode == ParamsSearch.BestMoveModeEnum.TopQIfSufficientN)
+    else if (Manager.ParamsSearch.BestMoveMode == ParamsSearch.BestMoveModeEnum.TopQIfSufficientN
+          || Manager.ParamsSearch.BestMoveMode == ParamsSearch.BestMoveModeEnum.TopQIfSufficientNStrict)
     {
       float qOfBestNMove = (float)childrenSortedN[0].Q;
 
@@ -363,21 +389,28 @@ public class ManagerChooseBestMoveMCGS
 
         float differenceFromQOfBestN = MathF.Abs((float)candidate.Q - (float)childrenSortedN[0].Q);
 
-        float minFrac = MinFractionNToUseQ(Node, differenceFromQOfBestN, Manager.ParamsSearch.BestMoveMode == ParamsSearch.BestMoveModeEnum.TopQIfSufficientNPermissive);
+        float minFrac = MinFractionNToUseQ(EffectiveBestMoveMode(Manager.ParamsSearch, Node.N), differenceFromQOfBestN);
 
         int minNToBeConsideredForBestQ = (int)(nOfChildWithHighestN * minFrac);
         if (candidate.N > minNToBeConsideredForBestQ)
         {
           BestMoveInfoMCGS candidateResult = new BestMoveInfoMCGS(BestMoveInfoMCGS.BestMoveReason.SearchResult, position, candidate, (float)-edgesSortedQ[0].Q, childrenSortedN[0].N,
                                       BestNSecond, childrenSortedN[0], edgesSortedQ[0]);
-          return TryOverrideWithMoreIrreversibleMove(position, candidateResult, edgesSortedQ);
+          // Played move was upgraded away from the most-visited move on the strength of its Q.
+          if (candidate != childrenSortedN[0])
+          {
+            candidateResult.SelectionNote = "best-Q";
+          }
+          return TryOverrideWithMoreIrreversibleMove(position,
+                   TryOverrideWithRootMinimaxBlend(position, candidateResult, edgesSortedQ, childrenSortedN), edgesSortedQ);
         }
       }
 
       // We didn't find any moves qualified by Q, fallback to move with highest N
       BestMoveInfoMCGS result = new BestMoveInfoMCGS(BestMoveInfoMCGS.BestMoveReason.SearchResult, position, childrenSortedN[0], (float)-edgesSortedQ[0].Q, childrenSortedN[0].N,
                                   BestNSecond, childrenSortedN[0], edgesSortedQ[0]);
-      return TryOverrideWithMoreIrreversibleMove(position, result, edgesSortedQ);
+      return TryOverrideWithMoreIrreversibleMove(position,
+               TryOverrideWithRootMinimaxBlend(position, result, edgesSortedQ, childrenSortedN), edgesSortedQ);
 
     }
     else
@@ -477,8 +510,11 @@ public class ManagerChooseBestMoveMCGS
       // Apply the same "sufficient N" logic used elsewhere to ensure the candidate
       // has enough visits to be considered reliable. The candidate must have at least
       // a minimum fraction of the best move's N, where the fraction depends on the Q difference.
-      float minFrac = MinFractionNToUseQ(Node, qDifference, 
-                                         Manager.ParamsSearch.BestMoveMode == ParamsSearch.BestMoveModeEnum.TopQIfSufficientNPermissive);
+      // Note: qDifference may be negative (candidateB has better Q than moveA but failed
+      // N-sufficiency during primary selection). MinFractionNToUseQ clamps negative
+      // differences to zero, so such a candidate must have full N parity
+      // (N at least that of moveA) to be eligible for the irreversibility override.
+      float minFrac = MinFractionNToUseQ(EffectiveBestMoveMode(Manager.ParamsSearch, Node.N), qDifference);
       int minNRequired = (int)(moveA.N * minFrac);
       if (candidateB.N < minNRequired)
       {
@@ -540,11 +576,139 @@ public class ManagerChooseBestMoveMCGS
                                     currentBest.BestN,
                                     currentBest.BestNSecond,
                                     currentBest.BestNEdge,
-                                    currentBest.BestQEdge);
+                                    currentBest.BestQEdge)
+        { SelectionNote = "irreversible" };
       }
     }
 
     return currentBest;
+  }
+
+
+  /// <summary>
+  /// Opt-in tiebreak among root moves that are nearly equal in averaged Q: prefers the move with
+  /// the highest static, depth-bounded soft-minimax blend value over the existing graph
+  /// (see ParamsRootMinimaxBlend and PrincipalRevaluation.BlendedRootChildValues). The pass is
+  /// read-only over the final tree (no NN evaluations, no graph mutation).
+  ///
+  /// Engages only when enabled, at the final best-move calculation, on a normal search result with
+  /// at least MinRootN visits, and only among candidates that (a) lie within QGapThreshold of the
+  /// chosen move in Q and (b) already pass the standard sufficient-N eligibility gate
+  /// (MinFractionNToUseQ) - so it can only reorder moves the chooser already deems sound, never
+  /// promote an under-supported move.
+  ///
+  /// In shadow mode (Enabled but not ApplyToBestMove) it logs what it would have done and returns
+  /// the baseline unchanged.
+  /// </summary>
+  /// <param name="position">The current position.</param>
+  /// <param name="currentBest">The currently chosen best move info.</param>
+  /// <param name="edgesSortedQ">Root edges sorted by Q (best for us first).</param>
+  /// <param name="childrenSortedN">Root edges sorted by N (most visited first).</param>
+  /// <returns>The (possibly substituted) best move info.</returns>
+  private BestMoveInfoMCGS TryOverrideWithRootMinimaxBlend(MGPosition position,
+                                                           BestMoveInfoMCGS currentBest,
+                                                           GEdge[] edgesSortedQ,
+                                                           GEdge[] childrenSortedN)
+  {
+    // Only run for the genuine move selection that is actually played - never for secondary
+    // best-move calculations (UCI info lines, PV extraction, dump-move-stats), which would incur
+    // the cost without affecting play. See IsActualMoveSelection.
+    ParamsRootMinimaxBlend p = Manager.ParamsSearch.RootMinimaxBlend;
+    if (!IsActualMoveSelection || p == null || p.Mode == ParamsRootMinimaxBlend.ModeType.Disabled)
+    {
+      return currentBest;
+    }
+
+    if (Node.N < p.MinRootN
+     || currentBest.Reason != BestMoveInfoMCGS.BestMoveReason.SearchResult)
+    {
+      return currentBest;
+    }
+
+    GEdge moveA = currentBest.BestMoveEdge;
+    if (moveA.IsNull)
+    {
+      return currentBest;
+    }
+
+    System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
+
+    // Build the candidate set: the incumbent plus any move whose Q is within QGapThreshold of it
+    // and whose visit count is at least MinCandidateFractionN of the most-visited move's N
+    // ("well supported, not small relative to the largest N"). Restricting to this well-supported,
+    // near-equal-Q neighborhood bounds the tiebreak's reach. (The chooser's own MinFractionNToUseQ
+    // gate is deliberately NOT reused here: for near-equal Q it demands near-full visit parity and
+    // so would almost never admit a second candidate.)
+    int bestN = childrenSortedN[0].N;
+    int minCandidateN = (int)(p.MinCandidateFractionN * bestN);
+
+    List<GEdge> candidates = new() { moveA };
+    foreach (GEdge e in edgesSortedQ)
+    {
+      if (e.IsNull || e == moveA)
+      {
+        continue;
+      }
+
+      // Candidate must be near-equal in Q to the chosen move and well supported
+      // (N not small relative to the most-visited move).
+      if (MathF.Abs((float)(e.Q - moveA.Q)) > p.QGapThreshold)
+      {
+        continue;
+      }
+      if (e.N < minCandidateN)
+      {
+        continue;
+      }
+
+      candidates.Add(e);
+    }
+
+    if (candidates.Count < 2)
+    {
+      return currentBest; // nothing to disambiguate (the common case)
+    }
+
+    // Static, read-only, depth-bounded soft-minimax blend value (our perspective) for each candidate.
+    double[] blend = PrincipalRevaluation.BlendedRootChildValues(candidates, p.Depth, p.Intensity,
+                                                                 p.SoftmaxP, p.CutFraction, p.NCutAbs, Node.N);
+
+    // Candidate 0 is the incumbent; find the highest-blend challenger.
+    double incumbentBlend = blend[0];
+    int bestIdx = 0;
+    double bestBlend = incumbentBlend;
+    for (int i = 1; i < candidates.Count; i++)
+    {
+      if (blend[i] > bestBlend)
+      {
+        bestBlend = blend[i];
+        bestIdx = i;
+      }
+    }
+
+    // Switch only if a challenger beats the incumbent's blended value by at least SwitchMargin.
+    if (bestIdx == 0 || bestBlend <= incumbentBlend + p.SwitchMargin)
+    {
+      return currentBest;
+    }
+
+    GEdge challenger = candidates[bestIdx];
+
+    bool apply = p.Mode == ParamsRootMinimaxBlend.ModeType.Active;
+    ConsoleUtils.WriteLineColored(ConsoleColor.Yellow,
+      $"[ROOT-BLEND {(apply ? "SWITCH" : "would switch")}] {moveA.MoveMG} -> {challenger.MoveMG}  "
+    + $"Q: {-moveA.Q:F4} -> {-challenger.Q:F4}  blend: {incumbentBlend:F4} -> {bestBlend:F4}  "
+    + $"(lambda={p.Intensity}, depth={p.Depth}, p={p.SoftmaxP}, candidates={candidates.Count}, {sw.Elapsed.TotalMilliseconds:F2}ms, {position.ToPosition.FEN})");
+
+    if (!apply)
+    {
+      return currentBest; // shadow mode: report only, do not change the played move
+    }
+
+    return new BestMoveInfoMCGS(BestMoveInfoMCGS.BestMoveReason.SearchResult, position, challenger,
+                                currentBest.QMaximal, currentBest.BestN, currentBest.BestNSecond,
+                                currentBest.BestNEdge, currentBest.BestQEdge)
+    { SelectionNote = "minimax" };
   }
 
 
@@ -557,33 +721,74 @@ public class ManagerChooseBestMoveMCGS
   /// because:
   ///   - the less explored (lower N) a move is, the more uncertain we are of its true Q (could be worse).
   ///   - N partly reflects the influence of policy, which should not be lightly ignored.
+  ///
+  /// The returned value is always within [MinFracNFloor(mode), 1.0].
+  /// Negative qDifferenceFromBestQ (candidate Q better than reference)
+  /// is treated as zero difference, i.e. full N parity is required.
   /// </summary>
+  /// <param name="mode"></param>
   /// <param name="qDifferenceFromBestQ"></param>
   /// <returns></returns>
-  static internal float MinFractionNToUseQ(GNode node, float qDifferenceFromBestQ, bool permissive)
+  static internal float MinFractionNToUseQ(ParamsSearch.BestMoveModeEnum mode, float qDifferenceFromBestQ)
   {
     // Compute fraction required which decreases slowly below 1.0
     // as the Q difference increases (using a power function).
-    // Value of 25 yields these minimum fractions for various sample levels of Q difference:
+    // The strict value of 25 yields these minimum fractions for various sample levels of Q difference:
     //    0.005 --> 88%
     //    0.010 --> 78%
     //    0.020 --> 60%
     // Tests (using matches) suggest play quality is not highly sensitive to this POWER,
     // with a value of 30 possibly very slightly better than 20.
-    const float POWER = 25;
-    const float POWER_PERMISSIVE = 50;
+    const float POWER = 40;
+    const float POWER_STRICT = 25;
 
-    const float MIN_FRAC_N_REQUIRED_MIN_PERMISSIVE = 0.15f;
+    // All modes other than the default TopQIfSufficientN use the strict mapping
+    // (TopN and the RPO modes conservatively so).
+    bool strict = mode != ParamsSearch.BestMoveModeEnum.TopQIfSufficientN;
 
-    float minFrac = MathF.Pow(1.0f - qDifferenceFromBestQ, (permissive ? POWER_PERMISSIVE : POWER));
+    qDifferenceFromBestQ = Math.Clamp(qDifferenceFromBestQ, 0f, 1f);
+    float minFrac = MathF.Pow(1.0f - qDifferenceFromBestQ, (strict ? POWER_STRICT : POWER));
 
     // Impose absolute minimum fraction.
-    if (minFrac < (permissive ? MIN_FRAC_N_REQUIRED_MIN_PERMISSIVE : MIN_FRAC_N_REQUIRED_MIN))
-    {
-      minFrac = MIN_FRAC_N_REQUIRED_MIN;
-    }
-
-    return minFrac;
+    return MathF.Max(minFrac, MinFracNFloor(mode));
   }
+
+
+  /// <summary>
+  /// Absolute minimum fraction of the reference (most visited) move's N required
+  /// for a move to qualify as best by Q, i.e. the lower bound of MinFractionNToUseQ
+  /// over all Q differences.
+  /// TopN and the RPO modes have no fraction-based qualification of their own;
+  /// they map to the strict floor (conservative).
+  /// </summary>
+  /// <param name="mode"></param>
+  /// <returns></returns>
+  static internal float MinFracNFloor(ParamsSearch.BestMoveModeEnum mode)
+    => mode == ParamsSearch.BestMoveModeEnum.TopQIfSufficientN
+         ? MIN_FRAC_N_REQUIRED_MIN
+         : MIN_FRAC_N_REQUIRED_MIN_STRICT;
+
+
+  /// <summary>
+  /// Minimum root N for the default TopQIfSufficientN mapping to apply.
+  /// Below this, a fixed fraction of N carries much weaker statistical evidence,
+  /// so the strict mapping is substituted
+  /// (graduating: TopN below MIN_N_USE_TOP_Q, then strict, then default).
+  /// </summary>
+  internal const int SMALL_GRAPH_STRICT_MIN_N = 100;
+
+  /// <summary>
+  /// Returns the best move mode to actually apply given the size of the search:
+  /// for small graphs (root N below SMALL_GRAPH_STRICT_MIN_N) TopQIfSufficientN
+  /// is replaced by TopQIfSufficientNStrict.
+  /// </summary>
+  /// <param name="paramsSearch"></param>
+  /// <param name="rootN"></param>
+  /// <returns></returns>
+  static internal ParamsSearch.BestMoveModeEnum EffectiveBestMoveMode(ParamsSearch paramsSearch, int rootN)
+    => (paramsSearch.BestMoveMode == ParamsSearch.BestMoveModeEnum.TopQIfSufficientN
+     && rootN < SMALL_GRAPH_STRICT_MIN_N)
+         ? ParamsSearch.BestMoveModeEnum.TopQIfSufficientNStrict
+         : paramsSearch.BestMoveMode;
 
 }

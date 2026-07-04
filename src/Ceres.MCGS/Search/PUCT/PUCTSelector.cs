@@ -75,7 +75,7 @@ public static class PUCTSelector
   /// <param name="cpuctMultiplier"></param>
   /// <param name="temperatureMultiplier"></param>
   public static NodeSelectAccumulator ComputeTopChildScores(Graph graph, GNode node,
-                                                            ParamsSearch paramsSearch, ParamsSelect paramsSelect, 
+                                                            ParamsSearch paramsSearch, ParamsSelect paramsSelect,
                                                             int selectorID, bool refreshStaleEdges,
                                                             MCGSFutilityPruningStatus[] rootMovePruningStatus,
                                                             float dualCollisionFraction,
@@ -95,7 +95,7 @@ public static class PUCTSelector
 
     ref readonly GNodeStruct nodeRef = ref node.NodeRef;
 
-    int numToProcess = Math.Min(Math.Min(maxChildIndex + 1, nodeRef.NumPolicyMoves), 
+    int numToProcess = Math.Min(Math.Min(maxChildIndex + 1, nodeRef.NumPolicyMoves),
                                 PUCTScoreCalcVector.MAX_CHILDREN);
 
     if (numToProcess == 0)
@@ -109,7 +109,7 @@ public static class PUCTSelector
 
 
     graph.GatherChildInfoViaChildren(node, selectorID, maxChildIndex, dualCollisionFraction, stats, refreshStaleEdges,
-                                     crossParentNActive: paramsSelect.CBGPUCT_SelectCrossParentNEnabled);
+                                     crossParentNActive: paramsSelect.CBGPUCTSelectActive && paramsSelect.CBGPUCT_SelectCrossParentNEnabled);
 
     // Possibly use action head directly
     double[] qWhenNoChildrenComposite = null;
@@ -257,7 +257,7 @@ public static class PUCTSelector
       {
         thresholdPUCTSuboptimalityReject = paramsSearch.VisitSuboptimalityRejectThreshold.Value;
       }
-      
+
       numVisitsAccepted = PUCTScoreCalcVector.ScoreCalcMulti(paramsSelect,
                                                               node.IsSearchRoot, nodeRef.N,
                                                               parentNumInFlight,
@@ -272,14 +272,18 @@ public static class PUCTSelector
       // Some scoring paths can produce allocations that violate the sequential-expansion
       // invariant ("no child gets a visit before all of its left siblings have at least
       // one visit"):
-      //   - ActionHead FPU: per-child q from the network is not monotonic in policy.
+      //   - Per-child FPU (ActionHead or PolicyImputedRPO): the imputed per-child q is not
+      //     monotonic in policy, so a later unvisited child can outscore an earlier one.
+      //     qWhenNoChildrenComposite is non-null exactly when per-child FPU was built above.
       //   - CB-GPUCT: the visit-target pi_bar reflects (mu, q) jointly, so cross-parent
       //     N skew, per-child FPU, and (rarely) fixed-point iteration with clamp-induced
       //     ties can produce a non-monotonic deficit ordering among unvisited children.
-      // The fixup is cheap and only relocates visits when an actual hole is present.
+      // Leaving a hole (an unexpanded slot before another that got a visit) corrupts memory
+      // in Graph.InitializeNewEdge, so the fixup must run for every per-child path.  It is
+      // cheap and only relocates visits when an actual hole is present.
       if (numTargetVisits > 0
-          && (paramsSelect.FPUMode == ParamsSelect.FPUType.ActionHead
-              || paramsSelect.CBGPUCTSelectActive))
+          && (qWhenNoChildrenComposite != null
+              || paramsSelect.CBGPUCTSelectActiveAtN(nodeRef.N)))
       {
         FillInSequentialVisitHoles(childVisitCounts, ref node.NodeRef, numToProcess);
       }
@@ -327,19 +331,23 @@ public static class PUCTSelector
       qIn[i] = (i < numExpanded && nSpan[i] > 0) ? -wSpan[i] / nSpan[i] : double.NaN;
     }
 
-    // Anchor choice mirrors legacy ApplyRPOImputedFPU.  The reverse-KL path ignores
-    // the anchor (it must be None there); construct the appropriate anchor for forward KL.
+    // Anchor VALUE is dispatched by CBGPUCT_QAnchorTypeFPU (default ParentQ = node.Q,
+    // matching legacy behavior).  Anchor MODE selection (MatchChild vs MatchValue) is
+    // independent of the value and stays based on whether child 0 is visited - this
+    // affects only the q calibration formula's intercept, not the value being matched.
+    // The reverse-KL path ignores the anchor entirely (must be None there).
     RPORegularization regularization = paramsSelect.RPOFPURegularization;
+    double anchorValue = CBGPUCTScoreCalc.ComputeImputationAnchor(paramsSelect.CBGPUCT_QAnchorTypeFPU, node, qIn, numToProcess);
     RPOAnchor anchor = regularization == RPORegularization.ReverseKL
       ? RPOAnchor.None
       : (nSpan[0] > 0
-          ? new RPOAnchor(RPOAnchorMode.MatchChild, 0, node.Q)
-          : new RPOAnchor(RPOAnchorMode.MatchValue, -1, node.Q));
+          ? new RPOAnchor(RPOAnchorMode.MatchChild, 0, anchorValue)
+          : new RPOAnchor(RPOAnchorMode.MatchValue, -1, anchorValue));
 
     double lambda = paramsSelect.PolicyImputationTau;
     RPOOptions opts = new(bisectionIterations: 12,
                           bisectionResidualTol: 1e-6,
-                          clampQToUnitInterval: true,
+                          clampQ: true,
                           minPriorProbability: 0.0);
 
     double[] result = qWhenNoChildrenBuffer ??= new double[PUCTScoreCalcVector.MAX_CHILDREN];
@@ -352,26 +360,14 @@ public static class PUCTSelector
                                    options: opts,
                                    nanFallbackQ: node.Q);
 
-    // Final clamp to [-1, 1] to match legacy effective output range.  The legacy
-    // Boltzmann code internally clipped to [-1.2, 1.2] to leave headroom for a
-    // descending-epsilon hack that is now obsolete (sequential expansion ordering
-    // is preserved through P-ordering of children).
-    for (int i = 0; i < numToProcess; i++)
-    {
-      double v = result[i];
-      if (v < -1.0) result[i] = -1.0;
-      else if (v > 1.0) result[i] = 1.0;
-    }
-
-    // Cap Q values for unexpanded children to not exceed defaultFPU + 0.30.
+    // Cap Q values for unexpanded children to not exceed defaultFPU + 0.20.
     double defaultFPU = paramsSelect.CalcQWhenNoChildren(node.IsSearchRoot, node.Q, stats.SumPVisited);
-    double maxQ = 0.30 + defaultFPU;
+    double maxQ = 0.20 + defaultFPU;
     for (int i = numExpanded; i < numToProcess; i++)
     {
-      if (result[i] > maxQ)
-      {
-        result[i] = maxQ;
-      }
+      double thisResult = result[i] + paramsSelect.RPOFPUValue; 
+      thisResult = Math.Clamp(result[i], -1, 1);
+      result[i] = thisResult > maxQ ? maxQ : thisResult;
     }
 
     if (CBGPUCTDumpDiagnostics.DEBUG_DUMP_FPU_CALCS)
@@ -395,8 +391,8 @@ public static class PUCTSelector
   /// <param name="childVisitCounts"></param>
   /// <param name="nodeRef"></param>
   /// <param name="numToProcess"></param>
-  private static void FillInSequentialVisitHoles(Span<short> childVisitCounts, 
-                                                 ref readonly GNodeStruct nodeRef, 
+  private static void FillInSequentialVisitHoles(Span<short> childVisitCounts,
+                                                 ref readonly GNodeStruct nodeRef,
                                                  int numToProcess)
   {
     // Fixup any holes

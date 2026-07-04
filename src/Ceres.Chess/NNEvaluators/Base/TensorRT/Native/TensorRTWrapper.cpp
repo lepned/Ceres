@@ -18,6 +18,8 @@
 #include <memory>
 #include <functional>
 #include <cstring>
+#include <cstdlib>
+#include <cstdint>
 #include <atomic>
 #include <unordered_map>
 #include <unordered_set>
@@ -80,6 +82,18 @@ namespace
   nvinfer1::IRuntime* g_runtime = nullptr;
   std::string g_lastError;
   bool g_initialized = false;
+
+  // Stream sync wait policy. Default 3="auto" decides per-sync from the per-GPU batch size
+  // (the count being synced): SPIN when it is small (<= SYNC_SPIN_MAX_PERGPU, where the GPU
+  // burst is short so the block-sync OS wakeup latency is a large fraction of the wait) and
+  // BLOCK otherwise (long GPU work => wakeup negligible, and blocking frees the core). This
+  // is measured to be the crossover: spin helps fast/small per-GPU batches (e.g. multi-GPU
+  // splits and fast nets) while block is free and CPU-cheap on large batches / big nets.
+  // Override via env CERES_TRT_SYNC = auto|spin|block|driver.
+  //   0 = "driver" (cudaStreamSynchronize), 1 = "spin" (event busy-poll, low latency,
+  //   burns a core), 2 = "block" (blocking-sync event, low CPU), 3 = "auto" (the rule).
+  int g_syncMode = 3;
+  constexpr int SYNC_SPIN_MAX_PERGPU = 64;
 
   // Thread-local cache for current CUDA device to avoid redundant cudaSetDevice() calls.
   // Value of -1 means no device has been set on this thread yet.
@@ -151,6 +165,8 @@ namespace
     SharedEngine* sharedOwner = nullptr;  // Non-null when sharing engine via multi-profile
     int32_t batchSize = 0;
     int32_t deviceId = 0;  // GPU device ID
+    int32_t profileIndex = 0;  // Optimization profile this context is bound to (0 if single-profile)
+    bool useSpinWait = false;  // Retained so a shared-engine clone can reproduce this context's options
 
     std::vector<std::string> inputNames;
     std::vector<std::string> outputNames;
@@ -181,6 +197,9 @@ namespace
     void* streamCapturedInput[3] = { nullptr, nullptr, nullptr };
     void* streamCapturedOutput[3] = { nullptr, nullptr, nullptr };
 
+    // Reusable per-stream events for non-default sync modes (lazily created, see g_syncMode).
+    cudaEvent_t syncEvents[3] = { nullptr, nullptr, nullptr };
+
     ~EngineContext()
     {
       cudaSetDevice(deviceId);  // Ensure correct device for cleanup
@@ -191,6 +210,7 @@ namespace
       {
         if (streamGraphExecs[i]) cudaGraphExecDestroy(streamGraphExecs[i]);
         if (streamGraphs[i]) cudaGraphDestroy(streamGraphs[i]);
+        if (syncEvents[i]) cudaEventDestroy(syncEvents[i]);
       }
       for (int i = 0; i < 3; ++i)
       {
@@ -778,6 +798,154 @@ static bool IsSmolgenNormLayer(const char* layerName)
   return name.find("/attention/ln1/") != std::string::npos;
 }
 
+// Read an entire file into memory. Returns false on open/read failure. Used so the ONNX
+// bytes are read from disk exactly once and then reused for both strong-typing detection
+// and the TensorRT parse (parser->parse) -- nets are single-file with embedded weights,
+// so there are no external-data sidecars whose resolution would require parseFromFile.
+static bool ReadEntireFile(const char* path, std::vector<char>& out)
+{
+  std::ifstream in(path, std::ios::binary | std::ios::ate);
+  if (!in) return false;
+  const std::streamsize size = in.tellg();
+  if (size < 0) return false;
+  out.resize(static_cast<size_t>(size));
+  in.seekg(0);
+  if (size > 0 && !in.read(out.data(), size)) return false;
+  return true;
+}
+
+// Helper: detect explicit quantization (QuantizeLinear) in an in-memory ONNX model buffer.
+// TensorRT only honors FP8/FP4 QuantizeLinear/DequantizeLinear in a STRONGLY-TYPED network
+// (INT8 works weakly typed, but FP8/FP4 scale layers are silently ignored otherwise). Such
+// models are therefore built strongly typed, which also means builder precision flags and
+// manual setPrecision norm/softmax marking are skipped -- FP32 norms/softmax must be baked
+// into the ONNX instead.
+//
+// Rather than scanning every byte (which, for the common non-quantized model, means reading
+// the whole weight section just to prove a negative), this walks the ONNX protobuf wire
+// format and inspects NodeProto.op_type directly: ModelProto.graph (field 7) ->
+// GraphProto.node (field 1) -> NodeProto.op_type (field 4). Initializer/weight blobs are
+// skipped via their length prefixes, so cost is proportional to graph structure, not weight
+// size, and an op_type match cannot be spoofed by a tensor or metadata name.
+static bool OnnxNeedsStrongTyping(const void* data, size_t size)
+{
+  // Explicit override (escape hatch): CERES_TRT_STRONGLY_TYPED=0 forces off, =1 forces on.
+  if (const char* e = std::getenv("CERES_TRT_STRONGLY_TYPED"))
+  {
+    if (e[0] == '0') return false;
+    if (e[0] == '1') return true;
+  }
+
+  struct Walker
+  {
+    const uint8_t* const end;
+    bool found;
+
+    // Decode a base-128 varint at c (advancing c). False on truncation/overlong.
+    bool Varint(const uint8_t*& c, uint64_t& v)
+    {
+      v = 0;
+      for (int shift = 0; shift < 64; shift += 7)
+      {
+        if (c >= end) return false;
+        const uint8_t b = *c++;
+        v |= uint64_t(b & 0x7F) << shift;
+        if (!(b & 0x80)) return true;
+      }
+      return false;
+    }
+
+    // Decode a field key into (field number, wire type).
+    bool Tag(const uint8_t*& c, uint32_t& field, uint32_t& wire)
+    {
+      uint64_t key;
+      if (!Varint(c, key)) return false;
+      field = uint32_t(key >> 3);
+      wire = uint32_t(key & 7);
+      return true;
+    }
+
+    // Advance c past one field of the given wire type. False on malformed/overrun.
+    bool Skip(const uint8_t*& c, uint32_t wire)
+    {
+      uint64_t n;
+      switch (wire)
+      {
+        case 0: return Varint(c, n);                                          // varint
+        case 1: if (end - c < 8) return false; c += 8; return true;           // 64-bit
+        case 5: if (end - c < 4) return false; c += 4; return true;           // 32-bit
+        case 2: return Varint(c, n) && uint64_t(end - c) >= n && (c += n, true); // length-delimited
+        default: return false;                                               // groups: unsupported
+      }
+    }
+
+    // NodeProto: look for op_type (field 4) == one of the *QuantizeLinear ops.
+    void ScanNode(const uint8_t* c, const uint8_t* nodeEnd)
+    {
+      while (!found && c < nodeEnd)
+      {
+        uint32_t field, wire;
+        if (!Tag(c, field, wire)) return;
+        if (field == 4 && wire == 2)
+        {
+          uint64_t n;
+          if (!Varint(c, n) || uint64_t(nodeEnd - c) < n) return;
+          if ((n == 14 && memcmp(c, "QuantizeLinear", 14) == 0) ||
+              (n == 16 && memcmp(c, "DequantizeLinear", 16) == 0) ||
+              (n == 21 && memcmp(c, "DynamicQuantizeLinear", 21) == 0))
+          {
+            found = true;
+            return;
+          }
+          c += n;
+        }
+        else if (!Skip(c, wire)) return;
+      }
+    }
+
+    // GraphProto: iterate node submessages (field 1); seek past everything else (weights).
+    void ScanGraph(const uint8_t* c, const uint8_t* graphEnd)
+    {
+      while (!found && c < graphEnd)
+      {
+        uint32_t field, wire;
+        if (!Tag(c, field, wire)) return;
+        if (field == 1 && wire == 2)
+        {
+          uint64_t n;
+          if (!Varint(c, n) || uint64_t(graphEnd - c) < n) return;
+          ScanNode(c, c + n);
+          c += n;
+        }
+        else if (!Skip(c, wire)) return;
+      }
+    }
+
+    // ModelProto: descend into the graph submessage (field 7).
+    void ScanModel(const uint8_t* c)
+    {
+      while (!found && c < end)
+      {
+        uint32_t field, wire;
+        if (!Tag(c, field, wire)) return;
+        if (field == 7 && wire == 2)
+        {
+          uint64_t n;
+          if (!Varint(c, n) || uint64_t(end - c) < n) return;
+          ScanGraph(c, c + n);
+          c += n;
+        }
+        else if (!Skip(c, wire)) return;
+      }
+    }
+  };
+
+  const uint8_t* const base = static_cast<const uint8_t*>(data);
+  Walker w{ base + size, false };
+  w.ScanModel(base);
+  return w.found;
+}
+
 extern "C"
 {
 
@@ -805,13 +973,40 @@ extern "C"
       return nullptr;
     }
 
-    // Create network (kEXPLICIT_BATCH is deprecated in TRT 10+; 0 is equivalent)
+    // Read the ONNX bytes once; reused for strong-typing detection and the parse below.
+    std::vector<char> onnxBlob;
+    if (!ReadEntireFile(onnxPath, onnxBlob))
+    {
+      SetError("Failed to read ONNX file: " + std::string(onnxPath));
+      return nullptr;
+    }
+
+    // Create network. Models with explicit QuantizeLinear (FP8/FP4 QDQ) must be STRONGLY TYPED;
+    // TensorRT ignores FP8/FP4 QDQ scale layers in a weakly-typed network.
+    const bool stronglyTyped = OnnxNeedsStrongTyping(onnxBlob.data(), onnxBlob.size());
+    const uint32_t netFlags = stronglyTyped
+      ? (1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED)) : 0U;
+    if (stronglyTyped)
+      fprintf(stderr, "[TensorRT] QuantizeLinear detected -> building STRONGLY-TYPED network "
+        "(builder precision flags + setPrecision norm/softmax marking skipped; FP32 norms/softmax "
+        "must be baked into the ONNX)\n");
     auto network = std::unique_ptr<nvinfer1::INetworkDefinition>(
-      builder->createNetworkV2(0));
+      builder->createNetworkV2(netFlags));
     if (!network)
     {
       SetError("Failed to create network");
       return nullptr;
+    }
+    // Strongly-typed builds ignore builder precision flags and forbid setPrecision; neutralize
+    // the manual-precision options (FP8 + FP32 norms come from the ONNX itself).
+    TRT_BuildOptions optsStrong;
+    if (stronglyTyped)
+    {
+      optsStrong = *opts;
+      optsStrong.useBest = optsStrong.useFP16 = optsStrong.useBF16 = optsStrong.useFP8 = 0;
+      optsStrong.fp32PostAttentionNorm = optsStrong.fp32PostAttentionNormStrict = 0;
+      optsStrong.fp32SmolgenNorm = optsStrong.fp32Softmax = optsStrong.fp32AllNorms = 0;
+      opts = &optsStrong;
     }
 
     // Create ONNX parser
@@ -823,8 +1018,8 @@ extern "C"
       return nullptr;
     }
 
-    // Parse ONNX file
-    if (!parser->parseFromFile(onnxPath, static_cast<int>(nvinfer1::ILogger::Severity::kWARNING)))
+    // Parse ONNX from the already-read bytes (single-file model, weights embedded).
+    if (!parser->parse(onnxBlob.data(), onnxBlob.size()))
     {
       std::string errors;
       for (int32_t i = 0; i < parser->getNbErrors(); ++i)
@@ -1267,6 +1462,8 @@ extern "C"
     ec->batchSize = batchSize;
     ec->deviceId = deviceId;
     ec->useCudaGraphs = useCudaGraphs;
+    ec->profileIndex = 0;
+    ec->useSpinWait = useSpinWait;
 
     cudaStreamCreate(&ec->streams[0]);
     cudaStreamCreate(&ec->streams[1]);
@@ -2475,12 +2672,48 @@ extern "C"
     return 0;
   }
 
-  TRT_API int32_t TRT_SyncStreamIdx(TRT_EngineHandle handle, int32_t streamIdx)
+  // count = number of positions in the batch being synced on this stream (i.e. the per-GPU
+  // batch size). Used to resolve "auto" mode (3): spin for small batches, block for large.
+  TRT_API int32_t TRT_SyncStreamIdx(TRT_EngineHandle handle, int32_t streamIdx, int32_t count)
   {
     if (!handle || streamIdx < 0 || streamIdx > 2) return -1;
     auto* ec = static_cast<EngineContext*>(handle);
     if (!EnsureDevice(ec->deviceId)) return -1;
-    cudaStreamSynchronize(ec->streams[streamIdx]);
+
+    cudaStream_t stream = ec->streams[streamIdx];
+
+    // Resolve the wait policy. "auto" picks spin vs block per-sync from the per-GPU batch
+    // size: short GPU bursts (small batch) spin to avoid the OS wakeup latency; long bursts
+    // block to free the core.
+    int mode = g_syncMode;
+    if (mode == 3)
+    {
+      mode = (count <= SYNC_SPIN_MAX_PERGPU) ? 1 : 2;
+    }
+
+    if (mode == 0)
+    {
+      // Driver policy (typically spins when CUDA contexts <= cores, else blocks).
+      cudaStreamSynchronize(stream);
+      return 0;
+    }
+
+    // Reusable per-stream event. Created with the blocking flag so the BLOCK path actually
+    // blocks; the SPIN path busy-polls cudaEventQuery, which ignores the flag. A single
+    // stream may use either policy across batches (auto mode), hence the fixed flag.
+    if (!ec->syncEvents[streamIdx])
+    {
+      cudaEventCreateWithFlags(&ec->syncEvents[streamIdx], cudaEventBlockingSync | cudaEventDisableTiming);
+    }
+    cudaEventRecord(ec->syncEvents[streamIdx], stream);
+    if (mode == 1)
+    {
+      while (cudaEventQuery(ec->syncEvents[streamIdx]) == cudaErrorNotReady) { }
+    }
+    else
+    {
+      cudaEventSynchronize(ec->syncEvents[streamIdx]);
+    }
     return 0;
   }
 
@@ -2816,6 +3049,8 @@ extern "C"
     ec->batchSize = batchSize;
     ec->deviceId = deviceId;
     ec->useCudaGraphs = useCudaGraphs;
+    ec->profileIndex = profileIndex;
+    ec->useSpinWait = useSpinWait;
 
     // Create streams first (needed for setOptimizationProfileAsync)
     for (int i = 0; i < 3; ++i)
@@ -2823,11 +3058,18 @@ extern "C"
       cudaError_t serr = cudaStreamCreate(&ec->streams[i]);
       if (serr != cudaSuccess)
       {
-        // Clean up already-created streams
+        // Clean up already-created streams, then the partial context. Detach the (shared) engine
+        // and owner first so ~EngineContext neither double-frees `context` nor touches the
+        // engine/refcount on this failure path (the caller owns refcount rollback).
         for (int j = 0; j < i; ++j)
         {
           cudaStreamDestroy(ec->streams[j]);
+          ec->streams[j] = nullptr;
         }
+        ec->stream = nullptr;
+        ec->context = nullptr;
+        ec->sharedOwner = nullptr;
+        ec->engine = nullptr;
         delete context;
         delete ec;
         return nullptr;
@@ -2840,6 +3082,10 @@ extern "C"
     {
       if (!context->setOptimizationProfileAsync(profileIndex, ec->stream))
       {
+        // Detach engine/owner so ~EngineContext does not touch the engine/refcount here
+        // (caller owns refcount rollback); the streams and context are real and freed by the dtor.
+        ec->sharedOwner = nullptr;
+        ec->engine = nullptr;
         delete ec;
         return nullptr;
       }
@@ -3018,12 +3264,39 @@ extern "C"
       return -4;
     }
 
-    // Create network
-    auto network = std::unique_ptr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(0));
+    // Read the ONNX bytes once; reused for strong-typing detection and the parse below.
+    std::vector<char> onnxBlob;
+    if (!ReadEntireFile(onnxPath, onnxBlob))
+    {
+      SetError("Failed to read ONNX file: " + std::string(onnxPath));
+      return -8;
+    }
+
+    // Create network. Models with explicit QuantizeLinear (FP8/FP4 QDQ) must be STRONGLY TYPED;
+    // TensorRT ignores FP8/FP4 QDQ scale layers in a weakly-typed network.
+    const bool stronglyTyped = OnnxNeedsStrongTyping(onnxBlob.data(), onnxBlob.size());
+    const uint32_t netFlags = stronglyTyped
+      ? (1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED)) : 0U;
+    if (stronglyTyped)
+      fprintf(stderr, "[TensorRT] QuantizeLinear detected -> building STRONGLY-TYPED network "
+        "(builder precision flags + setPrecision norm/softmax marking skipped; FP32 norms/softmax "
+        "must be baked into the ONNX)\n");
+    auto network = std::unique_ptr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(netFlags));
     if (!network)
     {
       SetError("Failed to create network");
       return -5;
+    }
+    // Strongly-typed builds ignore builder precision flags and forbid setPrecision; neutralize
+    // the manual-precision options (FP8 + FP32 norms come from the ONNX itself).
+    TRT_BuildOptions optsStrong;
+    if (stronglyTyped)
+    {
+      optsStrong = *opts;
+      optsStrong.useBest = optsStrong.useFP16 = optsStrong.useBF16 = optsStrong.useFP8 = 0;
+      optsStrong.fp32PostAttentionNorm = optsStrong.fp32PostAttentionNormStrict = 0;
+      optsStrong.fp32SmolgenNorm = optsStrong.fp32Softmax = optsStrong.fp32AllNorms = 0;
+      opts = &optsStrong;
     }
 
     // Parse ONNX
@@ -3034,7 +3307,8 @@ extern "C"
       return -6;
     }
 
-    if (!parser->parseFromFile(onnxPath, static_cast<int>(nvinfer1::ILogger::Severity::kWARNING)))
+    // Parse ONNX from the already-read bytes (single-file model, weights embedded).
+    if (!parser->parse(onnxBlob.data(), onnxBlob.size()))
     {
       std::string errors;
       for (int32_t i = 0; i < parser->getNbErrors(); ++i)
@@ -3536,6 +3810,86 @@ extern "C"
   }
 
 
+  // Create a new EngineContext that SHARES the already-deserialized ICudaEngine owned by an
+  // existing context (referenceHandle), rather than deserializing/allocating the weights again.
+  // The clone gets its OWN IExecutionContext, streams, and GPU buffers (so it can run concurrently
+  // with the reference), but points at the same engine via the same ref-counted SharedEngine.
+  // Used so a second (overlap) evaluator can reuse the primary evaluator's engine weights.
+  // Returns 0 on success and writes the new handle to *outHandle; negative on error.
+  TRT_API int32_t TRT_CloneContextSharingEngine(TRT_EngineHandle referenceHandle,
+    int32_t deviceId, TRT_EngineHandle* outHandle)
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    if (!g_initialized)
+    {
+      SetError("TensorRT not initialized");
+      return -1;
+    }
+    if (!referenceHandle || !outHandle)
+    {
+      SetError("Invalid arguments for clone-context");
+      return -2;
+    }
+
+    auto* ref = static_cast<EngineContext*>(referenceHandle);
+    if (!ref->engine)
+    {
+      SetError("Reference handle has no engine to share");
+      return -3;
+    }
+
+    if (deviceId < 0)
+    {
+      deviceId = ref->deviceId;
+    }
+
+    // Reuse the reference's shared owner so the reference and all clones share one refcount.
+    // If the reference is a sole-owner (single-profile) context, promote it to ref-counted
+    // ownership first: count = 1 (the existing reference) + 1 (this clone, added below).
+    SharedEngine* shared = ref->sharedOwner;
+    bool promoted = false;
+    if (!shared)
+    {
+      shared = new SharedEngine(ref->engine, 1);
+      ref->sharedOwner = shared;
+      promoted = true;
+    }
+
+    // Reserve the clone's reference before creating it. InitializeEngineContextForProfile is
+    // refcount-neutral on failure, so on error we simply undo this reservation.
+    shared->refCount.fetch_add(1);
+
+    EngineContext* ec = InitializeEngineContextForProfile(ref->engine, shared,
+      ref->profileIndex, ref->batchSize, ref->useCudaGraphs, ref->useSpinWait, deviceId);
+    if (!ec)
+    {
+      shared->refCount.fetch_sub(1);
+      if (promoted)
+      {
+        // Revert the reference to sole-owner; do NOT delete the engine (reference still owns it).
+        ref->sharedOwner = nullptr;
+        delete shared;
+      }
+      SetError("Failed to initialize cloned execution context");
+      return -4;
+    }
+
+    *outHandle = ec;
+    g_lastError.clear();
+
+#if NOT
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+      "[TensorRT] Sharing engine (cloned context, batch=%d, profile=%d) - no deserialize",
+      ref->batchSize, ref->profileIndex);
+    PrintGreen(msg);
+
+#endif
+    return 0;
+  }
+
+
   TRT_API char* TRT_GenerateMultiProfileCacheFilename(const char* onnxPath,
     const int32_t* batchSizes, int32_t numProfiles,
     const TRT_BuildOptions* options, int32_t deviceId)
@@ -3605,8 +3959,17 @@ extern "C"
       }
     }
 
-    // Try loading from cache
-    if (!forceRebuild && FileExists(cachePath.c_str()))
+    // Try loading from cache.
+    // NOTE: every branch that ends up rebuilding logs an explicit reason to avoid a silent rebuilds
+    if (forceRebuild)
+    {
+      fprintf(stderr, "[TensorRT] Cache rebuild forced; ignoring any cached engine: %s\n", cachePath.c_str());
+    }
+    else if (!FileExists(cachePath.c_str()))
+    {
+      fprintf(stderr, "[TensorRT] Cache miss (no cached engine file found): %s\n", cachePath.c_str());
+    }
+    else
     {
       // Check if ONNX file is newer than cache
       struct stat onnxStat, cacheStat;
@@ -3616,6 +3979,7 @@ extern "C"
         if (onnxStat.st_mtime > cacheStat.st_mtime)
         {
           cacheValid = false;
+          fprintf(stderr, "[TensorRT] Cache stale (ONNX is newer than cached engine), rebuilding: %s\n", cachePath.c_str());
         }
       }
 
@@ -3632,7 +3996,12 @@ extern "C"
           {
             file.close();
 
-            std::lock_guard<std::mutex> lock(g_mutex);
+            // Lock-free deserialize: g_runtime is a single shared IRuntime created once in TRT_Init
+            // and never mutated; IRuntime::deserializeCudaEngine is thread-safe, and each concurrent
+            // call here targets a distinct deviceId (bound per-thread above) allocating only
+            // device-local resources. Dropping g_mutex here lets homogeneous multi-GPU loads
+            // deserialize in parallel rather than serializing on the global lock. Only the
+            // g_lastError accesses below are briefly locked.
             nvinfer1::ICudaEngine* engine = g_runtime->deserializeCudaEngine(buffer.data(), buffer.size());
             if (engine)
             {
@@ -3649,21 +4018,39 @@ extern "C"
                 }
                 std::string basename = GetBaseName(onnxPath);
                 char msg[512];
-                snprintf(msg, sizeof(msg), "[TensorRT] Loading multi-profile %s: batches=[%s], %d profiles",
-                  basename.c_str(), batchDesc.c_str(), numProfiles);
+                snprintf(msg, sizeof(msg), "[TensorRT] Loading multi-profile %s: batches=[%s], %d profiles (%lld bytes)",
+                  basename.c_str(), batchDesc.c_str(), numProfiles, (long long)buffer.size());
                 PrintGreen(msg);
 
                 if (outWasCached) *outWasCached = 1;
-                g_lastError.clear();
+                { std::lock_guard<std::mutex> lk(g_mutex); g_lastError.clear(); }
                 return 0;
               }
-              // CreateContextsFromEngine deleted engine on failure
+              else
+              {
+                // CreateContextsFromEngine deleted engine on failure
+                fprintf(stderr, "[TensorRT WARNING] Cache load FAILED: CreateContextsFromEngine returned %d (%lld bytes), rebuilding: %s\n",
+                  result, (long long)buffer.size(), cachePath.c_str());
+              }
+            }
+            else
+            {
+              fprintf(stderr, "[TensorRT WARNING] Cache load FAILED: deserializeCudaEngine returned null "
+                "(cached engine file likely corrupt, truncated, or built by an incompatible TensorRT/GPU), "
+                "size=%lld bytes, rebuilding: %s\n", (long long)buffer.size(), cachePath.c_str());
             }
           }
           else
           {
+            fprintf(stderr, "[TensorRT WARNING] Cache load FAILED: short read of engine file (got %lld of %lld bytes), rebuilding: %s\n",
+              (long long)file.gcount(), (long long)size, cachePath.c_str());
             file.close();
           }
+        }
+        else
+        {
+          fprintf(stderr, "[TensorRT WARNING] Cache load FAILED: could not open cached engine file for reading, rebuilding: %s\n",
+            cachePath.c_str());
         }
         // Fall through to rebuild if cache load failed
       }
@@ -3695,6 +4082,163 @@ extern "C"
     }
 
     return 0;
+  }
+
+
+  // Read the cached multi-profile serialized engine (.plan) blob for the given parameters into a
+  // heap buffer, WITHOUT deserializing or creating any contexts. Uses the same arch-keyed cache
+  // filename as TRT_LoadONNXMultiProfileCached, so homogeneous GPUs resolve to the same file.
+  // On a valid, non-stale cache hit: returns 0 and sets *outBuffer (caller frees via TRT_FreeBlob)
+  // and *outSize. If there is no cache dir, the file is absent, or it is stale (ONNX newer):
+  // returns 1 with *outBuffer null (caller should route through the normal build path). Negative
+  // on error.
+  TRT_API int32_t TRT_ReadMultiProfileBlobFromCache(const char* onnxPath,
+    const int32_t* batchSizes, int32_t numProfiles,
+    const TRT_BuildOptions* options, int32_t deviceId,
+    const char* cacheDir, char** outBuffer, int64_t* outSize)
+  {
+    if (outBuffer) *outBuffer = nullptr;
+    if (outSize) *outSize = 0;
+
+    if (!onnxPath || !batchSizes || numProfiles <= 0 || !outBuffer || !outSize)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Invalid arguments for ReadMultiProfileBlobFromCache");
+      return -1;
+    }
+
+    if (!cacheDir || cacheDir[0] == '\0')
+    {
+      return 1;  // No cache dir: treat as not present
+    }
+
+    // Generate cache filename (arch-keyed: identical for homogeneous GPUs).
+    char* cacheFilename = TRT_GenerateMultiProfileCacheFilename(onnxPath, batchSizes, numProfiles, options, deviceId);
+    std::string cachePath = std::string(cacheDir) + "/" + cacheFilename;
+    TRT_FreeString(cacheFilename);
+
+    if (!FileExists(cachePath.c_str()))
+    {
+      return 1;  // Not present
+    }
+
+    // Stale if the ONNX source is newer than the cached engine.
+    struct stat onnxStat, cacheStat;
+    if (stat(onnxPath, &onnxStat) == 0 && stat(cachePath.c_str(), &cacheStat) == 0)
+    {
+      if (onnxStat.st_mtime > cacheStat.st_mtime)
+      {
+        return 1;  // Stale
+      }
+    }
+
+    std::ifstream file(cachePath, std::ios::binary | std::ios::ate);
+    if (!file.is_open())
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Failed to open cached engine file: " + cachePath);
+      return -2;
+    }
+    std::streamsize size = file.tellg();
+    if (size <= 0)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Cached engine file empty: " + cachePath);
+      return -3;
+    }
+    file.seekg(0, std::ios::beg);
+
+    char* buf = static_cast<char*>(malloc(static_cast<size_t>(size)));
+    if (!buf)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Out of memory reading cached engine file");
+      return -4;
+    }
+    if (!file.read(buf, size))
+    {
+      free(buf);
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Short read of cached engine file: " + cachePath);
+      return -5;
+    }
+    file.close();
+
+    *outBuffer = buf;
+    *outSize = static_cast<int64_t>(size);
+    { std::lock_guard<std::mutex> lock(g_mutex); g_lastError.clear(); }
+    return 0;
+  }
+
+
+  // Deserialize an already-in-memory serialized multi-profile engine blob onto a specific device
+  // and create N execution contexts (one per profile). Does NOT touch disk and does NOT hold the
+  // global lock across the deserialize, so it is safe to call concurrently for distinct deviceIds
+  // (the keystone of parallel homogeneous multi-GPU loads). The blob must be the serialized engine
+  // for this device's architecture (caller guarantees homogeneity). Returns 0 on success; negative
+  // on error. On success, outHandles[0..numProfiles-1] receive the new contexts.
+  TRT_API int32_t TRT_DeserializeMultiProfileFromBuffer(const char* buffer, int64_t bufferSize,
+    const int32_t* batchSizes, int32_t numProfiles,
+    const TRT_BuildOptions* options, int32_t deviceId,
+    TRT_EngineHandle* outHandles)
+  {
+    if (!g_initialized)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("TensorRT not initialized");
+      return -1;
+    }
+    if (!buffer || bufferSize <= 0 || !batchSizes || numProfiles <= 0 || !outHandles)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Invalid arguments for DeserializeMultiProfileFromBuffer");
+      return -2;
+    }
+
+    TRT_BuildOptions defaultOpts;
+    TRT_InitBuildOptions(&defaultOpts);
+    const TRT_BuildOptions* opts = options ? options : &defaultOpts;
+
+    // Bind this thread to the target device (per-thread; no global lock needed).
+    if (deviceId < 0)
+    {
+      cudaGetDevice(&deviceId);
+    }
+    else if (!EnsureDevice(deviceId))
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Failed to set CUDA device " + std::to_string(deviceId));
+      return -3;
+    }
+
+    // Lock-free deserialize (see rationale in TRT_LoadONNXMultiProfileCached).
+    nvinfer1::ICudaEngine* engine = g_runtime->deserializeCudaEngine(buffer, static_cast<size_t>(bufferSize));
+    if (!engine)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Failed to deserialize multi-profile engine from buffer");
+      return -4;
+    }
+
+    int32_t result = CreateContextsFromEngine(engine, batchSizes, numProfiles,
+      opts->useCudaGraphs != 0, opts->useSpinWait != 0, deviceId, outHandles);
+    if (result != 0)
+    {
+      // CreateContextsFromEngine deletes the engine on failure.
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Failed to create contexts from buffer-deserialized engine");
+      return -5;
+    }
+
+    { std::lock_guard<std::mutex> lock(g_mutex); g_lastError.clear(); }
+    return 0;
+  }
+
+
+  // Free a buffer returned by TRT_ReadMultiProfileBlobFromCache.
+  TRT_API void TRT_FreeBlob(char* buffer)
+  {
+    if (buffer) free(buffer);
   }
 
 

@@ -71,7 +71,7 @@ public static class MCGSPosGraphNodeDumper
   private const int W_DEP = 3, W_NUM_MOVES = 3, W_INDEX = 10, W_FLG = 3, W_MOVE = 6;
   private const int W_POLICY = 7, W_VISITPCT = 7, W_PAR_N = 10, W_N = 10, W_REP = 3;
   private const int W_ACTV = 7, W_V = 7, W_Q = 7, W_WDL = 17;
-  private const int W_UNC = 4, W_PIRR = 4, W_VERR = 4;
+  private const int W_UNC = 4, W_PIRR = 4, W_VERR = 4, W_VOL = 4, W_REPD = 5;
 
 
   internal static void DumpNodeStr(MCGSManager manager,
@@ -102,6 +102,20 @@ public static class MCGSPosGraphNodeDumper
       }
     }
 
+    // A draw-by-repetition placeholder child (Position/PositionEquivalence mode) is created
+    // but never visited or NN-evaluated: its V/Q/WDL are sentinel NaNs while the draw value
+    // lives on the incoming edge (edge.Q dilutes to 0 via NDrawByRepetition). Display the draw
+    // so the dump shows the move's true value (0) instead of NaN. The node is intentionally
+    // left unevaluated so it can be NN-evaluated if later reached via a non-repetition path.
+    bool isRepDrawPlaceholder = !node.IsEvaluated && !edge.IsNull && edge.NDrawByRepetition > 0;
+
+    // A coalesced child reached via a now-repeating path can be FULLY evaluated (it is also reached via
+    // non-repeating paths elsewhere in the graph) yet THIS edge's every visit completes a repetition
+    // (edge.NDrawByRepetition == edge.N => edge.Q == 0). Show the move as the draw it is rather than the
+    // child node's standalone evaluation (which would mask the forced repetition).
+    bool isFullRepDrawEdge = !edge.IsNull && edge.N > 0 && edge.NDrawByRepetition == edge.N;
+    bool showRepDraw = isRepDrawPlaceholder || isFullRepDrawEdge;
+
     // Flag column: pruning status (F/T/S) overridden by terminal (C/D).
     char flag = ' ';
     if (!node.IsSearchRoot && hasParent && parentNode.IsSearchRoot
@@ -118,6 +132,7 @@ public static class MCGSPosGraphNodeDumper
     }
     if (node.Terminal == GameResult.Checkmate) flag = 'C';
     else if (node.Terminal == GameResult.Draw) flag = 'D';
+    if (showRepDraw) flag = 'R';
 
     // Rep column: nonblank only when the position repeated earlier in the walk.
     char repChar = ' ';
@@ -145,6 +160,7 @@ public static class MCGSPosGraphNodeDumper
     // Action V: read from the edge header (action data lives there, not on the edge struct).
     // Blank if NN evaluator doesn't expose action head, no parent edge, or value is NaN.
     float actionVDisplay = float.NaN;
+#if ACTION_ENABLED
     if (manager.NNEvaluator0.HasAction && hasParent && indexInParent >= 0)
     {
       Span<GEdgeHeaderStruct> headers = parentNode.EdgeHeadersSpan;
@@ -157,6 +173,7 @@ public static class MCGSPosGraphNodeDumper
         }
       }
     }
+#endif
 
     // SAN of the move leading into this node (blank for root).
     string san = node.IsSearchRoot || !hasParent || edge.IsNull
@@ -164,6 +181,16 @@ public static class MCGSPosGraphNodeDumper
       : MGMoveConverter.ToMove(edge.MoveMG).ToSAN(parentNode.CalcPosition().ToPosition);
 
     double q = node.Q;
+
+    // Display values: for an unevaluated draw-by-repetition placeholder, substitute the draw
+    // (V=0, Q=0, W/D/L = 0/1/0) for the node's sentinel NaNs. For all other rows these equal
+    // the underlying node fields exactly, leaving their output unchanged.
+    float vDisp = showRepDraw ? 0f : node.V;
+    double qDisp = showRepDraw ? 0.0 : q;          // == edge.Q (0) for a pure rep draw
+    float winPDisp = showRepDraw ? 0f : (float)node.WinP;
+    float drawPDisp = showRepDraw ? 1f : node.DrawP;
+    float lossPDisp = showRepDraw ? 0f : (float)node.LossP;
+
     int? plyUntilIrreversible = node.PlyUntilPVIsIrreversibleMove();
 
     // Column writes - widths must match WriteHeaders.
@@ -187,18 +214,24 @@ public static class MCGSPosGraphNodeDumper
       DumpWithColor(actionVDisplay, $"{actionVDisplay,W_ACTV:F3} ", -0.2f, 0.2f, writer);
     }
 
-    DumpWithColor(node.V, $"{node.V,W_V:F3} ", -0.2f, 0.2f, writer);
-    DumpWithColor((float)q, $"{q,W_Q:F3} ", -0.2f, 0.2f, writer);
+    DumpWithColor(vDisp, $"{vDisp,W_V:F3} ", -0.2f, 0.2f, writer);
+    DumpWithColor((float)qDisp, $"{qDisp,W_Q:F3} ", -0.2f, 0.2f, writer);
 
-    writer.Write($"{node.WinP,5:F2}/{node.DrawP,5:F2}/{node.LossP,5:F2} ");      // W_WDL = 17
-    writer.Write($"{node.W,5:F2}/{node.D,5:F2}/{node.L,5:F2} ");
+    writer.Write($"{winPDisp,5:F2}/{drawPDisp,5:F2}/{lossPDisp,5:F2} ");      // W_WDL = 17
+    // Tree W/D/L: D taken fresh from children (ComputeDForDisplay), W/L derived from the
+    // always-correct Q so the trio is internally consistent (sums to 1) and free of any
+    // running-average D staleness at this node.
+    double dDisp = showRepDraw ? 1.0 : node.ComputeDForDisplay();
+    writer.Write($"{(qDisp + 1 - dDisp) / 2.0,5:F2}/{dDisp,5:F2}/{(1 - dDisp - qDisp) / 2.0,5:F2} ");
 
     writer.Write($"{100 * node.UncertaintyValue,W_UNC:F0} ");
     writer.Write($"{100 * node.UncertaintyPolicy,W_UNC:F0} ");
     writer.Write(plyUntilIrreversible.HasValue
       ? $"{plyUntilIrreversible.Value,W_PIRR} "
       : $"{"-",W_PIRR} ");
-    writer.Write($"{100 * MathF.Abs(node.V - (float)q),W_VERR:F0}");
+    writer.Write($"{100 * MathF.Abs(vDisp - (float)qDisp),W_VERR:F0} ");
+    writer.Write($"{100 * node.LeafValueVolatilityDebiased,W_VOL:F0} ");
+    writer.Write($"{100 * node.RepDrawFraction,W_REPD:F0}");
 
     if (fullDetail)
     {
@@ -233,7 +266,9 @@ public static class MCGSPosGraphNodeDumper
     writer.Write($"{"VUnc",W_UNC} ");
     writer.Write($"{"PUnc",W_UNC} ");
     writer.Write($"{"PIrr",W_PIRR} ");
-    writer.Write($"{"VErr",W_VERR}");
+    writer.Write($"{"VErr",W_VERR} ");
+    writer.Write($"{"Vol",W_VOL} ");
+    writer.Write($"{"RepD",W_REPD}");
     if (fullDetail) writer.Write("  FEN");
     writer.WriteLine();
 
@@ -256,7 +291,9 @@ public static class MCGSPosGraphNodeDumper
     writer.Write($"{new string('-', W_UNC),W_UNC} ");
     writer.Write($"{new string('-', W_UNC),W_UNC} ");
     writer.Write($"{new string('-', W_PIRR),W_PIRR} ");
-    writer.Write($"{new string('-', W_VERR),W_VERR}");
+    writer.Write($"{new string('-', W_VERR),W_VERR} ");
+    writer.Write($"{new string('-', W_VOL),W_VOL} ");
+    writer.Write($"{new string('-', W_REPD),W_REPD}");
     if (fullDetail) writer.Write("  ---");
     writer.WriteLine();
   }
@@ -401,6 +438,16 @@ public static class MCGSPosGraphNodeDumper
         // Stop dumping of N becomes too small
         if (node.N < minN)
         {
+          return;
+        }
+
+        // A node whose policy is still a deferred transposition copy (e.g. freshly created
+        // during deep rollouts) has no materialized edge headers, so neither its child edges
+        // nor ManagerChooseBestMoveMCGS (both used below to advance) may consult it.
+        // Treat it as the leaf of the principal variation.
+        if (node.IsPendingPolicyCopy)
+        {
+          writer.WriteLine("  (leaf: deferred policy copy pending)");
           return;
         }
 

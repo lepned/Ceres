@@ -27,6 +27,7 @@ using Ceres.Chess.NNEvaluators;
 using Ceres.MCTS.Params;
 
 using Ceres.Base.OperatingSystem;
+using Ceres.Features.NetPublishing;
 
 #endregion
 
@@ -85,7 +86,7 @@ namespace Ceres.Commands
       else if (parts.Length > 0 && parts[0].ToUpper() == "UCI")
       {
         // First argument explicit UCI
-        LaunchUCI(cmd.Substring(cmd.IndexOf("UCI ") + 4), searchModifier, selectModifier);
+        LaunchUCI(cmd.Substring(cmd.IndexOf("UCI ", StringComparison.OrdinalIgnoreCase) + 4), searchModifier, selectModifier);
         Environment.Exit(0);
       }
       else if (parts.Length > 0 && parts[0].Contains("="))
@@ -278,10 +279,61 @@ namespace Ceres.Commands
         string options = keys.GetValue("Options");
         InterprocessCommandManager.EnqueueCommand("graph", options);
       }
+
+      else if (featureName == "PUBLISHNET")
+      {
+        KeyValueSetParsed keys = new KeyValueSetParsed(keyValueArgs, null);
+        string configPath = keys.GetRequiredValue("Config", "PUBLISHNET requires Config=<path to JSON config file>");
+        CeresNetGitHubUploader.Run(configPath);
+        Environment.Exit(0);
+      }
+      else if (featureName == "GAME-ANALYZE" || featureName == "GAME-ANALYZE-LC0")
+      {
+        // Positional args: <pgn file> <move number> <time>.
+        // Key=value args (e.g. network=, device=) may appear in any position; they are
+        // distinguished from positionals by the presence of "=".
+        bool isLC0 = featureName == "GAME-ANALYZE-LC0";
+        string cmdName = featureName.ToLower();
+
+        List<string> positionals = new();
+        List<string> keyVals = new();
+        foreach (string part in args.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+        {
+          if (part.Contains("="))
+          {
+            // Accept "net=" as a convenience alias for "network=".
+            keyVals.Add(part.StartsWith("net=", StringComparison.OrdinalIgnoreCase)
+                          ? "network=" + part.Substring(4)
+                          : part);
+          }
+          else
+          {
+            positionals.Add(part);
+          }
+        }
+
+        if (positionals.Count < 3)
+        {
+          ShowErrorExit($"{featureName} requires three arguments: <pgn file> <move number> <time>\r\n"
+                      + $"  Example: {cmdName} game.pgn 105 10s [network=<net> device=<device>]\r\n"
+                      + "  Append \"..\" to the move number to start with Black to move (e.g. 105..).");
+        }
+
+        string startup = $"{positionals[0]} {positionals[1]} {positionals[2]}";
+        if (isLC0)
+        {
+          LaunchUCI(string.Join(" ", keyVals), searchModifier, selectModifier, gameAnalyzeLC0Startup: startup);
+        }
+        else
+        {
+          LaunchUCI(string.Join(" ", keyVals), searchModifier, selectModifier, gameAnalyzeStartup: startup);
+        }
+        Environment.Exit(0);
+      }
       else
       {
         ShowErrorExit("Expected argument to begin with one of the features " +
-                       "UCI, ANALYZE, SUITE, TOURN, SYSBENCH, BACKENDBENCH, BACKENDCOMPARE, BENCHMARK, PERFT, GRAPH or SETOPT");
+                       "UCI, ANALYZE, SUITE, TOURN, SYSBENCH, BACKENDBENCH, BACKENDCOMPARE, BENCHMARK, PERFT, GRAPH, GAME-ANALYZE, GAME-ANALYZE-LC0, PUBLISHNET or SETOPT");
       }
     }
 
@@ -292,7 +344,8 @@ namespace Ceres.Commands
     }
 
 
-    private static void LaunchUCI(string keyValueArgs, Action<ParamsSearch> searchModifier, Action<ParamsSelect> selectModifier)
+    private static void LaunchUCI(string keyValueArgs, Action<ParamsSearch> searchModifier, Action<ParamsSelect> selectModifier,
+                                  string gameAnalyzeStartup = null, string gameAnalyzeLC0Startup = null)
     {
       FeatureUCIParams uciParams = FeatureUCIParams.ParseUCICommand(keyValueArgs);
 
@@ -321,9 +374,17 @@ namespace Ceres.Commands
           backendBenchMCGS,
           searchBenchmarkAction);
 
+        // Inject the live TCEC monitor handler (lives in Ceres.Features, which references
+        // Ceres.MCGS, so it cannot be referenced from inside the MCGS UCI manager directly).
+        ux.TCECMonitorHandler = engine => Ceres.Features.TCEC.TCECMonitor.Run(engine);
+
+        // Inject the Lc0 analysis handler for "game-analyze-lc0" (also lives in Ceres.Features).
+        ux.LC0AnalyzeHandler = a => Ceres.Features.GameEngines.GameAnalyzeLC0Runner.Run(
+                                      a.evaluatorDef, a.fenAndMoves, a.movetimeMs, a.outWriter);
+
         Console.WriteLine();
         Console.WriteLine("Entering UCI command processing mode (MCGS v2).");
-        ux.PlayUCI();
+        ux.PlayUCI(gameAnalyzeStartup, gameAnalyzeLC0Startup);
       }
       else
       {
@@ -343,6 +404,11 @@ namespace Ceres.Commands
           CeresUserSettingsManager.Settings.SearchLogFile,
           backendBenchMCTS,
           searchBenchmarkAction);
+
+        if (gameAnalyzeStartup != null || gameAnalyzeLC0Startup != null)
+        {
+          Console.WriteLine("WARNING: the game-analyze / game-analyze-lc0 features require MCGS (v2) mode; ignoring startup analysis request.");
+        }
 
         Console.WriteLine();
         Console.WriteLine("Entering UCI command processing mode (MCTS v1).");

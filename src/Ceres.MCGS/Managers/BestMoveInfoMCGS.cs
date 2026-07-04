@@ -58,7 +58,8 @@ public record BestMoveInfoMCGS
     SearchResult,
 
     /// <summary>
-    /// BestMoveModeEnum is set to TopV (play best move based on value head).
+    /// The move was forced via MCGSManager.TopVForcedMove
+    /// (best move chosen directly from the value or action head in 1-node searches).
     /// </summary>
     TopVMove,
 
@@ -118,6 +119,14 @@ public record BestMoveInfoMCGS
   /// Best move in this position.
   /// </summary>
   public MGMove BestMove;
+
+  /// <summary>
+  /// Optional concise diagnostic note naming the mechanism that selected the played move when it
+  /// differs from the most-visited (top-N) move: "best-Q", "minimax", "irreversible", or "drp-avoid".
+  /// Null when the played move is simply the top-N move. Diagnostic only (consumed by the minilog);
+  /// it does not affect play.
+  /// </summary>
+  public string SelectionNote { get; set; }
 
 
   /// <summary>

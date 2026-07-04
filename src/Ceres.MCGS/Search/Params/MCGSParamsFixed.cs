@@ -37,6 +37,17 @@ public static class MCGSParamsFixed
   /// </summary>
   public const bool GRAPH_REWRITE_DUMP_REUSE_DIAGNOSTICS = true;
 
+  public const bool DUMP_EARLY_SMOOTHING_BOOST = false;
+
+  /// <summary>
+  /// If true, the game limit manager (ManagerGameLimitCeresMCGS) emits one
+  /// comprehensive line per move to the console showing every input and
+  /// intermediate factor that produced the time/nodes allocation, the return
+  /// path taken, and the final allocated value (with the binding clamp, if any).
+  /// Intended as a debugging/analysis convenience; has no effect on play.
+  /// </summary>
+  public const bool DUMP_LIMIT_CALC = false;
+
   public const bool LOG_LIVE_STATS = false;
 
   /// <summary>
@@ -44,6 +55,37 @@ public static class MCGSParamsFixed
   /// If false, uses ExtendibleConcurrentHashMap which avoids stop-the-world resize pauses.
   /// </summary>
   public const bool USE_LEGACY_CONCURRENT_DICTIONARY = false;
+
+  #region Transposition dictionary initial sizing
+
+  // The per-graph transposition dictionaries are "right-sized" up front from the search budget
+  // (see MCGSSearch.EstimateInitialDictionaryCapacity) or, on the reuse/rewrite path, from the exact
+  // reachable-set size (see GraphExtractor). This avoids a cascade of incremental growths as a long
+  // search climbs from a small default to tens of millions of entries: directory doublings plus
+  // per-bucket pre-allocation with the extendible map, or stop-the-world rehashes with the legacy
+  // ConcurrentDictionary. The estimate only sets the STARTING capacity; the map still grows if needed.
+
+  /// <summary>
+  /// Floor for the initial transposition dictionary capacity hint (entries). Keeps tiny searches
+  /// (e.g. a single-node probe) from over-allocating while still avoiding a pathologically small start.
+  /// </summary>
+  public const int DICTIONARY_SIZE_HINT_MIN = 16_384;
+
+  /// <summary>
+  /// Ceiling for the initial transposition dictionary capacity hint (entries). Bounds the up-front
+  /// allocation (the extendible map pre-allocates one bucket object per (capacity / bucket-capacity)
+  /// directory slot), so even a very large search budget cannot reserve an unreasonable amount of
+  /// memory before any search work is done.
+  /// </summary>
+  public const int DICTIONARY_SIZE_HINT_MAX = 300_000_000;
+
+  /// <summary>
+  /// Multiplier applied to the estimated per-move search-node count to anticipate the accumulation of
+  /// distinct positions across the multiple moves that share a single (reused) graph.
+  /// </summary>
+  public const double DICTIONARY_SIZE_HINT_REUSE_ACCUM_FACTOR = 30.0;
+
+  #endregion
 
   public const bool DEBUG_MODE = false;
   public const bool LOGGING_ENABLED = false; // performance degradation high when in Debug mode
@@ -69,7 +111,7 @@ public static class MCGSParamsFixed
   /// This limits incurring the performance cost to only situations where there is a
   /// large potential benefit from immediate propagation.
   /// </summary>
-  public const double PROPAGATE_OFF_VISIT_PARENTS_MIN_Q_DELTA = 0.01;
+  public const double PROPAGATE_OFF_VISIT_PARENTS_MIN_Q_DELTA = 0.005;
 
 
   /// <summary>
@@ -77,6 +119,7 @@ public static class MCGSParamsFixed
   /// are used to compute and apply an updated Q value to the parent node.
   /// This propagates Q updates to other children (off the current visit path)
   /// that may have happened since the parent node was last visited.
+  /// Tests confirm this reset very beneficial. 
   /// </summary>
   public const bool RESET_Q_DURING_SELECT_PHASE_FROM_ALL_CHILDREN = true;
 
@@ -86,22 +129,19 @@ public static class MCGSParamsFixed
   public const bool UPDATE_MAXQ_SUBOPTIMALITY = false;
 
   /// <summary>
-  /// Depth in the to which a depth-first attempt is made to
-  /// back out draw by repetitions visits which are invalidated
-  /// by a change on search root (0 to disable).
-  /// 
-  /// WARNING: Levels greater than 1 are less well tested.
-  /// </summary>
-  public const int POSITION_MODE_DEPTH_BACKUP_INVALIDATED_REPETITION = 0;
-
-  /// <summary>
   /// If siblings should choose max(N) for Q.
   /// Tests at 45s+0.75s suggest Elo at least 10 worse when enabled.
   /// </summary>
   public const bool USE_PSEUDOTRANSPOSITION_MAX_N_NODE_ONLY = false;
 
   public const float SIBLING_POWER_SHRINK_SIBLING_N = 1;
-  public const float SIBLING_WT_MAX_FRACTION = 0.65f;
+
+  /// <summary>
+  ///  The fraction of weight used for sibling values when in 
+  ///  PositionAndHistory mode.
+  ///  Suite tests suggested values less than 0.65 are better, for example 0.4 or 0.5.
+  /// </summary>
+  public const float SIBLING_WT_MAX_FRACTION = 0.50f;
 
   public const float MOVE_ORDERING_MIN_RATIO_POLICY = 0.15f;
 
@@ -119,7 +159,6 @@ public static class MCGSParamsFixed
   public const bool ENABLE_DRAW_KNOWN_TO_EXIST = true; // possibly small benefit? (+3 Elo at 3k nodes)
 
   public const bool FIX_DRP_NEEDS_3_BEFORE_ROOT = true;
-  public const bool FIX_REUSE_GRAPH_DRAW_AT_ROOT = true;
 
   /// <summary>
   /// If the redescent multiplier should be adjusted higher
@@ -128,6 +167,16 @@ public static class MCGSParamsFixed
   /// However a longer test (180+3 with T3D) was only +2 Elo.
   /// </summary>
   public const bool REDESCENT_MUTIPLIER_ADJUST = true;
+
+
+  /// <summary>
+  /// When stochastic redescent mode is enabled (ParamsSearch.RedescentStochasticProbability > 0),
+  /// descent through a transposition node is forced (never short-circuited to the cached subtree
+  /// value) while the parent node has fewer than this many visits. This warmup guarantees that
+  /// freshly created / barely-explored nodes receive some genuine deepening before the
+  /// transposition-stop short-circuit (IsTranspositionSufficientN) is permitted to apply.
+  /// </summary>
+  public const int REDESCENT_STOCHASTIC_FORCE_BELOW_PARENT_N = 5;
 
 
   // In tests, perhaps especially as N gets larger (e.g. 10000+), numbers less than 0.7 are better (e.g. 0.6 or 0.5)
@@ -139,6 +188,14 @@ public static class MCGSParamsFixed
   public const bool LARGE_HARDWARE_CONFIG = true;
 
   public const bool TRACK_NODE_EDGE_UNCERTAINTY = false; // methodology is problematic due to aggregated backups
+
+  /// <summary>
+  /// If true, after every search completes the engine automatically emits the full search
+  /// information dump (identical to issuing the UCI "dump-info" command) followed by a
+  /// revaluation analysis (identical to "revalue-root N" with N = root N / 20), without being
+  /// explicitly requested. Intended as a debugging/analysis convenience.
+  /// </summary>
+  public const bool ALWAYS_DUMP_SEARCH_INFO = false;
 
   /// <summary>
   /// Minimum probability threshold for top policy move to be considered for PV auto-extension.

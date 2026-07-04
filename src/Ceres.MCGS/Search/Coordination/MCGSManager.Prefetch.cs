@@ -96,7 +96,7 @@ public partial class MCGSManager
     const bool HAS_ACTION = false;
     const bool HAS_STATE = false;
 
-    Graph graph = new(1_000, HAS_ACTION, HAS_STATE, GRAPH_ENABLED, false, false, false, PositionWithHistory.StartPosition, false);
+    Graph graph = new(1_000, HAS_ACTION, HAS_STATE, GRAPH_ENABLED, false, false, false, PositionWithHistory.StartPosition, false, false);
     GNode rootForRecursivePreload = graph.GraphRootNode;
 
     //      if (BUILD_TREE_MODE)
@@ -181,7 +181,8 @@ public partial class MCGSManager
     //      Console.WriteLine(searchLimit.HardMaxNumFinalNodes());
     //      searchLimit.HardMaxNumFinalNodes = targetNumVisits + 1000;
 
-    RunLoopUntilGraphSize(pos, SearchLimit.NodesPerMove(targetNumVisits));
+    throw new NotImplementedException("Next line needs remediation");
+    //RunLoopUntilGraphSize(pos, SearchLimit.NodesPerMove(targetNumVisits));
 
     if (debugMode)
     {
@@ -197,7 +198,6 @@ public partial class MCGSManager
       Engine.Graph.Validate(true);
 
       //        int numWasted = numNodes - numVisited;
-      //        Console.WriteLine($"Batches {SelectTerminatorNeuralNet.CountTotalBatches}, positions {SelectTerminatorNeuralNet.CountTotalPositions}");
       //        Console.WriteLine($"Num nodes {numNodes}, num visited {numVisited}, prefetched {totalPrefetched}, wasted {numWasted}");
     }
   }

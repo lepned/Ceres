@@ -128,6 +128,21 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
   // If not null, this is the index of the visit at which backup should resume (after a split or a backup resumption)
   public short? PendingResumptionNextSlotToUse;
 
+  /// <summary>
+  /// If this path was launched by MCGSManager.DoSearchInnerNodes (a rollout that begins
+  /// at a specified inner node rather than the search root), this is that inner start node.
+  /// Null for ordinary paths. Used to map a completed path back to its originating node
+  /// (for example to detect when a node's rollout reached a terminal leaf).
+  /// </summary>
+  internal GNode InnerSearchStartNode;
+
+  /// <summary>
+  /// When InnerSearchStartNode is set, the number of forced prefix visits from the search root
+  /// down to that start node (its depth from the search root). The depth descended below the
+  /// start node is then NumVisitsInPath - InnerSearchStartDepth.
+  /// </summary>
+  internal int InnerSearchStartDepth;
+
   #endregion
 
   /// <summary>
@@ -150,6 +165,8 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
     RunningHash = default;
     NumVisitsInPath = default;
     PendingResumptionNextSlotToUse = default;
+    InnerSearchStartNode = default;
+    InnerSearchStartDepth = default;
     // Note: PlySinceLastMove and PlySinceLastMoveTemp are NOT reset here.
     // They are value types that are re-populated when the path is initialized in ExtendPathsRecursively.
     // Their contents are overwritten when Engine.NeedsPlySinceLastMove is true.
@@ -602,6 +619,8 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
     splittingPath.NumVisitsInPath = this.NumVisitsInPath;
     splittingPath.TerminationReason = this.TerminationReason;
     splittingPath.MaxQSubOptimality = this.MaxQSubOptimality;
+    splittingPath.InnerSearchStartNode = this.InnerSearchStartNode;
+    splittingPath.InnerSearchStartDepth = this.InnerSearchStartDepth;
 
     splittingPath.RunningHash = this.RunningHash;
     if (moveWasIrreversibleMove)
@@ -1125,10 +1144,15 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
   {
     ReadOnlySpan<PosHash64> prehistoryHashes = graph.Store.HistoryHashes.PriorPositionsHashes64;
 
-    // Process all nodes (if any) from the search root node up to the graph root node.
-    // Do not process the node at index 0 (search root node) since it is already tested by caller.
+    // Process the spine nodes from the search root down to (and including) the first node below the graph root.
+    // NOTE: element ^1 is the search root and element 0 is the first node BELOW the graph root.
+    // (The previous bound of i >= 1 skipped element 0 under the mistaken belief that index 0 was the
+    //  search root, thereby missing repetitions against the position just below the graph root, which
+    //  is checked nowhere else.) We still iterate element ^1 because the irreversibility of the move INTO
+    //  the search root must act as a cutoff; its hash compare is harmless because all callers exclude
+    //  child == search root before calling this method.
     int arrayLength = nodesGraphToSearchRoot.Length;
-    for (int i = arrayLength - 1; i >= 1; i--)
+    for (int i = arrayLength - 1; i >= 0; i--)
     {
       ref readonly GraphRootToSearchRootNodeInfo nodeFromGraphRootToSearchRoot = ref nodesGraphToSearchRoot[i];
       Debug.Assert(nodeFromGraphRootToSearchRoot.ChildNode.HashStandalone == nodeFromGraphRootToSearchRoot.ChildHashStandalone64);
@@ -1148,10 +1172,14 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
       }
     }
 
-    // Process all prehistory visits (this will also include the root node move).
-    // TODO: For efficiency add tracking and checking of irreversibility also in the prehistory.
+    // Process prehistory positions from newest (the graph root) back toward the start of the game,
+    // stopping at the most recent irreversible move: a position before an irreversible move can never
+    // be a repetition of any position in the current reversible run (a pawn move or capture changes the
+    // board permanently). MoveAfterPositionWasIrreversible[j] is true when the move played FROM
+    // prehistory position j (into position j+1) was irreversible.
+    bool[] prehistoryMoveIrreversible = graph.Store.HistoryHashes.MoveAfterPositionWasIrreversible;
     int numPriorPositions = prehistoryHashes.Length;
-    for (int i = 0; i < numPriorPositions; i++)
+    for (int i = numPriorPositions - 1; i >= 0; i--)
     {
       if (prehistoryHashes[i] == matchHashValue)
       {
@@ -1160,6 +1188,70 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
           return true;
         }
         haveSeenRepetition = true;
+      }
+
+      // Stop once the move leading into position i was irreversible (nothing earlier can be a repetition).
+      if (i == 0 || prehistoryMoveIrreversible[i - 1])
+      {
+        break;
+      }
+    }
+
+    return false;
+  }
+
+
+  /// <summary>
+  /// Cheap necessary-condition test for whether ReconcileDrawByRepetitions could possibly do anything
+  /// at the current search root, used to skip its tree walk when provably a no-op.
+  ///
+  /// An edge is reconciled only when its child board is a history-level repetition, i.e. when
+  /// HashFoundInGraphRootPathOrPrehistory returns true - which (under FIX_DRP_NEEDS_3_BEFORE_ROOT)
+  /// requires that board to already appear at least TWICE within the spine+prehistory reversible run.
+  /// So a reconcilable edge can exist only if SOME board already recurs in that run. This scans the run
+  /// once (O(rule50)) with the identical irreversibility cutoffs as HashFoundInGraphRootPathOrPrehistory
+  /// and returns whether such a recurrence exists; when it does not, the whole reconciliation is skippable.
+  /// (Without the seen-twice gate the threshold is one, i.e. any non-empty reversible run qualifies.)
+  /// </summary>
+  public static bool SpinePrehistoryHasRepetitionTarget(Graph graph,
+                                                        ReadOnlySpan<GraphRootToSearchRootNodeInfo> nodesGraphToSearchRoot)
+  {
+    bool needTwo = MCGSParamsFixed.FIX_DRP_NEEDS_3_BEFORE_ROOT;
+    HashSet<PosHash64> seen = new();
+
+    // Spine: search root (^1) back toward the graph root, stopping at the move into the reversible run.
+    for (int i = nodesGraphToSearchRoot.Length - 1; i >= 0; i--)
+    {
+      if (!seen.Add(nodesGraphToSearchRoot[i].ChildHashStandalone64))
+      {
+        return true;                  // board appears >= 2x within the run
+      }
+      if (!needTwo)
+      {
+        return true;                  // seen-once gate: any board in a non-empty run is a target
+      }
+      if (nodesGraphToSearchRoot[i].MoveToChildIrreversible)
+      {
+        return false;                 // reversible run cut here; older positions cannot repeat into it
+      }
+    }
+
+    // Prehistory: newest (graph root) back, stopping at the most recent irreversible move.
+    ReadOnlySpan<PosHash64> prehistoryHashes = graph.Store.HistoryHashes.PriorPositionsHashes64;
+    bool[] prehistoryMoveIrreversible = graph.Store.HistoryHashes.MoveAfterPositionWasIrreversible;
+    for (int i = prehistoryHashes.Length - 1; i >= 0; i--)
+    {
+      if (!seen.Add(prehistoryHashes[i]))
+      {
+        return true;
+      }
+      if (!needTwo)
+      {
+        return true;
+      }
+      if (i == 0 || prehistoryMoveIrreversible[i - 1])
+      {
+        break;
       }
     }
 

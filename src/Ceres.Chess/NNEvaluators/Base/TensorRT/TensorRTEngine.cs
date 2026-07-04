@@ -220,6 +220,115 @@ public sealed class TensorRTEngine : IDisposable
 
 
   /// <summary>
+  /// Reads the cached multi-profile serialized engine (.plan) blob for these parameters into a
+  /// native heap buffer WITHOUT deserializing. Uses the same arch-keyed cache filename as
+  /// <see cref="LoadMultiProfileWithCache"/>, so homogeneous GPUs resolve to the same file.
+  /// Returns true with the buffer/size on a valid, non-stale cache hit (free via
+  /// <see cref="FreeMultiProfileBlob"/>); returns false (blob == IntPtr.Zero) when the cache is
+  /// absent or stale, in which case the caller should build through the normal cached path.
+  /// Throws only on a genuine native error.
+  /// </summary>
+  public static unsafe bool TryReadMultiProfileBlobFromCache(string onnxPath, int[] batchSizes,
+      TensorRTBuildOptions options, int deviceId, string cacheDir, out IntPtr blob, out long size)
+  {
+    int numProfiles = batchSizes.Length;
+    int result;
+    fixed (int* sizesPtr = batchSizes)
+    {
+      result = TensorRTNative.ReadMultiProfileBlobFromCache(onnxPath, sizesPtr, numProfiles,
+          ref options, deviceId, cacheDir, out blob, out size);
+    }
+
+    if (result == 0)
+    {
+      return true;
+    }
+    if (result > 0)
+    {
+      // Cache absent or stale — not an error; caller routes through the build path.
+      blob = IntPtr.Zero;
+      size = 0;
+      return false;
+    }
+
+    string error = TensorRTNative.GetLastErrorString();
+    throw new InvalidOperationException($"Failed to read cached multi-profile blob ({result}): {error ?? "unknown error"}");
+  }
+
+
+  /// <summary>
+  /// Deserializes an in-memory serialized multi-profile engine blob onto <paramref name="deviceId"/>
+  /// and returns one TensorRTEngine per batch size (each with its own execution context, sharing the
+  /// freshly-deserialized ICudaEngine). The native call does not hold the global lock across the
+  /// deserialize, so this may be invoked concurrently for distinct devices (parallel homogeneous
+  /// multi-GPU loads). The blob must match this device's architecture (caller guarantees homogeneity).
+  /// </summary>
+  public static unsafe TensorRTEngine[] DeserializeMultiProfileFromBuffer(IntPtr blob, long size,
+      int[] batchSizes, TensorRTBuildOptions options, int deviceId, string sourcePath)
+  {
+    int numProfiles = batchSizes.Length;
+    IntPtr* handles = stackalloc IntPtr[numProfiles];
+
+    int result;
+    fixed (int* sizesPtr = batchSizes)
+    {
+      result = TensorRTNative.DeserializeMultiProfileFromBuffer(blob, size, sizesPtr, numProfiles,
+          ref options, deviceId, handles);
+    }
+
+    if (result != 0)
+    {
+      string error = TensorRTNative.GetLastErrorString();
+      throw new InvalidOperationException($"Failed to deserialize multi-profile engine from buffer ({result}): {error ?? "unknown error"}");
+    }
+
+    TensorRTEngine[] engines = new TensorRTEngine[numProfiles];
+    for (int i = 0; i < numProfiles; i++)
+    {
+      engines[i] = new TensorRTEngine(handles[i], batchSizes[i], sourcePath, wasLoadedFromCache: true);
+    }
+    return engines;
+  }
+
+
+  /// <summary>
+  /// Frees a native buffer returned by <see cref="TryReadMultiProfileBlobFromCache"/>.
+  /// </summary>
+  public static void FreeMultiProfileBlob(IntPtr blob)
+  {
+    if (blob != IntPtr.Zero)
+    {
+      TensorRTNative.FreeBlob(blob);
+    }
+  }
+
+
+  /// <summary>
+  /// Creates a new TensorRTEngine whose execution context SHARES the already-deserialized
+  /// native engine (weights) owned by <paramref name="reference"/>, rather than deserializing
+  /// the engine again. The clone gets its own execution context / streams / GPU buffers, so it
+  /// can be used concurrently with the reference. The underlying engine is ref-counted natively
+  /// and freed only once the reference and all clones are disposed (disposal order independent).
+  /// </summary>
+  public static TensorRTEngine CloneSharingEngine(TensorRTEngine reference, int deviceId)
+  {
+    if (reference == null)
+    {
+      throw new ArgumentNullException(nameof(reference));
+    }
+
+    int result = TensorRTNative.CloneContextSharingEngine(reference.handle, deviceId, out IntPtr newHandle);
+    if (result != 0 || newHandle == IntPtr.Zero)
+    {
+      string error = TensorRTNative.GetLastErrorString();
+      throw new InvalidOperationException($"Failed to clone shared engine context ({result}): {error ?? "unknown error"}");
+    }
+
+    return new TensorRTEngine(newHandle, reference.BatchSize, reference.SourcePath, wasLoadedFromCache: true);
+  }
+
+
+  /// <summary>
   /// Load a pre-built multi-profile engine file (.engine) directly.
   /// Deserializes the engine and creates N execution contexts, one per batch size.
   /// Bypasses ONNX parsing and cache validation — useful for loading
@@ -809,9 +918,14 @@ public sealed class TensorRTEngine : IDisposable
   /// Synchronizes the specified CUDA stream, blocking until all operations complete.
   /// </summary>
   /// <param name="streamIdx">Stream index (0 or 1)</param>
-  public void SyncStream(int streamIdx)
+  /// <summary>
+  /// Waits for the given stream's work to complete. <paramref name="count"/> is the per-GPU
+  /// batch size being synced; the native layer uses it to pick spin vs block sync in "auto"
+  /// mode (spin for small batches where the wakeup latency dominates, block otherwise).
+  /// </summary>
+  public void SyncStream(int streamIdx, int count)
   {
-    int result = TensorRTNative.SyncStreamIdx(handle, streamIdx);
+    int result = TensorRTNative.SyncStreamIdx(handle, streamIdx, count);
     if (result != 0)
     {
       throw new InvalidOperationException($"SyncStreamIdx failed on stream {streamIdx}");

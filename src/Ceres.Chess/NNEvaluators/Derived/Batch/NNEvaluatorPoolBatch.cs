@@ -50,6 +50,12 @@ namespace Ceres.Chess.NNEvaluators
     /// </summary>
     internal PositionEvaluationBatch[] completedBatches;
 
+    /// <summary>
+    /// If non-null, an exception that occurred while processing this pooled batch.
+    /// The waiting caller(s) rethrow this rather than the worker thread terminating the process.
+    /// </summary>
+    internal Exception ProcessingException;
+
 
     /// <summary>
     /// Processes the current set of batches by:
@@ -94,10 +100,23 @@ namespace Ceres.Chess.NNEvaluators
       ulong[] posPlaneBitmaps = new ulong[numPositions * EncodedPositionWithHistory.NUM_PLANES_TOTAL];
       byte[] posPlaneValuesEncoded = new byte[numPositions * EncodedPositionWithHistory.NUM_PLANES_TOTAL];
 
-      bool hasPositions = !pendingBatches[0].Positions.IsEmpty;
-      bool hasMoves = !pendingBatches[0].Moves.IsEmpty;
-      bool hasHashes = !pendingBatches[0].PositionHashes.IsEmpty;
-      bool hasPliesSincePerSquare = !pendingBatches[0].LastMovePlies.IsEmpty;
+      // When pooling across multiple independent searches the sub-batches may be heterogeneous
+      // (e.g. some carry optional auxiliary inputs while others do not, or some are empty), so the
+      // first batch is not necessarily representative. Detect each optional field across ALL batches,
+      // allocate it if any batch supplies it, and copy per-batch only where present.
+      bool hasPositions = false;
+      bool hasMoves = false;
+      bool hasHashes = false;
+      bool hasPliesSincePerSquare = false;
+      bool hasPositionsBuffer = false;
+      foreach (EncodedPositionBatchFlat scanBatch in pendingBatches)
+      {
+        if (scanBatch.Positions != null) { hasPositions = true; }
+        if (scanBatch.Moves != null) { hasMoves = true; }
+        if (scanBatch.PositionHashes != null) { hasHashes = true; }
+        if (scanBatch.LastMovePlies != null) { hasPliesSincePerSquare = true; }
+        if (scanBatch.PositionsBuffer != null && scanBatch.PositionsBuffer.Length > 0) { hasPositionsBuffer = true; }
+      }
 
       MGPosition[] positions = hasPositions ? new MGPosition[numPositions] : null;
       ulong[] positionHashes = hasHashes ? new ulong[numPositions] : null;
@@ -105,38 +124,54 @@ namespace Ceres.Chess.NNEvaluators
 
       MGMoveList[] moves = hasMoves ? new MGMoveList[numPositions] : null;
 
+      // The raw encoded positions (needed by TPG/Ceres nets that re-convert positions at eval time, e.g.
+      // when EncodedPositionBatchFlat.RETAIN_POSITION_INTERNALS is set) must also be carried through the
+      // aggregation, otherwise the combined batch's PositionsBuffer is empty and TPG conversion throws.
+      EncodedPositionWithHistory[] positionsBuffer = hasPositionsBuffer ? new EncodedPositionWithHistory[numPositions] : null;
+
       int nextSourceBitmapIndex = 0;
       int nextSourceValueIndex = 0;
       int nextPositionIndex = 0;
       foreach (EncodedPositionBatchFlat thisBatch in pendingBatches)
       {
-        int skipCount = thisBatch.NumPos * EncodedPositionWithHistory.NUM_PLANES_TOTAL;
+        int numPos = thisBatch.NumPos;
+        if (numPos == 0)
+        {
+          continue;
+        }
+
+        int skipCount = numPos * EncodedPositionWithHistory.NUM_PLANES_TOTAL;
         Array.Copy(thisBatch.PosPlaneBitmaps, 0, posPlaneBitmaps, nextSourceBitmapIndex, skipCount);
         nextSourceBitmapIndex += skipCount;
         Array.Copy(thisBatch.PosPlaneValues, 0, posPlaneValuesEncoded, nextSourceValueIndex, skipCount);
         nextSourceValueIndex += skipCount;
 
-        if (hasPositions)
+        if (hasPositions && thisBatch.Positions != null)
         {
-          Array.Copy(thisBatch.Positions, 0, positions, nextPositionIndex, thisBatch.NumPos);
+          Array.Copy(thisBatch.Positions, 0, positions, nextPositionIndex, numPos);
         }
 
-        if (hasHashes)
+        if (hasHashes && thisBatch.PositionHashes != null)
         {
-          Array.Copy(thisBatch.PositionHashes, 0, positionHashes, nextPositionIndex, thisBatch.NumPos);
+          Array.Copy(thisBatch.PositionHashes, 0, positionHashes, nextPositionIndex, numPos);
         }
 
-        if (hasPliesSincePerSquare)
+        if (hasPliesSincePerSquare && thisBatch.LastMovePlies != null)
         {
-          Array.Copy(thisBatch.LastMovePlies, 0, pliesSinceLastSquare, nextPositionIndex * 64, thisBatch.NumPos * 64);
+          Array.Copy(thisBatch.LastMovePlies, 0, pliesSinceLastSquare, nextPositionIndex * 64, numPos * 64);
         }
 
-        if (hasMoves)
+        if (hasMoves && thisBatch.Moves != null)
         {
-          Array.Copy(thisBatch.Moves, 0, moves, nextPositionIndex, thisBatch.NumPos);
+          Array.Copy(thisBatch.Moves, 0, moves, nextPositionIndex, numPos);
         }
 
-        nextPositionIndex += thisBatch.NumPos;
+        if (hasPositionsBuffer && thisBatch.PositionsBuffer != null && thisBatch.PositionsBuffer.Length > 0)
+        {
+          Array.Copy(thisBatch.PositionsBuffer, 0, positionsBuffer, nextPositionIndex, numPos);
+        }
+
+        nextPositionIndex += numPos;
       }
 
       fullBatch = new EncodedPositionBatchFlat(posPlaneBitmaps, posPlaneValuesEncoded, null, null, null, numPositions);
@@ -159,6 +194,12 @@ namespace Ceres.Chess.NNEvaluators
       if (hasMoves)
       {
         fullBatch.Moves = moves;
+      }
+
+      if (hasPositionsBuffer)
+      {
+        // PositionsBuffer is a settable field on the concrete type (get-only on the interface).
+        ((EncodedPositionBatchFlat)fullBatch).PositionsBuffer = positionsBuffer;
       }
 
       return fullBatch;

@@ -35,8 +35,14 @@ public partial class MCGSPathsSet : IDisposable
 
   /// <summary>
   /// The set of paths to be processed.
+  ///
+  /// A preallocated ListBounded (rather than a ConcurrentQueue) so the per-batch Reset
+  /// reuses the same backing array instead of orphaning the queue's internal segments to
+  /// the GC every batch. Filled lock-free during parallel select via AddConcurrent (all
+  /// readers run only after the select-phase worker-pool barrier). Sized to the path pool
+  /// capacity (maxBatchSize + 5; see MCGSIterator.paths), which hard-bounds the path count.
   /// </summary>
-  public readonly ConcurrentQueue<MCGSPath> Paths;
+  public readonly ListBounded<MCGSPath> Paths;
 
   /// <summary>
   /// Total number of paths processed (including aborted).
@@ -68,6 +74,44 @@ public partial class MCGSPathsSet : IDisposable
   /// </summary>
   public readonly ListBounded<MCGSPath> NNPaths;
 
+  /// <summary>
+  /// Maximum number of NN evaluation paths allowed in this batch (int.MaxValue when unarmed).
+  /// Armed only during the second "fill to evaluator capacity" selection pass so that the
+  /// fill cannot (materially) overshoot the evaluator's padded batch capacity, which would
+  /// spill into an additional engine launch. Checked via NNEvalBudgetExhausted in
+  /// MCGSSelect.CapacityAbortNeeded (further descents are aborted once the budget is reached).
+  /// </summary>
+  internal int NNEvalSlotLimit = int.MaxValue;
+
+  /// <summary>
+  /// If the number of NN evaluation paths has reached the armed limit (see NNEvalSlotLimit).
+  /// </summary>
+  internal bool NNEvalBudgetExhausted => NNPaths.Count >= NNEvalSlotLimit;
+
+  /// <summary>
+  /// Records of visits abandoned mid-frame during select (expansion blocked by lock
+  /// contention, suboptimality rejection) whose ledger backout (ancestor visits'
+  /// attempted/pending counters and edge in-flight counts) must be applied at the START
+  /// of the backup phase. The backout walks ancestor path-segment slots; doing that
+  /// during select would race with concurrent growth of those segments by other select
+  /// workers (ArraySegmentRef.EnsureSize reallocates and copies the storage), so the
+  /// records are deferred to the quiescent backup phase (see MCGSSelect.ApplyDroppedVisits).
+  /// </summary>
+  internal readonly ConcurrentQueue<(MCGSPath path, int numSlotsUsed, int numVisits)> PendingDroppedVisits = new();
+
+  /// <summary>
+  /// Records that numVisits assigned down this path are being abandoned at its current
+  /// position (capturing the current slot count so the later backout walks exactly the
+  /// ancestors as of this point, even if the path is subsequently extended).
+  /// </summary>
+  internal void RecordDroppedVisits(MCGSPath path, int numVisits)
+  {
+    if (path.NumVisitsInPath > 0)
+    {
+      PendingDroppedVisits.Enqueue((path, path.numSlotsUsed, numVisits));
+    }
+  }
+
 
   private bool disposedValue;
 
@@ -80,7 +124,8 @@ public partial class MCGSPathsSet : IDisposable
   public MCGSPathsSet(MCGSIterator parentIterator, int maxBatchSize)
   {
     ParentIterator = parentIterator;
-    Paths = new ConcurrentQueue<MCGSPath>();
+    // Sized to match the iterator's path pool (maxBatchSize + 5), which caps the number of paths.
+    Paths = new ListBounded<MCGSPath>(maxBatchSize + 5);
     NNPaths = new ListBounded<MCGSPath>(maxBatchSize);
  }
 
@@ -115,14 +160,16 @@ public partial class MCGSPathsSet : IDisposable
 
       if (path.TerminationReason == MCGSPathTerminationReason.PendingNeuralNetEval)
       {
-        lock (NNPaths)
-        {
-          NNPaths.Add(path);
-        }
+        // Lock-free: NNPaths is preallocated to maxBatchSize and all readers run only
+        // after the select-phase barrier (worker pool WaitAll), so slot reservation via
+        // Interlocked suffices and the prior Monitor lock (a contention point under
+        // parallel select) is unnecessary.
+        NNPaths.AddConcurrent(path);
       }
     }
 
-    Paths.Enqueue(path);
+    // Lock-free add (same barrier rules as NNPaths above); preallocated so no per-batch GC churn.
+    Paths.AddConcurrent(path);
   }
 
 
@@ -132,8 +179,13 @@ public partial class MCGSPathsSet : IDisposable
   /// </summary>
   public void Reset()
   {
-    Paths.Clear();
+    // Clear(false): just resets the count (keeps the backing array); stale references beyond
+    // the new length are never read (all access is bounded by Count) and stay alive via the
+    // iterator's path pool anyway, so zeroing would be wasted work.
+    Paths.Clear(false);
     NNPaths.Clear();
+    NNEvalSlotLimit = int.MaxValue;
+    PendingDroppedVisits.Clear();
     Array.Clear(PathLengthDistribution, 0, PathLengthDistribution.Length);
   }
 

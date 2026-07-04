@@ -22,7 +22,7 @@ namespace Ceres.Commands
 {
   internal static class HelpCommands
   {
-    internal const string VALID_COMMANDS = "HELP, UCI, ANALYZE, SUITE, TOURN, SYSBENCH, BACKENDBENCH, BENCHMARK, GRAPH, SETOPT or SETUP";
+    internal const string VALID_COMMANDS = "HELP, UCI, ANALYZE, SUITE, TOURN, SYSBENCH, BACKENDBENCH, BENCHMARK, GRAPH, GAME-ANALYZE, GAME-ANALYZE-LC0, SETOPT or SETUP";
 
     internal static void ProcessHelpCommand(string cmd)
     {
@@ -55,6 +55,10 @@ namespace Ceres.Commands
         DumpHelpText(CERES_HELP_BENCHMARK);
       else if (parts[1] == "GRAPH")
         DumpHelpText(CERES_HELP_GRAPH);
+      else if (parts[1] == "GAME-ANALYZE")
+        DumpHelpText(CERES_HELP_GAME_ANALYZE);
+      else if (parts[1] == "GAME-ANALYZE-LC0")
+        DumpHelpText(CERES_HELP_GAME_ANALYZE_LC0);
       else
         DispatchCommands.ShowErrorExit($"Unrecognized command {parts[1]}, try " + HelpCommands.VALID_COMMANDS);
       System.Environment.Exit(0);
@@ -129,6 +133,27 @@ namespace Ceres.Commands
     Example               : Ceres GRAPH options=0
 ";
 
+    const string CERES_HELP_GAME_ANALYZE =
+@"  GAME-ANALYZE - Locate a position (or range of positions) in a PGN file by move number, analyze each for a fixed time, dump search detail, then remain in UCI mode pre-positioned for further analysis (MCGS/v2 only).
+    Required positional args : <pgn file> <move number or range> <time>
+                               move number: e.g. 105 (move 105, White to move) or 105.. (move 105, Black to move)
+                               range:       <start>-<end>, e.g. 1-9999 (effectively all moves) or ..7-..12 (Black's 7th through Black's 12th move).
+                                            Every position between the endpoints (inclusive) is analyzed in game order, reusing the search graph from one position to the next.
+                               time:        e.g. 10s, 500ms, 1m (a bare number is interpreted as seconds)
+    Optional key/values      : { network, device }  (may appear in any position)
+    Example                  : Ceres GAME-ANALYZE game.pgn 105 10s network=~T79 device=GPU:0
+    Example (range)          : Ceres GAME-ANALYZE game.pgn ..7-..12 10s network=~T79 device=GPU:0
+";
+
+    const string CERES_HELP_GAME_ANALYZE_LC0 =
+@"  GAME-ANALYZE-LC0 - Like GAME-ANALYZE, but runs the fixed-time analysis with an Lc0 engine (configured from the current network/device), streaming Lc0's UCI output. When done, closes Lc0 and loads the position into Ceres for further manual analysis WITHOUT running a Ceres search (MCGS/v2 only; requires an LC0-type network).
+    Required positional args : <pgn file> <move number> <time>
+                               move number: e.g. 105 (move 105, White to move) or 105.. (move 105, Black to move)
+                               time:        e.g. 10s, 500ms, 1m (a bare number is interpreted as seconds)
+    Optional key/values      : { network, device }  (may appear in any position)
+    Example                  : Ceres GAME-ANALYZE-LC0 game.pgn 105 10s network=~T79 device=GPU:0
+";
+
     static void DumpAllHelp()
     {
       DumpHelpText(CERES_HELP_UCI);
@@ -139,6 +164,8 @@ namespace Ceres.Commands
       DumpHelpText(CERES_HELP_BACKENDBENCH);
       DumpHelpText(CERES_HELP_BENCHMARK);
       DumpHelpText(CERES_HELP_GRAPH);
+      DumpHelpText(CERES_HELP_GAME_ANALYZE);
+      DumpHelpText(CERES_HELP_GAME_ANALYZE_LC0);
       DumpHelpText(CERES_HELP_SETOPT);
       DumpHelpText(CERES_HELP_SETUP);
     }

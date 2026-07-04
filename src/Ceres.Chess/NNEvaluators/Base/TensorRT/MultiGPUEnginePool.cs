@@ -52,6 +52,10 @@ public sealed class MultiGPUEnginePool : IDisposable
   private readonly bool useByteInputs;
   private bool disposed;
 
+  // True when this pool's engines are cloned from (and share the ICudaEngine of) a reference
+  // pool. In that case batch-size optimization is skipped (sizes are fixed by the shared engine).
+  private readonly bool isSharedPool;
+
   // Fields needed for rebuilding pools with optimized sizes
   private readonly string onnxPath;
   private readonly TensorRTBuildOptions buildOptions;
@@ -171,7 +175,8 @@ public sealed class MultiGPUEnginePool : IDisposable
   /// </summary>
   public MultiGPUEnginePool(TensorRT trt, string onnxPath, int[][] sizesPerGPU, EnginePoolMode mode,
                              TensorRTBuildOptions options, int inputElementsPerPos, int outputElementsPerPos,
-                             int[] deviceIds, int minBatchSizePerGPU, string cacheDir)
+                             int[] deviceIds, int minBatchSizePerGPU, string cacheDir,
+                             MultiGPUEnginePool referencePool = null)
   {
     this.trt = trt;
     this.onnxPath = onnxPath;
@@ -181,6 +186,18 @@ public sealed class MultiGPUEnginePool : IDisposable
     this.minBatchSizePerGPU = minBatchSizePerGPU;
     this.mode = mode;
     this.sizesPerGPU = sizesPerGPU;
+    isSharedPool = referencePool != null;
+
+    if (isSharedPool)
+    {
+      // Mirror the reference pool's FINAL per-GPU sizes (which reflect any batch-size optimization
+      // it performed) so this pool's scheduler/cost tables line up with the cloned engines.
+      this.sizesPerGPU = new int[referencePool.sizesPerGPU.Length][];
+      for (int i = 0; i < referencePool.sizesPerGPU.Length; i++)
+      {
+        this.sizesPerGPU[i] = (int[])referencePool.sizesPerGPU[i].Clone();
+      }
+    }
 
     // Load engines in parallel across GPUs when enabled, multi-GPU, and all device IDs are unique
     // (duplicate device IDs can occur for testing purposes and require sequential loading)
@@ -189,7 +206,36 @@ public sealed class MultiGPUEnginePool : IDisposable
                        && deviceIds.Length > 1
                        && !hasDuplicateDevices;
 
-    if (useParallel)
+    // Shared-blob parallel load: for homogeneous multi-GPU (Exact mode, ONNX source) read each
+    // architecture group's serialized engine once and deserialize the rest of the group's devices
+    // in parallel from that in-memory blob (see LoadHomogeneousGroupsSharingBlob).
+    string srcExt = System.IO.Path.GetExtension(onnxPath).ToLowerInvariant();
+    bool isOnnxSource = srcExt != ".engine" && srcExt != ".plan";
+    bool useSharedBlobParallel = NNEvaluatorTensorRT.SHARED_BLOB_PARALLEL_LOAD_ENABLED
+                                 && !isSharedPool
+                                 && mode == EnginePoolMode.Exact
+                                 && isOnnxSource
+                                 && deviceIds.Length > 1
+                                 && !hasDuplicateDevices;
+
+    if (isSharedPool)
+    {
+      // Engine-sharing path: clone each GPU's pool from the corresponding reference pool. No
+      // deserialization or weight allocation — only new contexts/streams/buffers are created.
+      for (int i = 0; i < deviceIds.Length; i++)
+      {
+        EnginePool pool = new EnginePool(trt, onnxPath, (int[])this.sizesPerGPU[i].Clone(), mode, options,
+                                          inputElementsPerPos, outputElementsPerPos, deviceIds[i], cacheDir,
+                                          referencePool: referencePool.pools[i]);
+        pools.Add(pool);
+      }
+    }
+    else if (useSharedBlobParallel)
+    {
+      LoadHomogeneousGroupsSharingBlob(trt, onnxPath, options, inputElementsPerPos, outputElementsPerPos,
+                                       deviceIds, cacheDir);
+    }
+    else if (useParallel)
     {
       // Pre-allocate array for thread-safe parallel assignment
       EnginePool[] poolsArray = new EnginePool[deviceIds.Length];
@@ -265,7 +311,100 @@ public sealed class MultiGPUEnginePool : IDisposable
       deviceNames[i] = TensorRTNative.GetDeviceName(deviceIds[i]);
     }
 
+    // Sync policy (spin vs block) is chosen per-sync from the per-GPU batch size in the
+    // native layer's "auto" mode (default), so no pool-level promotion is needed here.
     Warmup();
+  }
+
+
+  /// <summary>
+  /// Loads engines for homogeneous-GPU groups by reading each group's serialized engine blob once
+  /// and deserializing the group's remaining devices in parallel from that in-memory blob. Each
+  /// device still receives its own deserialized ICudaEngine (TensorRT weights are device-local and
+  /// cannot be shared across physical GPUs); this only removes the redundant per-device disk read
+  /// and the global-lock serialization of deserialization. Group leaders are built first
+  /// (sequentially) so a cold cache builds and saves the .plan exactly once before any follower
+  /// reads it. A device whose blob could not be read falls back to the normal per-device load.
+  /// </summary>
+  private void LoadHomogeneousGroupsSharingBlob(TensorRT trt, string onnxPath, TensorRTBuildOptions options,
+                                                int inputElementsPerPos, int outputElementsPerPos,
+                                                int[] deviceIds, string cacheDir)
+  {
+    EnginePool[] poolsArray = new EnginePool[deviceIds.Length];
+
+    // Group device indices by architecture AND batch-size profile. The on-disk cache file is keyed
+    // by (architecture, batch sizes, build options); devices sharing a key share the same .plan, so
+    // the leader's blob is valid for its followers and the profile order lines up exactly.
+    Dictionary<string, List<int>> groups = new Dictionary<string, List<int>>();
+    for (int i = 0; i < deviceIds.Length; i++)
+    {
+      string archName = TensorRTNative.GetDeviceName(deviceIds[i]) ?? ("dev" + deviceIds[i]);
+      string key = archName + "|" + string.Join(",", sizesPerGPU[i]);
+      if (!groups.TryGetValue(key, out List<int> members))
+      {
+        members = new List<int>();
+        groups[key] = members;
+      }
+      members.Add(i);
+    }
+
+    // Build each group's leader first (sequentially) — reading or building+saving its .plan exactly
+    // once — then capture the leader's serialized blob for sharing with the group's followers.
+    List<(int index, IntPtr blob, long size)> followers = new List<(int index, IntPtr blob, long size)>();
+    List<IntPtr> blobsToFree = new List<IntPtr>();
+    foreach (List<int> members in groups.Values)
+    {
+      int leaderIdx = members[0];
+      poolsArray[leaderIdx] = new EnginePool(trt, onnxPath, (int[])sizesPerGPU[leaderIdx].Clone(), mode, options,
+                                             inputElementsPerPos, outputElementsPerPos, deviceIds[leaderIdx], cacheDir);
+      if (members.Count == 1)
+      {
+        continue;  // Singleton (heterogeneous) group — nothing to share.
+      }
+
+      // The cache filename's batch order matches EnginePool's internal descending sort, so sort a
+      // copy the same way before resolving the blob's cache filename.
+      int[] leaderSizes = (int[])sizesPerGPU[leaderIdx].Clone();
+      Array.Sort(leaderSizes);
+      Array.Reverse(leaderSizes);
+
+      bool haveBlob = trt.TryReadMultiProfileBlobFromCache(onnxPath, leaderSizes, options, cacheDir,
+                                                           deviceIds[leaderIdx], out IntPtr blob, out long size);
+      if (haveBlob)
+      {
+        blobsToFree.Add(blob);
+      }
+      else
+      {
+        // Blob unexpectedly unavailable (e.g. no cache dir); followers load independently (blob == 0).
+        Console.WriteLine("  NOTE: shared-blob multi-GPU load could not read leader engine blob; "
+                          + "followers will load independently.");
+      }
+
+      for (int m = 1; m < members.Count; m++)
+      {
+        followers.Add((members[m], blob, size));
+      }
+    }
+
+    // Deserialize all followers (across all groups) in parallel from their group's shared blob.
+    // A zero blob makes the EnginePool fall back to the normal cached path for that device.
+    Parallel.ForEach(followers, f =>
+    {
+      poolsArray[f.index] = new EnginePool(trt, onnxPath, (int[])sizesPerGPU[f.index].Clone(), mode, options,
+                                           inputElementsPerPos, outputElementsPerPos, deviceIds[f.index], cacheDir,
+                                           referencePool: null, sharedBlob: f.blob, sharedBlobSize: f.size);
+    });
+
+    foreach (IntPtr blob in blobsToFree)
+    {
+      trt.FreeMultiProfileBlob(blob);
+    }
+
+    for (int i = 0; i < deviceIds.Length; i++)
+    {
+      pools.Add(poolsArray[i]);
+    }
   }
 
 
@@ -449,7 +588,7 @@ public sealed class MultiGPUEnginePool : IDisposable
 
     executionTimesPerGPU = new float[numGPUs][];
 
-    for (int gpuIndex = 0; gpuIndex < numGPUs; gpuIndex++)
+    void WarmupGPU(int gpuIndex)
     {
       int[] gpuSizes = sizesPerGPU[gpuIndex];
       int numBatchSizes = gpuSizes.Length;
@@ -514,6 +653,23 @@ public sealed class MultiGPUEnginePool : IDisposable
       Console.WriteLine($"DEVICE {deviceIDs[gpuIndex]} sizes: [{sizesStr}] timings: [{timingsStr}] ms ({deviceNames[gpuIndex]})");
     }
 
+    // Warm up (and trigger CUDA-graph capture for) the GPUs. When enabled, do this concurrently
+    // across GPUs instead of one device at a time — each GPU uses its own EnginePool
+    // (contexts/streams/buffers/device), so this is the same concurrency the production multi-GPU
+    // dispatch already relies on. Parallel.For has an implicit barrier, so all per-GPU timings are
+    // populated before the averaging/speed-fraction computation below runs.
+    if (NNEvaluatorTensorRT.PARALLEL_WARMUP_ENABLED && numGPUs > 1)
+    {
+      Parallel.For(0, numGPUs, WarmupGPU);
+    }
+    else
+    {
+      for (int gpuIndex = 0; gpuIndex < numGPUs; gpuIndex++)
+      {
+        WarmupGPU(gpuIndex);
+      }
+    }
+
     // Average execution timings for identical GPU types to reduce measurement noise.
     // GPUs with the same device name have the same SM count and engine sizes.
     float[][] rawTimings = new float[numGPUs][];
@@ -567,8 +723,10 @@ public sealed class MultiGPUEnginePool : IDisposable
       pools[g].ExecutionTimes = executionTimesPerGPU[g];
     }
 
-    // Run batch size optimization if enabled
-    if (APPLY_BATCH_SIZE_OPTIMIZATION && mode == EnginePoolMode.Exact)
+    // Run batch size optimization if enabled. Skipped for shared pools: their engine sizes are
+    // fixed by the reference's already-built engines, and rebuilding would deserialize fresh
+    // engines and defeat the sharing.
+    if (APPLY_BATCH_SIZE_OPTIMIZATION && mode == EnginePoolMode.Exact && !isSharedPool)
     {
       int maxBatchSize = sizesPerGPU[0][^1] * numGPUs;
       BatchSizeOptimizer.OptimizationResult result = BatchSizeOptimizer.Optimize(sizesPerGPU[0], executionTimesPerGPU, numGPUs, 1024);
@@ -790,6 +948,55 @@ public sealed class MultiGPUEnginePool : IDisposable
 
 
   /// <summary>
+  /// Returns the total number of position slots (including padding up to fixed engine
+  /// batch sizes) that would actually be executed to process the specified number of positions.
+  /// Padding slots could instead be filled with additional real positions at no
+  /// additional inference cost.
+  /// For multi-GPU execution this is the sum of the padded capacities of each GPU's
+  /// share under the same distribution the Process methods would use (for example a
+  /// request of 100 positions split 50/50 across two GPUs each padding to 60 yields 120).
+  /// Thread-safe.
+  /// </summary>
+  public int PaddedBatchCapacity(int totalPositions)
+  {
+    if (totalPositions <= 0)
+    {
+      return totalPositions;
+    }
+
+    if (ShouldUseSingleGPU(totalPositions))
+    {
+      return pools[0].PaddedBatchCapacity(totalPositions);
+    }
+
+    // Mirror the distribution logic of the Process methods.
+    int numGPUs = Math.Max(1, Math.Min(pools.Count, totalPositions / minBatchSizePerGPU));
+    Span<int> distribution = stackalloc int[pools.Count];
+    if (!TryComputeOptimalDistribution(totalPositions, numGPUs, distribution))
+    {
+      // Mirror the even-split fallback used by the Process methods.
+      int baseSize = totalPositions / numGPUs;
+      int remainder = totalPositions % numGPUs;
+      for (int g = 0; g < numGPUs; g++)
+      {
+        distribution[g] = baseSize + (g < remainder ? 1 : 0);
+      }
+    }
+
+    int capacity = 0;
+    for (int g = 0; g < numGPUs; g++)
+    {
+      if (distribution[g] > 0)
+      {
+        capacity += pools[g].PaddedBatchCapacity(distribution[g]);
+      }
+    }
+
+    return Math.Max(capacity, totalPositions);
+  }
+
+
+  /// <summary>
   /// Process batch with Half inputs.
   /// </summary>
   public void Process(Half[] input, Half[] output, int totalPositions)
@@ -975,6 +1182,31 @@ public sealed class MultiGPUEnginePool : IDisposable
 
 
   /// <summary>
+  /// Like <see cref="ProcessWithHandler"/>, but receives a fill delegate instead of a
+  /// pre-filled managed input buffer. When the batch is routed to a single GPU, the
+  /// conversion writes directly into that GPU's pinned input buffer (no managed staging
+  /// copy). For the multi-GPU split path it fills a reusable managed buffer and uses the
+  /// standard split path (identical results).
+  /// </summary>
+  public void ProcessWithHandlerDirect(int totalPositions, Action<Memory<Half>> fillInput,
+                                       SubBatchOutputHandler handler, Half[] fallbackBuffer)
+  {
+    for (int i = 0; i < pools.Count; i++) pools[i].MarkNewBatch();
+
+    if (ShouldUseSingleGPU(totalPositions))
+    {
+      pools[0].ProcessWithHandlerDirect(totalPositions, fillInput, handler, fallbackBuffer, globalPositionOffset: 0);
+      return;
+    }
+
+    // Multi-GPU split: fill the caller-provided scratch buffer, then run the standard split path.
+    int needed = totalPositions * InputElementsPerPosition;
+    fillInput(new Memory<Half>(fallbackBuffer, 0, needed));
+    ProcessWithHandler(fallbackBuffer, totalPositions, handler);
+  }
+
+
+  /// <summary>
   /// Process byte inputs with callback for tensor-major output extraction.
   /// Thread-safe: handler uses thread-local buffers and writes to non-overlapping position ranges.
   /// </summary>
@@ -1051,29 +1283,62 @@ public sealed class MultiGPUEnginePool : IDisposable
       return TryFractionBasedDistribution(totalPositions, numGPUs, distribution);
     }
 
-    // Check session cache (engine sizes, timings, and penalties are constant)
-    if (distCacheValid[totalPositions])
+    if (TryReadDistCache(totalPositions, numGPUs, distribution))
     {
-      int cBase = totalPositions * pools.Count;
-      for (int g = 0; g < numGPUs; g++)
-      {
-        distribution[g] = distCache[cBase + g];
-      }
-
-      if (BatchScheduler.VERBOSE_DETAILS)
-      {
-        int usedGPUs = 0;
-        for (int g = 0; g < numGPUs; g++)
-        {
-          if (distribution[g] > 0) usedGPUs++;
-        }
-        Console.WriteLine($"  MULTI_GPU_DIST (cached): {totalPositions} positions -> GPUs used={usedGPUs} " +
-                          $"distribution=[{string.Join(", ", distribution.Slice(0, numGPUs).ToArray())}]");
-      }
-
       return true;
     }
 
+    // Serialize the DP computation: it mutates shared scratch buffers (dpBufA/dpBufB/dpChoices)
+    // and may be invoked concurrently with Process (e.g. PaddedBatchCapacity queried from
+    // search threads while another thread is evaluating).
+    lock (distComputeLock)
+    {
+      if (TryReadDistCache(totalPositions, numGPUs, distribution))
+      {
+        return true;
+      }
+
+      return ComputeOptimalDistributionUnderLock(totalPositions, numGPUs, distribution);
+    }
+  }
+
+
+  private readonly object distComputeLock = new();
+
+  /// <summary>
+  /// Attempts to read a previously computed distribution from the session cache
+  /// (engine sizes, timings, and penalties are constant). Thread-safe.
+  /// </summary>
+  private bool TryReadDistCache(int totalPositions, int numGPUs, Span<int> distribution)
+  {
+    if (!Volatile.Read(ref distCacheValid[totalPositions]))
+    {
+      return false;
+    }
+
+    int cBase = totalPositions * pools.Count;
+    for (int g = 0; g < numGPUs; g++)
+    {
+      distribution[g] = distCache[cBase + g];
+    }
+
+    if (BatchScheduler.VERBOSE_DETAILS)
+    {
+      int usedGPUs = 0;
+      for (int g = 0; g < numGPUs; g++)
+      {
+        if (distribution[g] > 0) usedGPUs++;
+      }
+      Console.WriteLine($"  MULTI_GPU_DIST (cached): {totalPositions} positions -> GPUs used={usedGPUs} " +
+                        $"distribution=[{string.Join(", ", distribution.Slice(0, numGPUs).ToArray())}]");
+    }
+
+    return true;
+  }
+
+
+  private bool ComputeOptimalDistributionUnderLock(int totalPositions, int numGPUs, Span<int> distribution)
+  {
     // Select optimal GPU count by running lightweight DP for each k.
     // Unlike an even-split heuristic, this accounts for uneven distributions
     // across heterogeneous GPUs (e.g., NVL vs PCIe).
@@ -1270,14 +1535,89 @@ public sealed class MultiGPUEnginePool : IDisposable
   }
 
 
+  /// <summary>
+  /// Within each group of identical GPUs (same device name), redistributes that group's total
+  /// assigned positions as evenly as possible. For symmetric GPUs this produces the expected
+  /// balanced split (e.g. 50/50) instead of the makespan DP's lower-plateau-edge result
+  /// (e.g. 160 positions -> [72, 88] rather than [80, 80]).
+  ///
+  /// Makespan-safe: because each GPU's cost(n) is non-decreasing, the evened group maximum
+  /// (cost of ceil(total/k)) is &lt;= the original group maximum (cost of the largest member),
+  /// so this can only keep or reduce the makespan, never increase it. Any remainder goes to the
+  /// earliest GPU indices, so GPU 0 (which runs inline on the caller thread, with no dispatch/join
+  /// handoff latency) carries the larger share. Only GPUs the optimizer actually used (count &gt; 0)
+  /// participate, which preserves any fewer-GPU decision.
+  /// </summary>
+  private void RebalanceWithinDeviceGroups(Span<int> distribution, int numGPUs)
+  {
+    for (int g = 0; g < numGPUs; g++)
+    {
+      string name = deviceNames[g];
+      if (name == null || distribution[g] <= 0)
+      {
+        continue;
+      }
+
+      // Only process each group once, at its first used member.
+      bool isFirstOfGroup = true;
+      for (int p = 0; p < g; p++)
+      {
+        if (distribution[p] > 0 && string.Equals(deviceNames[p], name, StringComparison.Ordinal))
+        {
+          isFirstOfGroup = false;
+          break;
+        }
+      }
+      if (!isFirstOfGroup)
+      {
+        continue;
+      }
+
+      int groupCount = 0;
+      int groupTotal = 0;
+      for (int m = g; m < numGPUs; m++)
+      {
+        if (distribution[m] > 0 && string.Equals(deviceNames[m], name, StringComparison.Ordinal))
+        {
+          groupCount++;
+          groupTotal += distribution[m];
+        }
+      }
+      if (groupCount <= 1)
+      {
+        continue;
+      }
+
+      // Even split; first (groupTotal % groupCount) members get one extra position.
+      int baseShare = groupTotal / groupCount;
+      int remainder = groupTotal % groupCount;
+      int assigned = 0;
+      for (int m = g; m < numGPUs; m++)
+      {
+        if (distribution[m] > 0 && string.Equals(deviceNames[m], name, StringComparison.Ordinal))
+        {
+          distribution[m] = baseShare + (assigned < remainder ? 1 : 0);
+          assigned++;
+        }
+      }
+    }
+  }
+
+
   private void StoreDistCache(int totalPositions, int numGPUs, Span<int> distribution)
   {
+    // Even out the load within each group of identical GPUs before caching, so symmetric
+    // GPUs get equal (e.g. 50/50) splits. Makespan-safe (see RebalanceWithinDeviceGroups).
+    RebalanceWithinDeviceGroups(distribution, numGPUs);
+
     int cBase = totalPositions * pools.Count;
     for (int g = 0; g < numGPUs; g++)
     {
       distCache[cBase + g] = distribution[g];
     }
-    distCacheValid[totalPositions] = true;
+    // Release write: readers (TryReadDistCache, possibly on other threads)
+    // must observe the distCache values above before the valid flag.
+    Volatile.Write(ref distCacheValid[totalPositions], true);
   }
 
 

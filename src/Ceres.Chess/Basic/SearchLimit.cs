@@ -108,6 +108,11 @@ namespace Ceres.Chess
       return new SearchLimit(SearchLimitType.SecondsPerMove, seconds, searchContinuationSupported);
     }
 
+    public static SearchLimit DepthPerMove(int depth, bool searchContinuationSupported = false)
+    {
+      return new SearchLimit(SearchLimitType.DepthPerMove, depth, searchContinuationSupported);
+    }
+
     public static SearchLimit SecondsForAllMoves(float seconds, float secondsIncrement = 0, int? maxMovesToGo = null, bool searchContinuationSupported = true)
     {
       return new SearchLimit(SearchLimitType.SecondsForAllMoves, seconds, searchContinuationSupported, secondsIncrement, maxMovesToGo);
@@ -239,6 +244,23 @@ namespace Ceres.Chess
 
 
     /// <summary>
+    /// Returns a new SearchLimit with the duration added to by a specified factor.
+    /// </summary>
+    /// <param name="left"></param>
+    /// <param name="addend"></param>
+    /// <returns></returns>
+    public static SearchLimit operator +(SearchLimit left, float addend)
+    {
+
+      return left with
+      {
+        Value = left.Value + addend,
+        ValueIncrement = left.ValueIncrement + (left.ValueIncrement/left.Value) * addend
+      };
+    }
+
+
+    /// <summary>
     /// Returns the maximum number of nodes possible for this search
     /// if this can be determined, otherwise null.
     /// </summary>
@@ -289,6 +311,7 @@ namespace Ceres.Chess
         SearchLimitType.NodesForAllMoves => (int)Value,
         SearchLimitType.BestValueMove => 1,
         SearchLimitType.BestActionMove => 1,
+        SearchLimitType.DepthPerMove => null,
         _ => throw new NotImplementedException()
       };
     }
@@ -316,6 +339,7 @@ namespace Ceres.Chess
           SearchLimitType.SecondsForAllMoves => Math.Min(maxTreeNodes, (long)(MAX_NPS * Value) + 1000),
           SearchLimitType.NodesForAllMoves => Math.Min(maxTreeNodes, (long)(Value + 1000)),
           SearchLimitType.BestValueMove => 1,
+          SearchLimitType.DepthPerMove => maxTreeNodes,
           _ => throw new NotImplementedException()
         };
       }
@@ -328,43 +352,39 @@ namespace Ceres.Chess
     /// </summary>
     /// <param name="initialNumNodes"></param>
     /// <param name="estNumNodesPerSecond"></param>
-    /// <param name="estIsObserved"></param>
     /// <returns></returns>
-    public int EstNumFinalNodes(int initialNumNodes, int estNumNodesPerSecond, bool estIsObserved) 
-      => initialNumNodes + EstNumSearchNodes(initialNumNodes, estNumNodesPerSecond, estIsObserved);
+    public int EstNumFinalNodes(int initialNumNodes, int estNumNodesPerSecond) 
+      => initialNumNodes + EstNumSearchNodes(initialNumNodes, estNumNodesPerSecond);
+
 
     /// Estimated number of incremental search nodes (N) for the search tree
     /// which starts with specified number of initial nodes and then
     /// searches for this limit.
-    public int EstNumSearchNodes(int initialNumNodes, int estNumNodesPerSecond, bool estIsObserved)
+    /// The returned value is a best estimate, not a hard upper bound.
+    public int EstNumSearchNodes(int initialNumNodes, int estEvaluationsPerSecond)
     {
+      // N.B. Due to transpositions, the actual number of graph nodes
+      //      may be much higher than the number of nodes that
+      //      could be evaluated by the net in the same unit of time.
+      const float EST_NODES_PER_NNEVAL = 2.0f;
+
       // TODO: make the estimations below smarter
       return Type switch
       {
         SearchLimitType.NodesPerMove => (int)Value, 
         SearchLimitType.NodesPerTree  => (int)MathF.Max(Value - initialNumNodes, 1),
-        SearchLimitType.SecondsPerMove => (int)SecsToNodes(Value, estNumNodesPerSecond, estIsObserved),
-        SearchLimitType.SecondsForAllMoves => (int)((Value / 20.0f) * estNumNodesPerSecond),
         SearchLimitType.NodesForAllMoves => (int)(Value / 20.0f),
+
+        SearchLimitType.SecondsPerMove => (int)(Value * estEvaluationsPerSecond * EST_NODES_PER_NNEVAL),
+        SearchLimitType.SecondsForAllMoves => (int)((Value / 20.0f) * estEvaluationsPerSecond * EST_NODES_PER_NNEVAL),
+
         SearchLimitType.BestValueMove => 1,
         SearchLimitType.BestActionMove => 1,
+        SearchLimitType.DepthPerMove => initialNumNodes,
         _ => throw new NotImplementedException()
       };
     }
 
-
-    static float SecsToNodes(float secs, int estNumNodesPerSecond, bool estNodesIsObserved)
-    {
-      if (!estNodesIsObserved && secs < 0.1)
-      {
-        // first nodes are much slower due to lagency
-        return secs * estNumNodesPerSecond * 0.3f;
-      }
-      else
-      {
-        return secs * estNumNodesPerSecond;
-      }
-    }
 
     #endregion
 
@@ -420,6 +440,7 @@ namespace Ceres.Chess
       SearchLimitType.SecondsPerMove => "SM",
       SearchLimitType.BestValueMove => "V",
       SearchLimitType.BestActionMove => "A",
+      SearchLimitType.DepthPerMove => "DM",
       _ => throw new Exception($"Internal error: unsupported SearchLimitType type {Type}")
     };
 
@@ -431,7 +452,8 @@ namespace Ceres.Chess
     public override string ToString()
     {
       string movesToGoPart = MaxMovesToGo.HasValue ? $" Moves { MaxMovesToGo }" : "";
-      string valuePart = IsTimeLimit ? $"{Value,8:F2}s" : $"{Value,12:N0} nodes";
+      string valuePart = Type == SearchLimitType.DepthPerMove ? $"{Value,8:F0} depth"
+                       : IsTimeLimit ? $"{Value,8:F2}s" : $"{Value,12:N0} nodes";
       string incrPart = IsTimeLimit ? $"{ValueIncrement,8:F2}s" : $"{ValueIncrement,12:N0} nodes";
 
       string maxNodes = MaxTreeNodes != null ? $" Nodes max {MaxTreeNodes,12:N0}" : "";

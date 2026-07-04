@@ -513,8 +513,9 @@ public readonly unsafe partial struct GNode : IComparable<GNode>, IEquatable<GNo
   /// <returns></returns>
   public readonly GEdge[] EdgesSorted(Func<GEdge, double> sortValueFunc)
   {
-    GEdge[] edges = new GEdge[NumEdgesExpanded];
-    for (int i = 0; i < NumEdgesExpanded; i++)
+    int numExpanded = NumEdgesExpanded;
+    GEdge[] edges = new GEdge[numExpanded];
+    for (int i = 0; i < numExpanded; i++)
     {
       edges[i] = ChildEdgeAtIndex(i);
     }
@@ -531,9 +532,18 @@ public readonly unsafe partial struct GNode : IComparable<GNode>, IEquatable<GNo
   /// <returns></returns>
   public readonly GEdge EdgeWithMaxValue(Func<GEdge, double> valueFunc)
   {
+    if (IsPendingPolicyCopy)
+    {
+      // Edge headers are not yet materialized (deferred transposition policy copy,
+      // e.g. a node freshly created during deep rollouts): NumEdgesExpanded may be
+      // nonzero while the headers are not yet valid, so they must not be read.
+      return default;
+    }
+
+    int numExpanded = NumEdgesExpanded;
     double maxValue = double.MinValue;
-    int maxIndex = -1;  
-    for (int i = 0; i < NumEdgesExpanded; i++)
+    int maxIndex = -1;
+    for (int i = 0; i < numExpanded; i++)
     {
       double value = valueFunc(ChildEdgeAtIndex(i));
       if (value > maxValue)
@@ -543,7 +553,17 @@ public readonly unsafe partial struct GNode : IComparable<GNode>, IEquatable<GNo
       }
     }
 
-    return ChildEdgeAtIndex(maxIndex);
+    // If no edge produced a value greater than double.MinValue, maxIndex remains -1. This happens
+    // when every candidate value is NaN (NaN > x is always false) — e.g. valueFunc reads an edge
+    // Q that is NaN (draw-by-repetition / transposition nodes can have uninitialized Q). Fall back
+    // to the first edge rather than calling ChildEdgeAtIndex(-1), which reads the header slot before
+    // the node's block and can corrupt memory / fault.
+    if (maxIndex < 0)
+    {
+      maxIndex = 0;
+    }
+
+    return numExpanded > 0 ? ChildEdgeAtIndex(maxIndex) : default;
   }
 
 
@@ -642,6 +662,7 @@ public readonly unsafe partial struct GNode : IComparable<GNode>, IEquatable<GNo
            + (float.IsNaN(NodeRef.UncertaintyValue)  ? "" : $"UV={NodeRef.UncertaintyValue,4:F3} ") 
            + (float.IsNaN(NodeRef.UncertaintyPolicy) ? "" : $"UP={NodeRef.UncertaintyPolicy,4:F3} ")
            + $"H={NodeRef.HashStandalone.Hash % 10000} Sib={100*NodeRef.SiblingsQFrac}%/{NodeRef.SiblingsQ,4:F2} "
+           + (NodeRef.RepDrawFraction > 0 ? $"RepD={NodeRef.RepDrawFraction:F2} " : "")
            + $"E={NumEdgesExpanded} "
            + $"{CalcPosition().ToPosition.FEN}>";
     }
@@ -681,7 +702,8 @@ public readonly unsafe partial struct GNode : IComparable<GNode>, IEquatable<GNo
     Console.WriteLine("Policy length " + NumPolicyMoves);
     foreach ((GEdge Edge, int _) in ChildEdgesExpandedWithIndex)
     {
-      Console.WriteLine("  Move= " + Edge.MoveMG + " P=" + Edge.P + "  expanded:" + Edge.IsExpanded);
+      Console.WriteLine("  Move= " + Edge.MoveMG + " P=" + Edge.P + "  expanded:" + Edge.IsExpanded 
+                      + "  Q:" + Edge.Q + "  N:" + Edge.N);
     }
     for (int i=NumEdgesExpanded;i<NumPolicyMoves; i++)
     {

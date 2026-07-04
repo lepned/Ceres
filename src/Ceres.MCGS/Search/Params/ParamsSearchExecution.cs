@@ -88,6 +88,18 @@ public record ParamsSearchExecution
   public bool DualEvaluators = true;
 
   /// <summary>
+  /// When DualOverlappedIterators is true the two iterators' NN evaluations run concurrently on the
+  /// GPU and can therefore complete (and back up) out of selection order ("crossing"). If false
+  /// backups are forced to occur in batch-selection order: the batch selected first backs up first. 
+  /// A later batch waits (before taking the select/backup exclusion lock) until all earliser batches
+  /// have backed up. Cost is small (the wait largely hides behind the other iterator's GPU eval).
+  /// If true, a significant fraction (e.g. 10%) of batches can end up out-of-order for large slow nets
+  /// where both iterators can race thru select and backup phases to end up both in the evaluation phase.
+  /// Theoretically it seems best to disallow out-of-order, but matches consistenly slowed up to +15 Elo of allowed.
+  /// </summary>
+  public bool AllowOutOfOrderBatches = true;
+
+  /// <summary>
   /// Optional additional hard limit on size of gathered batch 
   /// of nodes (not all of which are necessarily destined for neural network evaluation).
   /// </summary>
@@ -103,6 +115,19 @@ public record ParamsSearchExecution
   /// TODO: Instead of divisor-based alignment, use exact fixed batch sizes used by NNEvaluator.
   /// </summary>
   public int NNBatchSizeAlignmentTarget = 0;
+
+  /// <summary>
+  /// If the gathered batch should be topped up (via a second selection pass) so the number
+  /// of positions sent to the NN evaluator fills the evaluator's padded batch capacity
+  /// (see NNEvaluator.PaddedBatchCapacity, e.g. the fixed engine batch sizes used by
+  /// TensorRT backends in exact-batch mode). The padding slots are computed by the
+  /// device regardless, so filling them with real positions increases evaluation
+  /// throughput at no additional inference cost.
+  /// Takes precedence over NNBatchSizeAlignmentTarget when the evaluator reports padding.
+  /// NOTE: although believed fully functional (for TensorRTNative backend)
+  ///       is not on by default because of modest eps improvement and potential lower batch quality.
+  /// </summary>
+  public bool NNBatchSizeFillToEvaluatorCapacity = false;
 
 
   /// <summary>
@@ -124,7 +149,7 @@ public record ParamsSearchExecution
   /// Note that this value may be adjusted downward somewhat
   /// dynamically at runtime if graph size is very large.
   /// </summary>
-  public int SelectOperationParallelThresholdNumVisits = 22;
+  public int SelectOperationParallelThresholdNumVisits = 28;
 
  /// <summary>
   /// If the initialization of policies in tree nodes (after retrieval from NN)

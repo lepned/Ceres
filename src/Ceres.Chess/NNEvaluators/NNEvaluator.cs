@@ -16,6 +16,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Numerics;
 using System.Runtime.InteropServices;
@@ -98,9 +99,15 @@ namespace Ceres.Chess.NNEvaluators
       /// </summary>
       public readonly long NumParameters;
 
-      public EvaluatorInfo(long numParameters)
+      /// <summary>
+      /// Size in bytes of the underlying network file (0 if unknown).
+      /// </summary>
+      public readonly long NetworkFileSizeBytes;
+
+      public EvaluatorInfo(long numParameters, long networkFileSizeBytes = 0)
       {
         NumParameters = numParameters;
+        NetworkFileSizeBytes = networkFileSizeBytes;
       }
     }
 
@@ -190,8 +197,44 @@ namespace Ceres.Chess.NNEvaluators
     /// </summary>
     public virtual bool SupportsParallelExecution => true;
 
-    public virtual float EstNPSBatch => PerformanceStats == null ? 30_000 : PerformanceStats.BigBatchNPS;
-    public virtual float EstNPSSingleton => PerformanceStats == null ? 500 : PerformanceStats.SingletonNPS;
+    /// <summary>
+    /// Conservative fallback estimate of big-batch throughput (nodes/sec), used only when no measured
+    /// value is available. Backends should record a realistic value at warmup (see SetEstimatedNPS).
+    /// </summary>
+    public const float DEFAULT_EST_NPS_BATCH = 30_000;
+
+    /// <summary>
+    /// Conservative fallback estimate of singleton (batch size 1) throughput (nodes/sec), used only
+    /// when no measured value is available.
+    /// </summary>
+    public const float DEFAULT_EST_NPS_SINGLETON = 500;
+
+    public virtual float EstNPSBatch => PerformanceStats == null ? DEFAULT_EST_NPS_BATCH : PerformanceStats.BigBatchNPS;
+    public virtual float EstNPSSingleton => PerformanceStats == null ? DEFAULT_EST_NPS_SINGLETON : PerformanceStats.SingletonNPS;
+
+    /// <summary>
+    /// Records estimated throughput (nodes/sec) measured by a subclass, typically during Warmup, so that
+    /// <see cref="EstNPSBatch"/> and <see cref="EstNPSSingleton"/> return realistic values for this
+    /// device/network instead of the conservative defaults. Pass a non-positive value for either argument
+    /// to leave that estimate unchanged (keeping any prior value, else the default). Never throws.
+    /// </summary>
+    /// <param name="singletonNPS">Measured singleton (batch size 1) throughput, or &lt;= 0 to leave unchanged.</param>
+    /// <param name="bigBatchNPS">Measured big-batch throughput, or &lt;= 0 to leave unchanged.</param>
+    protected void SetEstimatedNPS(float singletonNPS, float bigBatchNPS)
+    {
+      float singleton = singletonNPS > 0 ? singletonNPS
+                                         : (PerformanceStats?.SingletonNPS ?? DEFAULT_EST_NPS_SINGLETON);
+      float bigBatch = bigBatchNPS > 0 ? bigBatchNPS
+                                       : (PerformanceStats?.BigBatchNPS ?? DEFAULT_EST_NPS_BATCH);
+
+      PerformanceStats = new NNEvaluatorPerformanceStats()
+      {
+        EvaluatorType = GetType(),
+        SingletonNPS = singleton,
+        BigBatchNPS = bigBatch,
+        Breaks = PerformanceStats?.Breaks
+      };
+    }
 
     /// <summary>
     /// Types of input(s) required by the evaluator.
@@ -252,6 +295,16 @@ namespace Ceres.Chess.NNEvaluators
     public abstract int MaxBatchSize { get; }
 
     /// <summary>
+    /// Returns the total number of position slots that would actually be computed
+    /// (including any internal padding up to fixed engine batch sizes) when evaluating
+    /// a batch with the specified number of positions.
+    /// Since padding slots are computed regardless, callers can fill them with
+    /// additional real positions at no additional evaluation cost.
+    /// Default implementation returns numPositions (no padding).
+    /// </summary>
+    public virtual int PaddedBatchCapacity(int numPositions) => numPositions;
+
+    /// <summary>
     /// When true and playing using SearchLimit of BestValueMove, engine using this evaluator 
     /// will slightly adjust evaluation when repetitions are nonzero to prefer repetitions/draws
     /// when seemingly losing and disfavor when seemingly winning.
@@ -268,6 +321,18 @@ namespace Ceres.Chess.NNEvaluators
     /// Miscellaneous information about the evaluator.
     /// </summary>
     public virtual EvaluatorInfo Info => null;
+
+    /// <summary>
+    /// Number of distinct compute devices over which this evaluator's work is spread.
+    /// </summary>
+    public virtual int NumDevices => 1;
+
+    /// <summary>
+    /// Returns the size in bytes of the specified file,
+    /// or 0 if the path is null or the file does not exist.
+    /// </summary>
+    protected static long FileSizeBytesOrZero(string fileName)
+      => fileName != null && File.Exists(fileName) ? new FileInfo(fileName).Length : 0;
 
     /// <summary>
     /// If the raw neural network outputs should be retained.
@@ -329,6 +394,16 @@ namespace Ceres.Chess.NNEvaluators
     public long NumBatchesEvaluated { private set; get; }
 
     public long NumPositionsEvaluated { private set; get; }
+
+    /// <summary>
+    /// Optional tracker which accumulates the wall-clock time spent inside the
+    /// backend interop boundary ("backend time"). When non-null, evaluators that
+    /// support this instrumentation (currently NNEvaluatorTensorRT and NNEvaluatorCUDA) bracket
+    /// their native dispatch with EnterBackend/ExitBackend. A single instance is
+    /// typically shared across the evaluators of an NNEvaluatorSet so overlapping
+    /// backend calls are counted as a union rather than a sum.
+    /// </summary>
+    public BackendTimeTracker BackendTimeTracker { get; set; }
 
 
     /// <summary>

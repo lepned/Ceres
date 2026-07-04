@@ -113,12 +113,6 @@ public unsafe partial struct GNodeStruct
   /// </summary>
   public double D;
 
-  /// <summary>
-  /// Fortress probability metric stored as packed byte.
-  /// Values 0-254 map to [0.0, 1.0], value 255 represents NaN.
-  /// </summary>
-  public byte FortressPByte;
-
 
   /// <summary>
   /// Number of children which have been expanded 
@@ -237,25 +231,61 @@ public unsafe partial struct GNodeStruct
   }
 
 
-  /// <summary>
-  /// Fortress probability metric: minimum (1 - P(NEVER)) over all pawn squares.
-  /// Low values indicate a pawn unlikely to ever move, suggesting fortress-like structure.
-  /// Encoded: 0-254 maps to [0.0, 1.0], 255 represents NaN.
-  /// </summary>
-  public float FortressP
-  {
-    readonly get => FortressPByte == 255 ? float.NaN : FortressPByte * (1.0f / 254.0f);
-    set => FortressPByte = float.IsNaN(value) ? (byte)255 : (byte)Math.Round(Math.Clamp(value, 0f, 1f) * 254.0f);
-  }
-
 
   //    public NodeIndex NodeHashSibling;
-  public RunningStdDevShort StdDevEstimate;
+
+  /// <summary>
+  /// Compact (2 byte) exponentially-weighted (~50-visit) estimate of the volatility of leaf values
+  /// backed up through this node, measured as RMS deviation about the node's Q. Maintained during
+  /// backup only when ParamsSearch.TrackLeafValueVolatility is enabled (otherwise stays zero).
+  /// </summary>
+  public RunningStdDevShort LeafValueVolatility;
   //public readonly short Unused1;
   //public readonly short Unused2;
   //public int NDrawByRepetition;
-  public short UnusedShort;
-  //public byte UnusedByte;
+
+  /// <summary>
+  /// Quantized fraction of this node's visits which terminated at a history-sensitive
+  /// (repetition or 50-move rule) terminal draw edge anywhere beneath it.
+  /// Maintained during backup as a running average mirroring D's plumbing, but stored
+  /// in a single byte using STOCHASTIC ROUNDING: the stored grid value is an unbiased
+  /// estimator of the true fraction (a deterministic round-to-nearest would freeze
+  /// permanently once N exceeds ~255, since per-visit updates fall below half a grid
+  /// step). Noise is ~ sqrt(movement/255): about +-0.01 while the true value is moving,
+  /// far less once settled.
+  /// Used to discount pseudotransposition blending donors whose value derives
+  /// significantly from draws valid only for their own histories.
+  /// </summary>
+  private byte repDrawFractionByte;
+
+  public byte UnusedByte;
+  public byte UnusedByte2;
+
+  /// <summary>
+  /// Fraction of this node's visits which terminated at a history-sensitive
+  /// (repetition/50-move) terminal draw edge beneath it (see backing field).
+  /// </summary>
+  public readonly double RepDrawFraction => repDrawFractionByte * (1.0 / 255.0);
+
+  /// <summary>
+  /// Applies a running-average update to RepDrawFraction with stochastic rounding.
+  /// </summary>
+  /// <param name="startN">Node N before this backup.</param>
+  /// <param name="deltaN">Visits being applied.</param>
+  /// <param name="deltaR">Sum over the visits of the per-visit indicator/fraction (in [0, deltaN]).</param>
+  /// <param name="randUniform">A uniform random value in [0,1) used for the rounding decision.</param>
+  internal void UpdateRepDrawFractionStochastic(int startN, int deltaN, double deltaR, double randUniform)
+  {
+    if (deltaN <= 0)
+    {
+      return;
+    }
+
+    double newFraction = (RepDrawFraction * startN + deltaR) / (startN + deltaN);
+    double scaled = Math.Clamp(newFraction, 0, 1) * 255.0;
+    int floor = (int)scaled;
+    repDrawFractionByte = (byte)Math.Min(255, floor + ((scaled - floor) > randUniform ? 1 : 0));
+  }
 
   /// <summary>
   /// Lock for multithreaded synchronization.

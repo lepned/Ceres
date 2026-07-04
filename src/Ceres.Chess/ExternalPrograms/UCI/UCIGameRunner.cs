@@ -134,6 +134,12 @@ namespace Ceres.Chess.ExternalPrograms.UCI
     protected volatile string lastBestMove = null;
     protected volatile string lastError = null;
 
+    /// <summary>
+    /// Signaled by the engine read thread the instant a "bestmove" line arrives, so that
+    /// EvalPosition can block (sleep) until the search completes rather than busy-spinning.
+    /// </summary>
+    readonly System.Threading.ManualResetEventSlim bestMoveSignal = new System.Threading.ManualResetEventSlim(false);
+
     public string LastInfoString => lastInfo;
     public string LastBestMove => lastBestMove;
 
@@ -147,10 +153,69 @@ namespace Ceres.Chess.ExternalPrograms.UCI
 
     public List<string> InfoStringDict0 = new List<string>();
 
+    /// <summary>
+    /// For each multipv index, the most recent (deepest) UCI search info line seen during the
+    /// current search. Populated whenever the engine emits lines with a principal variation and a
+    /// score (always for MultiPV &gt; 1, and also for MultiPV = 1). Cleared at the start of each search.
+    /// </summary>
+    public readonly System.Collections.Concurrent.ConcurrentDictionary<int, string> LastInfoLineByMultiPV = new();
+
+    /// <summary>
+    /// Sequence of multipv-1 (best line) info lines seen during the current search, in arrival order.
+    /// Used to determine the depth at which the best move stabilized. Cleared at the start of each search.
+    /// </summary>
+    public readonly System.Collections.Concurrent.ConcurrentQueue<string> BestLineHistory = new();
+
+
+    #region Marker-delimited block capture
+
+    /// <summary>
+    /// When non-null, a marker-delimited block capture is in progress; received lines belonging to
+    /// the block are collected here (see CaptureMarkedBlock). Null when no capture is active.
+    /// </summary>
+    volatile List<string> blockCaptureLines;
+    volatile string blockBeginMarker;
+    volatile string blockEndMarker;
+    volatile bool blockCaptureActive;     // true once the begin marker has been seen
+    volatile bool blockCaptureComplete;   // true once the end marker has been seen
+
+    #endregion
+
     void DataRead(int id, string data)
     {
       double elapsedTime = (double)(Stopwatch.GetTimestamp() - startTime) / freq;
       if (UCI_VERBOSE_LOGGING) Console.WriteLine(Math.Round(elapsedTime, 3) + " ENGINE::{0}::{1}", id, data);
+
+      // If a marker-delimited block capture is active, intercept lines belonging to the block so
+      // they are collected (and not routed as normal engine output). Lines arriving before the
+      // begin marker fall through to normal handling below.
+      List<string> capture = blockCaptureLines;
+      if (capture != null)
+      {
+        string trimmed = data.Trim();
+        if (!blockCaptureActive)
+        {
+          if (trimmed == blockBeginMarker)
+          {
+            blockCaptureActive = true;
+            return;
+          }
+        }
+        else
+        {
+          if (trimmed == blockEndMarker)
+          {
+            blockCaptureActive = false;
+            blockCaptureComplete = true;
+            return;
+          }
+          lock (capture)
+          {
+            capture.Add(data);
+          }
+          return;
+        }
+      }
 
       if (data.StartsWith("id name "))
       {
@@ -163,6 +228,8 @@ namespace Ceres.Chess.ExternalPrograms.UCI
       else if (data.Contains("bestmove"))
       {
         lastBestMove = data;
+        // Wake EvalPosition's blocking wait immediately (it is waiting for exactly this line).
+        bestMoveSignal.Set();
       }
       else if (data.Contains("info string"))
       {
@@ -174,6 +241,18 @@ namespace Ceres.Chess.ExternalPrograms.UCI
         {
           lastSearchInfo = new UCISearchInfo(data, lastBestMove, InfoStringDict0);// id == 0 ? InfoStringDict0 : null);
           lastInfo = data;
+        }
+
+        // Capture per-multipv lines so a MultiPVResult can be reconstructed after the search
+        // (used by the suite builder oracle). Only lines that carry a scored principal variation.
+        if (data.Contains(" pv ") && data.Contains("score"))
+        {
+          int multiPVIndex = UCIInfoParse.ExtractMultiPVIndex(data);
+          LastInfoLineByMultiPV[multiPVIndex] = data;
+          if (multiPVIndex == 1)
+          {
+            BestLineHistory.Enqueue(data);
+          }
         }
       }
     }
@@ -211,6 +290,11 @@ namespace Ceres.Chess.ExternalPrograms.UCI
       return EvalPosition(fenAndMovesString, "nodes", numNodes);
     }
 
+    public UCISearchInfo EvalPositionToDepth(string fenAndMovesString, int depth)
+    {
+      return EvalPosition(fenAndMovesString, "depth", depth);
+    }
+
     public UCISearchInfo EvalPositionRemainingNodes(string fenAndMovesString,
                                                     bool whiteToMove,
                                                     int? movesToGo,
@@ -236,6 +320,50 @@ namespace Ceres.Chess.ExternalPrograms.UCI
     public  void SendCommand(string command)
     {
       SendCommandCRLF(engine, command);
+    }
+
+
+    /// <summary>
+    /// Sends a command to the engine and captures the lines it emits between the specified begin and
+    /// end marker lines (the markers themselves are excluded). Lines arriving before the begin marker
+    /// are routed normally. Returns the captured lines, or null if the end marker was not seen within
+    /// the timeout (or the engine exited). Intended for capturing custom multi-line diagnostics output
+    /// such as the "dump-info-block" command.
+    /// </summary>
+    /// <param name="command">the UCI command to send (e.g. "dump-info-block")</param>
+    /// <param name="beginMarker">exact line (after trimming) marking the start of the block</param>
+    /// <param name="endMarker">exact line (after trimming) marking the end of the block</param>
+    /// <param name="timeoutMs">maximum time to wait for the end marker</param>
+    public IReadOnlyList<string> CaptureMarkedBlock(string command, string beginMarker, string endMarker, int timeoutMs)
+    {
+      List<string> lines = new List<string>();
+      blockBeginMarker = beginMarker;
+      blockEndMarker = endMarker;
+      blockCaptureActive = false;
+      blockCaptureComplete = false;
+      blockCaptureLines = lines;   // set last: arms the intercept in DataRead
+
+      try
+      {
+        SendCommand(command);
+
+        long deadline = Stopwatch.GetTimestamp() + (long)(timeoutMs / 1000.0 * Stopwatch.Frequency);
+        while (!blockCaptureComplete && Stopwatch.GetTimestamp() < deadline)
+        {
+          if (engine.EngineProcess.HasExited)
+          {
+            break;
+          }
+          System.Threading.Thread.Sleep(10);
+        }
+      }
+      finally
+      {
+        blockCaptureLines = null;   // disarm the intercept
+        blockCaptureActive = false;
+      }
+
+      return blockCaptureComplete ? lines : null;
     }
 
     protected void SendCommandCRLF(UCIEngineProcess thisEngine, string cmd)
@@ -319,6 +447,9 @@ namespace Ceres.Chess.ExternalPrograms.UCI
 
       lastBestMove = null;
       lastInfo = null;
+      LastInfoLineByMultiPV.Clear();
+      BestLineHistory.Clear();
+      bestMoveSignal.Reset();   // clear any prior signal before issuing this search
 
       //      string posString = fenAndMovesString.Contains("startpos") ? fen
       string curPosCmd = "position ";
@@ -361,7 +492,9 @@ namespace Ceres.Chess.ExternalPrograms.UCI
           }
         }
 
-        System.Threading.Thread.Sleep(isShortSearch ? 0 : 1);
+        // Block (without consuming CPU) until the read thread signals "bestmove", or until a short
+        // timeout elapses so the error / process-exit / long-wait checks below still run periodically.
+        bestMoveSignal.Wait(500);
         if (elapsedSeconds > 5)
         {
           if (engine.EngineProcess.HasExited)

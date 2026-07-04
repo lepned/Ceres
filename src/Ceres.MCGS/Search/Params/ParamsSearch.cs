@@ -14,6 +14,7 @@
 #region Using directives
 
 using System;
+using System.Text.Json.Serialization;
 using Ceres.Base.OperatingSystem;
 using Ceres.Chess.UserSettings;
 
@@ -90,16 +91,17 @@ public record ParamsSearch
     TopN,
 
     /// <summary>
-    /// The move having the best Q value is chosen, subject to 
-    /// also having certain minimum number of visits.
+    /// The move having the best Q value is chosen, subject to having sufficient visits
+    /// (a minimum fraction of the most visited move's N, see
+    /// ManagerChooseBestMoveMCGS.MinFractionNToUseQ). This is the default.
     /// </summary>
     TopQIfSufficientN,
 
     /// <summary>
-    /// The move having the best Q value is chosen, subject to
-    /// also having certain (less permissive) minimum number of visits
+    /// Same as TopQIfSufficientN but stricter: a higher minimum visit fraction
+    /// (closer to that of the most visited move) is required.
     /// </summary>
-    TopQIfSufficientNPermissive,
+    TopQIfSufficientNStrict,
 
     /// <summary>
     /// Use policy regularization (low intensity) using the method described in:
@@ -126,6 +128,16 @@ public record ParamsSearch
   /// of experimenting with leaf selection strategies which are more exploratory.
   /// </summary>
   public BestMoveModeEnum BestMoveMode = BestMoveModeEnum.TopQIfSufficientN;
+
+
+  /// <summary>
+  /// Opt-in tiebreak that disambiguates root moves nearly equal in averaged Q by using a
+  /// static, depth-bounded soft-minimax blend over the existing search graph (read-only;
+  /// no NN evaluations, no graph mutation). 
+  /// Disabled by default; see ParamsRootMinimaxBlend.
+  /// Tests showed modest unclear impact on Elo even though root moves changes were not rare.
+  /// </summary>
+  public ParamsRootMinimaxBlend RootMinimaxBlend = new();
 
 
   /// <summary>
@@ -180,16 +192,97 @@ public record ParamsSearch
   /// However in fact it apparently distorts the relative evaluations being performed 
   /// at the current node and surrounding nodes (e.g. the parent node).
   /// Therefore the weight of large-N pseudotranspositions is tightly constrained.
+  /// 
+  /// NOTE: later testing suggested this feature may not be Elo positive, disabled by default for now.
   /// </summary>
-  public bool EnablePseudoTranspositionBlendingInPositionAndEquivalenceMode = true;
+  public bool EnablePseudoTranspositionBlendingInPositionAndEquivalenceMode = false;
 
   /// <summary>
   /// If pseudotransposition blending is enabled.
   /// This is only applicable in PositionAndHistoryEquivalence
   /// (otherwise the nodes sharing same position are already coalesced).
   /// </summary>
+  [JsonIgnore]
   public bool EnablePseudoTranspositionBlending => EnablePseudoTranspositionBlendingInPositionAndEquivalenceMode
                                                 && PathTranspositionMode == PathMode.PositionAndHistoryEquivalence;
+
+  /// <summary>
+  /// If the multi-element per-position sibling sets (NodeIndexSetStore entries with more than one
+  /// member) need to be built and maintained during search.
+  ///
+  /// These multi-element sets are read ONLY by (a) pseudo-transposition Q/D blending and
+  /// (b) sibling-based move ordering. When neither is active nothing ever reads a multi-element
+  /// set, so the sets need not be built at all: the standalone dictionary keeps a single
+  /// (direct-index) representative per hash, which is all that transposition value-copy,
+  /// auto-extension, and cross-graph evaluation reuse require (those already use only element [0]).
+  /// Skipping set maintenance avoids the NodeIndexSetStore reservation plus the CPU of building
+  /// the sets at node creation and rebuilding them on every tree-reuse graph rewrite.
+  ///
+  /// Note: multi-element sets only ever form in PositionAndHistoryEquivalence mode (in coalesced
+  /// PositionEquivalence mode every standalone-hash entry stays a singleton regardless), so the
+  /// move-ordering term is gated on that mode and this is automatically false in coalesced mode.
+  /// </summary>
+  [JsonIgnore]
+  public bool MaintainSiblingSets => EnablePseudoTranspositionBlending
+                                  || (MoveOrderingPhase != MoveOrderingPhaseEnum.None
+                                   && PathTranspositionMode == PathMode.PositionAndHistoryEquivalence);
+
+  /// <summary>
+  /// If transposition auto-extension is enabled (PositionAndHistoryEquivalence mode only):
+  /// when a new node is created with its value/policy copied from an evaluated pseudo-twin
+  /// (TranspositionCopyValues) and the twin has at least TranspositionAutoExtensionMinTwinN
+  /// visits, the deterministic next visit from that node (always its top-policy child,
+  /// per the select fast path) is performed synchronously as well: the child is expanded
+  /// (value-copied from its own transposition, linked to an existing node, or created as a
+  /// terminal edge) and the new node is installed with N=2 and the exact two-visit Q via the
+  /// standard backup primitives. The path's single accepted visit then backs up a value
+  /// informed two plies deeper.
+  ///
+  /// Motivation: in history mode, pseudo-duplicated regions must be re-expanded one visit
+  /// at a time, so depth grows much more slowly than in Position mode; auto-extension gains
+  /// depth 2 per pseudo-twin expansion instead of 1, with no additional NN evaluations and
+  /// no approximation (all bookkeeping is exact). If the child has no available evaluation
+  /// source (and is not terminal), the extension is simply skipped.
+  /// </summary>
+  public bool EnableTranspositionAutoExtension = true;
+
+  /// <summary>
+  /// Minimum visit count of the pseudo-twin (the value-copy source) required for
+  /// transposition auto-extension to be attempted. With at least 2 visits the twin's own
+  /// top-policy child was already expanded, so the extension child's evaluation source
+  /// is very likely to exist.
+  /// </summary>
+  public int TranspositionAutoExtensionMinTwinN = 2;
+
+  /// <summary>
+  /// If the pseudotransposition (sibling) blend should additionally be installed at the
+  /// moment a new node is created with values copied from a pseudo-twin
+  /// (TranspositionCopyValues), rather than only from the node's later select-phase
+  /// refreshes. Uses exactly the same contribution formula, eligibility filters and
+  /// weight cap as the ordinary PTB refresh - this merely removes the one-visit lag,
+  /// so the node's FIRST backed-up value is already the blend of its copied V with the
+  /// sibling-set Q (instead of the raw V alone, with the blend arriving a visit later).
+  ///
+  /// Composes with EnableTranspositionAutoExtension: the blend occupies the sibling
+  /// component of the new node's stored Q while the auto-extension upgrades the pure
+  /// component, i.e. Q = w*siblingQ + (1-w)*(V1-Q2)/2 when both are active.
+  ///
+  /// Only effective when EnablePseudoTranspositionBlending is enabled (the same
+  /// select-phase refresh which later keeps the blend current).
+  /// </summary>
+  public bool EnablePseudoTranspositionBlendingAtCreation = true;
+
+  /// <summary>
+  /// Repetition-draw discounting of pseudotransposition blending donors: a donor whose
+  /// RepDrawFraction (fraction of its visit mass that terminated at repetition/50-move
+  /// terminal draws, valid only for the donor's own histories) is R has its blending
+  /// weight scaled by max(0, 1 - R / thisValue). Donors with R near 0 are unaffected,
+  /// partially contaminated donors contribute proportionally less, and donors at or above
+  /// this fraction are excluded entirely ("blend in less or not at all" as one knob).
+  /// Values less than or equal to 0 disable the discounting.
+  /// Tests of 0.5 vs 0.0 showed consistent +8 Elo improvements.
+  /// </summary>
+  public float PseudoTranspositionBlendingMaxRepDrawFraction = 0.5f;
 
   // Optionally stop descent at a transposition node only if it has a
   // sufficiently large number of visits. 
@@ -203,22 +296,43 @@ public record ParamsSearch
   //   3.0 --> -42 Elo
   //   5.0 --> -50 Elo
   //  20.0 --> -52 Elo
-  public float TranspositionStopMinSupportRatioPositionAndHistoryMode = 3f;
+  //  (infinite) -> (later testing suggested this mode may be best)
+  public float TranspositionStopMinSupportRatioPositionAndHistoryMode = 99999f; // effectively infinite
 
 
   /// <summary>
   /// MinSupportRatio when running in Position mode.
-  /// Because visits are coalesced across all transposition paths,
-  /// the expectation for subgraph size is typically higher than with PositionAndHistory mode.
+  /// Note that the setting of RedescentStochasticProbability (if nonzero) will also
+  /// impact the frequency of descent stopping on transposition nodes.
   /// </summary>
-  public float TranspositionStopMinSupportRatioPositionMode = 5f;
+  public float TranspositionStopMinSupportRatioPositionMode = 3f;
+
+
+  /// <summary>
+  /// Stochastic redescent mode (default 0, disabled). When set to a fractional value in (0, 1],
+  /// the decision of whether to stop descent at an already sufficiently visited transposition node
+  /// (see <see cref="MCGSSelect"/> IsTranspositionSufficientN) is augmented so that descent is
+  /// instead FORCED to continue ("redescend") in two additional cases:
+  ///   (1) with this fractional probability, unconditionally - sending occasional visits deeper
+  ///       even through nodes that would otherwise short-circuit to their cached subtree value; and
+  ///   (2) always while the parent node is still sparsely visited
+  ///       (parent N &lt; <see cref="MCGSParamsFixed.REDESCENT_STOCHASTIC_FORCE_BELOW_PARENT_N"/>),
+  ///       a warmup that guarantees some genuine deepening before the transposition-stop
+  ///       short-circuit is permitted to apply.
+  /// At 0 the transposition-stop logic is completely unchanged (a single predictable
+  /// branch is the only added cost on the hot path; the RNG is sampled only when the mode is active).
+  /// Intended as an exploration knob to counteract over-reliance on cached transposition values
+  /// (which can leave deep lines under-resolved when many parents share a heavily visited subgraph).
+  /// </summary>
+  public float RedescentStochasticProbability = 0.3f;
 
 
   /// <summary>
   /// Threshold after which suboptimal visit choices (according to PUCT)
   /// are rejected as being too suboptimal.
+  /// Enabling allows somewhat more aggressive default batch sizing without quality loss.
   /// </summary>
-  public float? VisitSuboptimalityRejectThreshold = null;
+  public float? VisitSuboptimalityRejectThreshold = 0.10f;
 
   public enum MoveOrderingPhaseEnum
   {
@@ -422,6 +536,26 @@ public record ParamsSearch
   public bool TwofoldDrawEnabled = true;
 
   /// <summary>
+  /// (PositionEquivalence mode only) Depth, in plies below the search root, to which expanded child
+  /// edges are reconciled against the CURRENT repetition context at the start of each search: any edge
+  /// whose child board is a history-level repetition (present in the graph-root -> search-root spine or
+  /// prehistory, hence a draw on EVERY search path) but which still carries non-draw visits is
+  /// reclassified as a full draw (NDrawByRepetition = N => edge.Q = 0), and affected node Q values are
+  /// refreshed bottom-up.
+  ///
+  /// Fixes a graph-reuse defect where a board-coalesced node is reused across game plies: an edge can
+  /// carry non-draw visits accumulated when the same board was reached earlier WITHOUT the repeating
+  /// history, diluting the move's value so the engine walks into a repetition with its eval frozen.
+  ///   0 = off.
+  ///   1 = search root's direct children only (the dominant, decision-determining case; cheap).
+  ///   N > 1 = also reconcile that many plies deeper (cost grows with depth; when > 1 a yellow
+  ///           per-search timing/stats line is printed). Only history-level repetitions are converted,
+  ///           which is sound at any depth regardless of node sharing.
+  /// See GNode.ReconcileDrawByRepetitions. Is a no-op unless such a repetition exists in range.
+  /// </summary>
+  public int RepetitionDrawReconciliationDepth = 4;
+
+  /// <summary>
   /// If nodes should apply supplemental updates.
   /// </summary>
   public bool EnableGraphCatchUp = false;
@@ -525,14 +659,34 @@ public record ParamsSearch
   public bool EnableUncertaintyBoosting = false;
 
   /// <summary>
-  /// If the policy uncertainty value should be used to 
+  /// If the policy uncertainty value should be used to
   /// adjust the per-position temperature on the policy.
   /// </summary>
   public bool EnablePolicyUncertaintyTemperatureBoosting = false;
 
+  /// <summary>
+  /// If enabled, each node maintains a compact (~50-visit) exponentially-weighted estimate of the
+  /// volatility (RMS deviation about the node's Q) of the leaf values backed up through it, stored
+  /// in GNodeStruct.LeafValueVolatility. Intended as an "unsettled / on-the-move" signal to later
+  /// bias selection toward uncertain nodes. Off by default; populating it is behavior-neutral
+  /// (the value is currently informational, surfaced in the UCI dump-info "Vol" column).
+  /// </summary>
+  public bool TrackLeafValueVolatility = false;
 
   /// <summary>
-  /// Amount of time subtracted from time allotments to 
+  /// If enabled (and TrackLeafValueVolatility is also enabled), the redescent multiplier
+  /// (transpositionStopMinSupportRatio) is additionally scaled per node by a factor derived from
+  /// the node's leaf value volatility: the volatility (RMS deviation about Q) is clamped to [0, 0.4]
+  /// and linearly mapped to a multiplier running from 0.25 (volatility 0) to 1.0 (volatility 0.4).
+  /// Lower volatility therefore shrinks the required support ratio (stop descent sooner), while
+  /// highly volatile nodes retain the full ratio (descend more deeply). No effect unless both flags
+  /// are set. See <see cref="TrackLeafValueVolatility"/>.
+  /// </summary>
+  public bool RedescentScaleByVolatility = false;
+
+
+  /// <summary>
+  /// Amount of time subtracted from time allotments to
   /// compensate for lag or various unpredictable latencies.
   /// </summary>
   public float MoveOverheadSeconds = 0.25f;
@@ -553,6 +707,44 @@ public record ParamsSearch
   /// Optional scalar that can be defined by developers for ad-hoc testing.
   /// </summary>
   public float TestScalar = 0.0f;
+
+
+  /// <summary>
+  /// Mode for the optional post-backup recomputation/propagation of node Q values,
+  /// run after each batch is backed up while the backup lock is still held (graph quiescent).
+  /// </summary>
+  public enum PostBackupQModeType
+  {
+    /// <summary>
+    /// No post-backup Q recomputation.
+    /// </summary>
+    Off,
+
+    /// <summary>
+    /// Recompute every node's Q bottom-up each batch (BottomUpQRecalculator).
+    /// Comprehensive but expensive; primarily a diagnostic.
+    /// </summary>
+    FullRecompute,
+
+    /// <summary>
+    /// Selective, amortized upward propagation that actively drains the per-edge IsStale flag with a
+    /// bounded per-batch budget (SelectiveQPropagator). Propagates transposition drift to the root
+    /// over time without a full-graph sweep.
+    /// </summary>
+    StaleDrain
+  }
+
+  /// <summary>
+  /// Mode for optional post-backup recomputation/propagation of node Q values.
+  /// Tests suggest backup corrections magnitudes are extremely modest and the computational overhead is significant.
+  /// </summary>
+  public PostBackupQModeType PostBackupQMode = PostBackupQModeType.Off;
+
+  /// <summary>
+  /// Maximum number of parent-node Q recomputes performed per batch when
+  /// PostBackupQMode == StaleDrain. Bounds per-batch cost and is the cycle-termination guarantee.
+  /// </summary>
+  public int SelectiveQDrainBudgetPerBatch = 256;
 
 
   /// <summary>
@@ -606,6 +798,18 @@ public record ParamsSearch
   /// </summary>
   public void Validate()
   {
+    RootMinimaxBlend?.Validate();
+
+    if (RedescentScaleByVolatility && !TrackLeafValueVolatility)
+    {
+      throw new Exception("TrackLeafValueVolatility must be set to true when RedescentScaleByVolatility is true");
+    }
+
+    if (RedescentStochasticProbability < 0 || RedescentStochasticProbability > 1)
+    {
+      throw new Exception("RedescentStochasticProbability must be in the range [0, 1].");
+    }
+
     if (OffPathBackupNumAdditionalLevelsToPropagate > 1
      && Execution.BackupMode == BackupMethodEnum.ReductionMultiThread)
     {
@@ -617,6 +821,25 @@ public record ParamsSearch
     if (!EnableGraph && PathTranspositionMode == PathMode.PositionAndHistoryEquivalence)
     {
       throw new Exception("Cannot use PathTranspositionMode PositionAndHistoryEquivalence when graph is disabled.");
+    }
+
+    if (EnableTranspositionAutoExtension
+     && (!EnableGraph || PathTranspositionMode != PathMode.PositionAndHistoryEquivalence))
+    {
+      // The extension relies on history-mode invariants (terminal draw edges valid for
+      // every path into a node; per-history node identity); in PositionEquivalence mode
+      // creating terminal draw edges for repetitions is incorrect (coalesced nodes).
+      EnableTranspositionAutoExtension = false;
+    }
+
+    if (!TwofoldDrawEnabled)
+    {
+      // In-search repetition detection records only a single prior occurrence
+      // (RepetitionCount is set to 0 or 1), so the 3-fold threshold of 2 implied by
+      // TwofoldDrawEnabled=false could never be met and repetition draws would go
+      // entirely undetected (with cycles spinning out new nodes until the 50-move rule).
+      throw new Exception("TwofoldDrawEnabled=false is not supported: repetition draw detection "
+                        + "tracks at most one prior occurrence, so 3-fold would never trigger.");
     }
 
     if (EnablePseudoTranspositionBlending &&
@@ -634,6 +857,16 @@ public record ParamsSearch
     if (SelectExplorationForUncertaintyAtEdge > 0 && !MCGSParamsFixed.TRACK_NODE_EDGE_UNCERTAINTY)
     {
       throw new NotImplementedException("Nonzero SelectExplorationForUncertaintyAtEdge requires UNCERTAINTY_TESTS_ENABLED to be true.");
+    }
+
+    if (PostBackupQMode == PostBackupQModeType.StaleDrain
+     && OffPathBackupNumAdditionalLevelsToPropagate > 0)
+    {
+      // The incremental off-path backup path (PropagateQChangesUpward) applies delta-based parent
+      // updates; the StaleDrain mode applies idempotent full recomputes. Running both would
+      // double-count, so they are mutually exclusive.
+      throw new Exception("PostBackupQMode.StaleDrain must not be combined with "
+                        + "OffPathBackupNumAdditionalLevelsToPropagate > 0.");
     }
   }
 }

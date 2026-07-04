@@ -19,9 +19,12 @@ using System.Threading.Tasks;
 using System.Collections.Generic;
 using System.Threading;
 
+using Ceres.Base.Misc;
 using Ceres.Chess;
 using Ceres.Chess.GameEngines;
 using Ceres.Chess.UserSettings;
+using Ceres.Features.Tournaments.Streaming;
+using Ceres.MCGS.GameEngines;
 #endregion
 
 namespace Ceres.Features.Tournaments
@@ -293,6 +296,8 @@ namespace Ceres.Features.Tournaments
         {
           Console.WriteLine("Tournament pending shutdown....");
           Def.parentDef.ShouldShutDown = true;
+          // Release any threads parked by a Ctrl-P pause so they observe the shutdown and drain.
+          Def.parentDef.PauseController?.Resume();
           shutdownComplete.WaitOne();
         }); ;
         Console.CancelKeyPress += ctrlCHandler;
@@ -313,6 +318,25 @@ namespace Ceres.Features.Tournaments
 
       // If we are a worker process then run only a single game thread.
       int numConcurrent = queueManager != null && !queueManager.IsCoordinator ? 1 : NumConcurrent;
+
+      // Set up interactive console control (Ctrl-P pause/resume and Ctrl-D dump-info) for local
+      // in-process tournaments when stdin is an interactive console. The pause controller must be
+      // created before any worker thread starts (threads register with it as they enter their game
+      // loop); the key-monitor thread itself is started below, after the worker tasks are launched.
+      CancellationTokenSource keyMonitorStop = null;
+      bool enableInteractiveKeys = enableCancelVialCtrlC && QueueManager == null && !Console.IsInputRedirected;
+      if (enableInteractiveKeys)
+      {
+        Def.parentDef.PauseController = new TournamentPauseController();
+      }
+
+      // Optionally start the live streaming publisher (default-on; see TournamentDef.EnableLiveStreaming),
+      // so any remote consumer (e.g. the EngineBattle GUI in REMOTE mode) can connect and watch games live.
+      if (Def.parentDef.EnableLiveStreaming && Def.parentDef.Observer == null)
+      {
+        Def.parentDef.Observer = new TournamentStreamPublisher(Def.parentDef.LiveStreamPort, numConcurrent);
+      }
+      Def.parentDef.Observer?.OnTournamentStart(DtoMappers.ToTournamentMeta(Def, numConcurrent));
 
       // First loop instantiats/warms up all the engines
       // (without concurrency due to potential CUDA synchronization conflicts).
@@ -362,13 +386,160 @@ namespace Ceres.Features.Tournaments
         tasks.Add(thisTask);
         thisTask.Start();
       }
+
+      // Now that all worker tasks are running, start the interactive key-monitor (if enabled).
+      if (enableInteractiveKeys)
+      {
+        keyMonitorStop = new CancellationTokenSource();
+        StartKeyMonitorThread(gameThreads, parentTest, keyMonitorStop.Token);
+      }
+
       Task.WaitAll(tasks.ToArray());
+
+      // Stop the key monitor and release any parked threads (no-op if not currently paused).
+      keyMonitorStop?.Cancel();
+      Def.parentDef.PauseController?.Resume();
+
+      Def.parentDef.Observer?.OnTournamentEnd();
 
       parentTest.DumpTournamentSummary(Def);
 
       shutdownComplete.Set();
 
       return parentTest;
+    }
+
+
+    /// <summary>
+    /// Starts a background thread that monitors the console for the interactive tournament control
+    /// keys: Ctrl-P (pause/resume) and Ctrl-D (dump search info for currently-searching MCGS engines).
+    /// Ctrl-C is handled separately (via Console.CancelKeyPress) and is unaffected.
+    /// </summary>
+    /// <param name="gameThreads">the worker game threads (engines polled for Ctrl-D dumps)</param>
+    /// <param name="parentTest">the shared result stats (summary printed on Ctrl-P pause)</param>
+    /// <param name="stopToken">cancellation signal driven when the tournament ends</param>
+    private void StartKeyMonitorThread(List<TournamentGameThread> gameThreads,
+                                       TournamentResultStats parentTest,
+                                       CancellationToken stopToken)
+    {
+      bool paused = false;
+
+      void HandleCtrlP()
+      {
+        TournamentPauseController controller = Def.parentDef.PauseController;
+        if (controller == null)
+        {
+          return;
+        }
+
+        if (!paused)
+        {
+          Console.WriteLine("Starting pause...");
+          // Block until every active worker thread has parked at an end-of-game boundary (or the
+          // tournament begins shutting down). This intentionally ignores further key presses until
+          // the pause completes.
+          bool allParked = controller.RequestPauseAndWaitAllParked(
+                             () => Def.parentDef.ShouldShutDown || stopToken.IsCancellationRequested);
+          if (allParked)
+          {
+            // Emit the same summary as at the end of the tournament, then announce the freeze.
+            parentTest.DumpTournamentSummary(Def);
+            ConsoleUtils.WriteLineColored(ConsoleColor.Green, "Paused...");
+            paused = true;
+          }
+          else
+          {
+            // Aborted before fully paused (tournament shutting down); release any parked threads.
+            controller.Resume();
+          }
+        }
+        else
+        {
+          controller.Resume();
+          Console.WriteLine("Resuming...");
+          paused = false;
+        }
+      }
+
+      void HandleCtrlD()
+      {
+        // Flag every currently-searching in-process MCGS engine to dump its search diagnostics,
+        // labeling the dump with the originating console command (the engine stays agnostic to it).
+        // For external Ceres engines accessed over UCI, request a marker-delimited dump-info-block
+        // over the UCI channel, capture it, and display it here (mirroring the in-process dump).
+        const string DUMP_DESCRIPTION = "Ctrl-D DUMP-INFO";
+        foreach (TournamentGameThread t in gameThreads)
+        {
+          foreach (GameEngine engine in t.Run.Engines)
+          {
+            RequestDumpInfoForEngine(engine, DUMP_DESCRIPTION);
+          }
+          RequestDumpInfoForEngine(t.Run.Engine2CheckEngine, DUMP_DESCRIPTION);
+        }
+      }
+
+      void RequestDumpInfoForEngine(GameEngine engine, string description)
+      {
+        if (engine is GameEngineCeresMCGSInProcess mcgs && mcgs.IsSearching)
+        {
+          mcgs.RequestDumpInfo(description);
+        }
+        else if (engine is GameEngineCeresMCGSUCI uci && uci.IsSearching)
+        {
+          // Capturing the block requires waiting for the subprocess to respond (up to a few seconds),
+          // so run it off the key-monitor thread to keep that thread responsive.
+          Task.Run(() =>
+          {
+            try
+            {
+              uci.DumpInfoBlockToConsole(description, Console.Out);
+            }
+            catch (Exception)
+            {
+              // Never let a diagnostics dump failure disrupt the tournament.
+            }
+          });
+        }
+      }
+
+      Thread keyMonitorThread = new Thread(() =>
+      {
+        while (!stopToken.IsCancellationRequested)
+        {
+          try
+          {
+            if (!Console.KeyAvailable)
+            {
+              Thread.Sleep(40);
+              continue;
+            }
+
+            ConsoleKeyInfo k = Console.ReadKey(intercept: true);
+            bool ctrl = (k.Modifiers & ConsoleModifiers.Control) != 0;
+            // Detect by key+modifier, with a fallback on the raw control character because some
+            // terminals (notably on Linux) deliver the control char without setting the modifier.
+            bool isCtrlP = (ctrl && k.Key == ConsoleKey.P) || k.KeyChar == '\u0010';
+            bool isCtrlD = (ctrl && k.Key == ConsoleKey.D) || k.KeyChar == '\u0004';
+
+            if (isCtrlP)
+            {
+              HandleCtrlP();
+            }
+            else if (isCtrlD)
+            {
+              HandleCtrlD();
+            }
+          }
+          catch (Exception)
+          {
+            // A console quirk (e.g. an input-mode change) -- back off briefly and continue.
+            Thread.Sleep(200);
+          }
+        }
+      });
+      keyMonitorThread.IsBackground = true;
+      keyMonitorThread.Name = "TournamentKeyMonitor";
+      keyMonitorThread.Start();
     }
 
   }

@@ -170,6 +170,28 @@ namespace Ceres.Chess.NNEvaluators.CUDA
       Evaluator = new NNBackendLC0_CUDA(gpuID, net, saveActivations, maxBatchSize,
                                         dumpTimings, enableCUDAGraphs, graphBatchSizeDivisor,
                                         TRY_SHARE_EVALUATORS ? ReferenceEvaluator?.Evaluator : null);
+
+      // Warm up and measure realistic throughput so EstNPSBatch / EstNPSSingleton reflect this
+      // device + network rather than the conservative defaults.
+      Warmup();
+    }
+
+
+    /// <summary>
+    /// Performs warmup and records a realistic throughput estimate (singleton and big-batch NPS) by
+    /// running the standard performance benchmark. Best-effort: any failure leaves the default NPS
+    /// estimates in place and must not prevent the evaluator from being used.
+    /// </summary>
+    public override void Warmup()
+    {
+      try
+      {
+        CalcStatistics(computeBreaks: false);
+      }
+      catch (Exception exc)
+      {
+        Console.WriteLine($"Warning: NNEvaluatorCUDA warmup/NPS estimation failed, using default estimates. {exc.Message}");
+      }
     }
 
 
@@ -204,6 +226,11 @@ namespace Ceres.Chess.NNEvaluators.CUDA
     /// </summary>
     public override int MaxBatchSize => maxBatchSize;
 
+    /// <summary>
+    /// Miscellaneous information about the evaluator (network file size used to gate batch sizing).
+    /// </summary>
+    public override EvaluatorInfo Info => new EvaluatorInfo(0, FileSizeBytesOrZero(Evaluator?.Net?.FileName));
+
 
     #endregion
 
@@ -233,8 +260,20 @@ namespace Ceres.Chess.NNEvaluators.CUDA
         PrepareInputPositions(positions);
       }
 
-      // Actually do the NN evaluation
-      Evaluator.EvaluateNN(numPositions);
+      // Actually do the NN evaluation. Bracket the (blocking) GPU forward pass as "backend time"
+      // for utilization measurement; EvaluateNN runs the kernels and synchronizes the stream, so
+      // this interval is the device-busy time. The managed input encoding (PrepareInputPositions)
+      // above is intentionally outside the timed region.
+      BackendTimeTracker tracker = BackendTimeTracker;
+      tracker?.EnterBackend();
+      try
+      {
+        Evaluator.EvaluateNN(numPositions);
+      }
+      finally
+      {
+        tracker?.ExitBackend();
+      }
 
       NNEvaluatorStats.UpdateStatsForBatch(GPUID, numPositions);
     }

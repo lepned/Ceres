@@ -185,15 +185,6 @@ namespace Ceres.Chess.UserSettings
     /// </summary>
     public bool ReducedMemoryMode { get; set; } = false;
 
-    /// <summary>
-    /// Processor NUMA node to which engine should be affinitized.
-    /// Generally a single node (socket or possibly chiplet) should be 
-    /// selected to improve performance.
-    /// Value of -1 indicates that affinitization should be disabled.
-    /// </summary>
-    public int NUMANode { get; set; } = 0;
-
-
     #endregion
 
     #region UCI setoptions
@@ -217,6 +208,14 @@ namespace Ceres.Chess.UserSettings
     public bool? EnableSiblingEval { get; set; }
     public bool? EnableUncertaintyBoosting { get; set; }
     public string LimitsManagerName { get; set; }
+
+    /// <summary>
+    /// If the diagnostic per-game "minilog" feature is enabled (a text file with a one-line-per-move
+    /// summary plus a companion HTML rendering). When true (the default) a standalone Ceres MCGS engine
+    /// writes a minilog, and tournaments may write per-engine minilogs (subject to TournamentDef.MiniLogFiles).
+    /// When false the feature is suppressed everywhere.
+    /// </summary>
+    public bool EnableMiniLog { get; set; } = false;
 
     #region Tablebases
 
