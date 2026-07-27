@@ -105,6 +105,7 @@ namespace Ceres.Chess.EncodedPositions
                                                                           bool filterOutFRCGames = true)
     {
       EncodedTrainingPosition[] positionsBuffer = new EncodedTrainingPosition[MAX_POSITIONS_PER_STREAM];
+      EncodedTrainingPositionExtraV7[] extrasV7Buffer = new EncodedTrainingPositionExtraV7[MAX_POSITIONS_PER_STREAM];
       EncodedTrainingPositionCompressed[] positionsBufferCompressed = new EncodedTrainingPositionCompressed[MAX_POSITIONS_PER_STREAM];
       byte[] streamByteBuffer = new byte[Marshal.SizeOf<EncodedTrainingPositionCompressed>() * MAX_POSITIONS_PER_STREAM];
 
@@ -157,7 +158,7 @@ namespace Ceres.Chess.EncodedPositions
                 if (!isPackedGames)
                 {
                   // Uncompressed read
-                  int numRead = ReadFromStream(decompressionStream, streamByteBuffer, ref positionsBuffer);
+                  int numRead = ReadFromStream(decompressionStream, streamByteBuffer, ref positionsBuffer, extrasV7Buffer, out bool isV7);
 
                   if (numRead == 0)
                   {
@@ -165,7 +166,8 @@ namespace Ceres.Chess.EncodedPositions
                   }
 
                   // Single game, not packed with multiple.
-                  EncodedTrainingPositionGameDirect ret = new (positionsBuffer.AsMemory(0, numRead));
+                  EncodedTrainingPositionGameDirect ret = new (positionsBuffer.AsMemory(0, numRead),
+                                                               isV7 ? extrasV7Buffer.AsMemory(0, numRead) : default);
                   if (!filterOutFRCGames || !ret.IsFRCGame)
                   {
                     yield return ret;
@@ -218,7 +220,8 @@ namespace Ceres.Chess.EncodedPositions
     }
 
 
-    static unsafe int ReadFromStream(Stream stream, byte[] rawBuffer, ref EncodedTrainingPosition[] buffer)
+    static unsafe int ReadFromStream(Stream stream, byte[] rawBuffer, ref EncodedTrainingPosition[] buffer,
+                                     EncodedTrainingPositionExtraV7[] extrasV7Buffer, out bool isV7)
     {
       int bytesRead = 0;
 
@@ -232,6 +235,36 @@ namespace Ceres.Chess.EncodedPositions
 
 
       Interlocked.Add(ref totalBytesRead, bytesRead);
+
+      // V7 records are a V6 record plus a 40-byte tail (extra rescorer fields).
+      // Capture the tails, then compact in place to the V6 stride so the
+      // struct cast below stays aligned; Version remains 7 in each record.
+      isV7 = bytesRead >= 4 && BitConverter.ToInt32(rawBuffer, 0) == EncodedTrainingPosition.SUPPORTED_VERSION_V7;
+      if (isV7)
+      {
+        if (bytesRead % EncodedTrainingPosition.V7_LEN != 0)
+        {
+          throw new Exception($"V7 training data stream length {bytesRead} not a multiple of record size {EncodedTrainingPosition.V7_LEN}");
+        }
+
+        int numRecords = bytesRead / EncodedTrainingPosition.V7_LEN;
+
+        // Extract all tails BEFORE compaction (compaction overwrites earlier tails in place).
+        for (int i = 0; i < numRecords; i++)
+        {
+          extrasV7Buffer[i] = MemoryMarshal.Read<EncodedTrainingPositionExtraV7>(
+            rawBuffer.AsSpan(i * EncodedTrainingPosition.V7_LEN + EncodedTrainingPosition.V6_LEN,
+                             EncodedTrainingPositionExtraV7.SIZE));
+        }
+
+        for (int i = 1; i < numRecords; i++)
+        {
+          Buffer.BlockCopy(rawBuffer, i * EncodedTrainingPosition.V7_LEN,
+                           rawBuffer, i * EncodedTrainingPosition.V6_LEN,
+                           EncodedTrainingPosition.V6_LEN);
+        }
+        bytesRead = numRecords * EncodedTrainingPosition.V6_LEN;
+      }
 
       return ObjUtils.CopyBytesIntoStructArray(rawBuffer, buffer, bytesRead);
     }

@@ -36,14 +36,18 @@ namespace Ceres.Chess.EncodedPositions
   [Serializable]
   public readonly partial struct EncodedTrainingPosition : IEquatable<EncodedTrainingPosition>
   {
-    // Only v6 data using input format 1 is supported.
+    // Only v6/v7 data using input format 1 is supported.
     // This keeps the code simple and allows unrestricted use of advanced v6 features.
+    // V7 records (e.g. from lc0-rescorer-v7) are a V6 record plus a 40-byte tail;
+    // the reader drops the tail so in memory they are V6 layout with Version == 7.
     public const int SUPPORTED_VERSION = 6;
+    public const int SUPPORTED_VERSION_V7 = 7;
     public const int SUPPORTED_INPUT_FORMAT = 1;
 
     public const int V4_LEN = 8276 + 16;
     public const int V5_LEN = 8308;
     public const int V6_LEN = 8356;
+    public const int V7_LEN = 8396;
 
     #region Raw structure data (Version, Policies, BoardsHistory, and MiscInfo)
 
@@ -226,9 +230,9 @@ namespace Ceres.Chess.EncodedPositions
         throw new Exception($"Found unsupported input format { inputFormat }, required is {SUPPORTED_INPUT_FORMAT}, {desc}.");
       }
 
-      if (version != SUPPORTED_VERSION)
+      if (version != SUPPORTED_VERSION && version != SUPPORTED_VERSION_V7)
       {
-        throw new Exception($"Found unsupported version { version }, required is {SUPPORTED_VERSION}, {desc}.");
+        throw new Exception($"Found unsupported version { version }, required is {SUPPORTED_VERSION} or {SUPPORTED_VERSION_V7}, {desc}.");
       }
 
 

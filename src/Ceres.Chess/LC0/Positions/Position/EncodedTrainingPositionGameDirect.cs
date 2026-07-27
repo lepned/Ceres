@@ -26,13 +26,20 @@ namespace Ceres.Chess.EncodedPositions
   public class EncodedTrainingPositionGameDirect : EncodedTrainingPositionGame
   {
     Memory<EncodedTrainingPosition> positions;
+    Memory<EncodedTrainingPositionExtraV7> extrasV7;
 
-    public EncodedTrainingPositionGameDirect(Memory<EncodedTrainingPosition> positions)
+    public EncodedTrainingPositionGameDirect(Memory<EncodedTrainingPosition> positions,
+                                             Memory<EncodedTrainingPositionExtraV7> extrasV7 = default)
     {
       this.positions = positions;
+      this.extrasV7 = extrasV7;
       if (positions.Length == 0)
       {
         throw new ArgumentException(nameof(positions), "length zero");
+      }
+      if (!extrasV7.IsEmpty && extrasV7.Length != positions.Length)
+      {
+        throw new ArgumentException(nameof(extrasV7), "length mismatch with positions");
       }
     }
 
@@ -45,6 +52,10 @@ namespace Ceres.Chess.EncodedPositions
     public override EncodedPolicyVector PolicyAtIndex(int index) => positions.Span[index].Policies;
 
     protected override ref readonly EncodedPositionWithHistory PositionRawMirroredRefAtIndex(int index) => ref positions.Span[index].PositionWithBoards;
+
+    public override bool HasExtraV7 => !extrasV7.IsEmpty;
+
+    public override EncodedTrainingPositionExtraV7 ExtraV7AtIndex(int index) => extrasV7.Span[index];
 
     public override string ToString()
     {

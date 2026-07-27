@@ -64,6 +64,19 @@ namespace Ceres.Chess.EncodedPositions
     /// <returns></returns>
     protected abstract ref readonly EncodedPositionWithHistory PositionRawMirroredRefAtIndex(int index);
 
+    /// <summary>
+    /// If per-position V7 extra fields (40-byte record tails, e.g. from lc0-rescorer-v7)
+    /// are available for this game.
+    /// </summary>
+    public virtual bool HasExtraV7 => false;
+
+    /// <summary>
+    /// Returns the V7 extra fields for the position at a specified index
+    /// (only valid if HasExtraV7 is true).
+    /// </summary>
+    public virtual EncodedTrainingPositionExtraV7 ExtraV7AtIndex(int index)
+      => throw new NotSupportedException("V7 extra fields not available for this game representation.");
+
     #region Base class methods (helpers)
 
     /// <summary>
