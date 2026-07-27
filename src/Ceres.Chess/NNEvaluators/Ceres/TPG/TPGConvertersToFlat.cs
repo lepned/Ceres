@@ -292,6 +292,18 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
         }
         else if (sizePerPos == 64 * 141)
         {
+          // V3 141-channel model — requires a V3 build: in a V2 build (USE_V2_TPG_RECORD,
+          // BYTES_PER_SQUARE_RECORD == 137) WritePosPieces emits 137-byte squares with no
+          // aux bytes, so a 141-stride output buffer would be filled misaligned — every
+          // square's features shifted — producing silently garbage inference (policy KLD ~4,
+          // near-zero accuracy) rather than an error. Fail loudly instead.
+          if (TPGRecord.BYTES_PER_SQUARE_RECORD != 141)
+          {
+            throw new InvalidOperationException(
+              "ConvertToFlatTPG: model expects 141 bytes/square (V3 aux net) but this Ceres build " +
+              $"is V2 (BYTES_PER_SQUARE_RECORD = {TPGRecord.BYTES_PER_SQUARE_RECORD}). " +
+              "Rebuild Ceres with USE_V3_TPG_RECORD defined (Ceres.Chess.csproj) to serve V3 nets.");
+          }
           bytesPerSquareOut = 141;  // V3 141-channel model — pass through
         }
         else
