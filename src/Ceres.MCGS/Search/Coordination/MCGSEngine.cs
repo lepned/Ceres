@@ -64,6 +64,13 @@ public partial class MCGSEngine
   public readonly MCGSSelect Select;
   public readonly MCGSBackup Backup;
 
+  /// <summary>
+  /// Optional Q-uncertainty select context (constructed lazily at strategy creation
+  /// when ParamsSelect.QUncAnyMethodActive; null otherwise). Shared by all search
+  /// threads of this engine.
+  /// </summary>
+  internal Search.QProbeSelect.QUncSelectContext QUnc;
+
   readonly SelectTerminatorPrefetched evaluatorPrecomputed;
 
   // Possible lock to restrict evaluator to single thread
@@ -126,6 +133,15 @@ public partial class MCGSEngine
 
   internal int nextBatchID;
 
+  /// <summary>
+  /// Optional hook invoked at the end of each iterator batch (MCGSIterator.RunOnce), after the
+  /// batch's backup has fully completed and all coordinator gates have been exited. At that point
+  /// the graph is quiescent in single-iterator harnesses (must not be used with
+  /// DualOverlappedIterators). Used by external instrumentation such as the Q-probe
+  /// training-data harvester (see MCGSIterator.RunProbeSpecs).
+  /// </summary>
+  internal Action<MCGSIterator> PostBatchHook;
+
 
   /// <summary>
   /// Optional logging object.
@@ -149,6 +165,8 @@ public partial class MCGSEngine
     NNEvaluator evaluator0 = Manager.NNEvaluator0;
     cachedNumDevicesInEvaluator = evaluator0?.NumDevices ?? 1;
     cachedNetFileSizeBytes = evaluator0?.Info?.NetworkFileSizeBytes ?? -1;
+
+    PostBatchHook = manager.ParamsSearch.PostBatchHook;
 
     Graph = graph;
     Graph.PTBMaxRepDrawFraction = manager.ParamsSearch.PseudoTranspositionBlendingMaxRepDrawFraction;
@@ -552,7 +570,7 @@ public partial class MCGSEngine
   /// root), growing the existing graph. Each round sends exactly one visit to each still-active
   /// node; rollouts are aggregated into shared NN batches and backed up (propagating each value up
   /// to the search root). The exploration term in selection is scaled by explorationMultiplier
-  /// (CPUCT for PUCT, CBGPUCT_SelectLambdaC for CBGPUCT). When stopNodeVisitsIfTerminalReached is
+  /// (CPUCT). When stopNodeVisitsIfTerminalReached is
   /// true, a node whose rollout reaches a terminal leaf is dropped from subsequent rounds.
   ///
   /// startNodes must already be filtered to evaluated, non-terminal, strict descendants of the

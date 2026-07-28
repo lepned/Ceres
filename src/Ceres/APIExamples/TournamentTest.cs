@@ -867,8 +867,9 @@ BT4 800 nodes vs SF17 0.20sec (6 threads)
         int gpuID = CommandLineWorkerSpecification.GPUID;
         Console.WriteLine($"\r\n***** Running in DISTRIBUTED mode as WORKER on gpu {gpuID} (queue directory {queueManager.QueueDirectory})\r\n");
 
-        player1.EngineDef.ModifyDeviceIndexIfNotPooled(gpuID);
-        player2.EngineDef.ModifyDeviceIndexIfNotPooled(gpuID);
+        // Distributed worker: place this worker's (single-GPU) engines on their assigned GPU.
+        player1.EngineDef.TrySetDeviceIndicesIfNotPooled(new[] { gpuID });
+        player2.EngineDef.TrySetDeviceIndicesIfNotPooled(new[] { gpuID });
       }
       else if (RUN_DISTRIBUTED)
       {
@@ -944,6 +945,8 @@ BT4 800 nodes vs SF17 0.20sec (6 threads)
 
       def.NumGamePairs = 2 * 5 * 50;// 110; // was:75
       def.ShowGameMoves = false;
+      def.MiniLogFiles = MiniLogFilesMode.IfLongSearchLimits;
+      def.OpeningRandomization = OpeningRandomizationEnum.ShuffleDeterministic;
 
       //string baseName = "tcec1819";
       //      string baseName = "4mvs_+90_+99";

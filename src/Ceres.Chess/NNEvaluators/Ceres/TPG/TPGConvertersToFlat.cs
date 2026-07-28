@@ -266,12 +266,9 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
       EncodedPositionBatchFlat ebf = batch as EncodedPositionBatchFlat;
       bool EMIT_PLY_SINCE = ebf?.LastMovePlies != null;
 
-      // TODO: Consider possibly restoring the commented out code below 
-      //       to efficiently decode the two top positions into TPGRecord
-      //       instead of having to setting EncodedPositionBatchFlat.RETAIN_POSITION_INTERNALS = true
-      //       and incurring all that overhead.
-      //       If do this, the regression/equivalency test can to be to compare
-      //       this version computed here against the new more efficient code.
+      // ConvertPositionsToRawSquareBytes reads history exclusively from batch.CompactHistories
+      // (the canonical representation, derived from planes at the choke point by hook 1 for
+      // plane-only producers). The former per-batch PositionsBuffer copy no longer exists.
       // TODO: someday handle since ply, does that need to be passed in from the search engine?
 
       byte[] moveBytesAll;
@@ -379,78 +376,6 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
       }
 
 
-#if OLD_TPG_COMBO_DIRECT_CONVER
-      static bool HAVE_WARNED = false;
-
-      int offsetAttentionInput = 0;
-      int offsetBoardInput = 0;
-      for (int i = 0; i < batch.NumPos; i++)
-      {
-        Position pos = batch.Positions[i].ToPosition;
-
-        TPGRecordCombo tpgRecordCombo = default;
-
-        // NOTE: history (prior move to square) not passed here
-        //        var lastMoveInfo = batch[i].PositionWithBoards.LastMoveInfoFromSideToMovePerspective();
-        //        Console.WriteLine(lastMoveInfo.pieceType + " " + lastMoveInfo.fromSquare + " " + lastMoveInfo.toSquare + " " + (lastMoveInfo.wasCastle ? " ************ " : ""));
-        //        int? targetSquareFromPriorMoveFromOurPerspective = lastMoveInfo.pieceType == PieceType.None ? null : lastMoveInfo.toSquare.SquareIndexStartA1;
-        int? targetSquareFromPriorMoveFromOurPerspective = null;
-        if (!HAVE_WARNED)
-        {
-          HAVE_WARNED = true;
-          Console.WriteLine("WARNING: ConvertToFlatTPG does not yet set history (via targetSquareFromPriorMoveFromOurPerspective), someday pass in IEncodedPositionBatchFlat somehow");
-        }
-
-
-        // Get first board
-        int startOffset = i * 112;
-        Span<BitVector64> bvOurs0   = MemoryMarshal.Cast<ulong, BitVector64>(batch.PosPlaneBitmaps.Slice(startOffset, 6));
-        Span<BitVector64> bvTheirs0 = MemoryMarshal.Cast<ulong, BitVector64>(batch.PosPlaneBitmaps.Slice(startOffset + 6, 6));
-        EncodedPositionBoard eb0 = new EncodedPositionBoard(bvOurs0, bvTheirs0, false).Mirrored;
-
-        // Get second board
-        startOffset = i * 112 + 13;
-        Span<BitVector64> bvOurs1 = MemoryMarshal.Cast<ulong, BitVector64>(batch.PosPlaneBitmaps.Slice(startOffset, 6));
-        Span<BitVector64> bvTheirs1 = MemoryMarshal.Cast<ulong, BitVector64>(batch.PosPlaneBitmaps.Slice(startOffset + 6, 6));
-        EncodedPositionBoard eb1 = new EncodedPositionBoard(bvOurs1, bvTheirs1, false).Mirrored;
-
-        (PieceType pieceType, Square fromSquare, Square toSquare, bool wasCastle) = EncodedPositionWithHistory.LastMoveInfoFromSideToMovePerspective(in eb0, in eb1);
-//Console.WriteLine("decode_LAST_MOVE " + pieceType + " " + fromSquare + " " + toSquare + " " + wasCastle + " " + pos.FEN + " " + eb1.GetFEN(pos.IsWhite) + " " + eb1.GetFEN(!pos.IsWhite));
-
-
-
-        if (pieceType != PieceType.None)
-        {
-          targetSquareFromPriorMoveFromOurPerspective = pos.IsWhite ? toSquare.SquareIndexStartA1
-                                                                    : toSquare.Reversed.SquareIndexStartA1;
-        }
-
-        EncodedPositionBatchFlat batchFlat = batch as EncodedPositionBatchFlat; 
-        TPGRecordConverter.ConvertToTPGCombo(in pos, targetSquareFromPriorMoveFromOurPerspective, false, default, ref tpgRecordCombo);
-
-        // TODO: Consider if we could simplify and avoid code duplication, use this method
-        //   TPGRecordConverter.ConvertToTPGCombo(in EncodedTrainingPosition trainingPos, ref TPGRecordCombo tpgRecordCombo)
-        // like
-        //   TPGRecordConverter.ConvertToTPGCombo(in batchFlat.PositionsBuffer[i].BoardsHistory, ref tpgRecordCombo)
-
-        float[] rawDataSquaresAndMoves = tpgRecordCombo.SquareAndMoveRawValues;
-        for (int j = 0; j < rawDataSquaresAndMoves.Length; j++)
-        {
-          flatValuesPrimary[offsetAttentionInput++] = rawDataSquaresAndMoves[j];
-        }
-
-        if (TPGRecordCombo.NUM_RAW_BOARD_BYTES_TOTAL > 0)
-        {
-          TPGWriter.ExtractRawBoard(batchFlat.PositionsBuffer[i].Mirrored, ref tpgRecordCombo);
-          float[] rawBoardValues = tpgRecordCombo.BoardRawValues;
-          for (int j = 0; j < rawBoardValues.Length; j++)
-          {
-            flatValuesSecondary[offsetBoardInput++] = rawBoardValues[j];
-          }
-        }
-
-      }
-#endif
     }
 
 

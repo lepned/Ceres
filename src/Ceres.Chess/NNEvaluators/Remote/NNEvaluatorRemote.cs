@@ -234,12 +234,19 @@ namespace Ceres.Chess.NNEvaluators.Remote
         cachedInputsRequired |= InputTypes.Positions;
       }
 
+      // Plane materialization happens SERVER-side. Masking Boards out of the client's required
+      // inputs prevents the choke-point hook 2 from materializing planes on the client for an LC0
+      // server: the client ships the compact records instead (smaller wire), and the server
+      // materializes. Legacy plane producers still ship their existing planes (content-driven).
+      cachedInputsRequired &= ~InputTypes.Boards;
+
       EngineNetworkID = engineNetID;
       Description = $"Remote({hostname}:{port})";
 
-      // Ceres/TPG networks need PositionsBuffer populated in batches.
-      // Set the global flag so batch constructors retain position internals.
-      EncodedPositionBatchFlat.RETAIN_POSITION_INTERNALS = true;
+      // Ceres/TPG networks (which advertise CompactHistories) need position histories in the
+      // batches they receive. The client feeds batches through EvaluateIntoBuffers, so the
+      // choke-point hook 1 derives the compact records from planes (for producers that supply
+      // only planes) before serialization ships them - no retained PositionsBuffer needed.
     }
 
 

@@ -286,6 +286,40 @@ namespace Ceres.Chess.EncodedPositions
 
 
     /// <summary>
+    /// Reconstructs this position (history boards + miscellaneous info) from one row of the
+    /// flat batch plane representation, i.e. the exact inverse of the per-row encoding performed
+    /// by EncodedPositionBatchFlat.Set. The leading 104 piece-plane bitmaps are the 8 history
+    /// boards in extraction order (inverse of ExtractPlanesValuesIntoArray); the trailing misc
+    /// planes carry castling (indices 104-107), side to move (108) and Rule50 (109).
+    /// </summary>
+    /// <param name="rowBitmaps">the 112 plane bitmaps for one position</param>
+    /// <param name="rowValues">the 112 plane values for one position (only Rule50 at index 109 is read)</param>
+    public void SetFromPlanes(ReadOnlySpan<ulong> rowBitmaps, ReadOnlySpan<byte> rowValues)
+    {
+      const int NUM_PIECE_PLANES = EncodedPositionBoard.NUM_PLANES_PER_BOARD * EncodedPositionBoards.NUM_MOVES_HISTORY; // 104
+
+      // Board bitmaps -> the 8 history boards (exact inverse of ExtractPlanesValuesIntoArray).
+      fixed (EncodedPositionBoard* dest = &BoardsHistory.History_0)
+      fixed (ulong* src = rowBitmaps)
+      {
+        const int LEN = NUM_PIECE_PLANES * sizeof(ulong);
+        Buffer.MemoryCopy(src, dest, LEN, LEN);
+      }
+
+      // Misc planes -> misc info (mirrors the write order in EncodedPositionBatchFlat.Set:
+      // castling US OOO/OO, Them OOO/OO, side to move, Rule50). A castling/side bitmap is
+      // ulong.MaxValue when the flag is set, otherwise zero; Rule50 is carried as a plane value.
+      byte castlingUSOOO   = rowBitmaps[NUM_PIECE_PLANES + 0] != 0 ? (byte)1 : (byte)0;
+      byte castlingUSOO    = rowBitmaps[NUM_PIECE_PLANES + 1] != 0 ? (byte)1 : (byte)0;
+      byte castlingThemOOO = rowBitmaps[NUM_PIECE_PLANES + 2] != 0 ? (byte)1 : (byte)0;
+      byte castlingThemOO  = rowBitmaps[NUM_PIECE_PLANES + 3] != 0 ? (byte)1 : (byte)0;
+      byte sideToMove      = rowBitmaps[NUM_PIECE_PLANES + 4] != 0 ? (byte)1 : (byte)0;
+      byte rule50          = rowValues[NUM_PIECE_PLANES + 5];
+      MiscInfo.SetMisc(castlingUSOOO, castlingUSOO, castlingThemOOO, castlingThemOO, sideToMove, rule50);
+    }
+
+
+    /// <summary>
     /// Returns the EncodedPositionBoard corresponding to a specified history baord.
     /// </summary>
     /// <param name="historyIndex"></param>
@@ -621,23 +655,40 @@ namespace Ceres.Chess.EncodedPositions
 
       if (CheckMovedTheirPiece(in board0.TheirQueens, in board1.TheirQueens, ref destSquare))
       {
-        CheckMovedTheirPiece(in board1.TheirQueens, in board0.TheirQueens, ref sourceSquare);
+        if (!CheckMovedTheirPiece(in board1.TheirQueens, in board0.TheirQueens, ref sourceSquare))
+        {
+          // No queen vacated a square: this was a pawn promotion to a queen;
+          // the source square is the mover's pawn which disappeared.
+          CheckMovedTheirPiece(in board1.TheirPawns, in board0.TheirPawns, ref sourceSquare);
+        }
         return (PieceType.Queen, sourceSquare, destSquare, false);
       }
 
       if (CheckMovedTheirPiece(in board0.TheirRooks, in board1.TheirRooks, ref destSquare))
       {
-        CheckMovedTheirPiece(in board1.TheirRooks, in board0.TheirRooks, ref sourceSquare);
+        if (!CheckMovedTheirPiece(in board1.TheirRooks, in board0.TheirRooks, ref sourceSquare))
+        {
+          // Pawn promotion to a rook (see queen case above).
+          CheckMovedTheirPiece(in board1.TheirPawns, in board0.TheirPawns, ref sourceSquare);
+        }
         return (PieceType.Rook, sourceSquare, destSquare, false);
       }
       if (CheckMovedTheirPiece(in board0.TheirBishops, in board1.TheirBishops, ref destSquare))
       {
-        CheckMovedTheirPiece(in board1.TheirBishops, in board0.TheirBishops, ref sourceSquare);
+        if (!CheckMovedTheirPiece(in board1.TheirBishops, in board0.TheirBishops, ref sourceSquare))
+        {
+          // Pawn promotion to a bishop (see queen case above).
+          CheckMovedTheirPiece(in board1.TheirPawns, in board0.TheirPawns, ref sourceSquare);
+        }
         return (PieceType.Bishop, sourceSquare, destSquare, false);
       }
       if (CheckMovedTheirPiece(in board0.TheirKnights, in board1.TheirKnights, ref destSquare))
       {
-        CheckMovedTheirPiece(in board1.TheirKnights, in board0.TheirKnights, ref sourceSquare);
+        if (!CheckMovedTheirPiece(in board1.TheirKnights, in board0.TheirKnights, ref sourceSquare))
+        {
+          // Pawn promotion to a knight (see queen case above).
+          CheckMovedTheirPiece(in board1.TheirPawns, in board0.TheirPawns, ref sourceSquare);
+        }
         return (PieceType.Knight, sourceSquare, destSquare, false);
       }
       if (CheckMovedTheirPiece(in board0.TheirPawns, in board1.TheirPawns, ref destSquare))

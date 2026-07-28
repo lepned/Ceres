@@ -52,6 +52,18 @@ public static class RegularizedPolicyOptimum
   /// </summary>
   private const int MAX_ACTIONS = 64;
 
+  /// <summary>
+  /// Clamp range applied (under RPOOptions.ClampQ) to finite q values and to the
+  /// NaN-fallback value on the REVERSE-KL path.  Deliberately slightly wider than the
+  /// [-1, 1] value scale so proven-win/loss encodings (|v| slightly above 1; see
+  /// ParamsSelect.WinPForProvenWin) survive the clamp and remain strictly preferred
+  /// over near-certain NN evaluations.  The forward-KL path intentionally clamps to
+  /// [-1, 1] instead: its q values are Boltzmann-imputed GUESSES for unvisited
+  /// children, which should never claim proven-result magnitudes.
+  /// </summary>
+  private const double CLAMP_Q_MIN = -1.2;
+  private const double CLAMP_Q_MAX = 1.2;
+
   // Per-thread scratch reused across Solve calls in place of per-call stackalloc/ArrayPool.
   // Each buffer is lazily allocated once per thread to MAX_ACTIONS and then sliced to the
   // live action count n on every call.  [ThreadStatic] gives each search thread its own set
@@ -78,9 +90,12 @@ public static class RegularizedPolicyOptimum
   /// <param name="lambda">Regularization strength (scalar).  Must be greater than or equal to 0 for reverse KL, greater than 0 for forward KL.</param>
   /// <param name="anchor">Determines the free intercept C(s) for forward-KL imputation.  Must be None for reverse KL.</param>
   /// <param name="regularization">ReverseKL (Grill) or ForwardKLSoftmax (Boltzmann).</param>
-  /// <param name="yOut">Output buffer for y* (length greater than or equal to n).  May be empty if y* is not needed.</param>
+  /// <param name="yOut">Output buffer for y* (length greater than or equal to n).  May be empty if y* is not needed.
+  /// IMPORTANT: when empty, the solver takes an imputation-only fast path: q_fill is computed exactly as usual
+  /// (bit-identical), but y* is never formed (reverse KL skips the alpha root-find entirely; forward KL skips the
+  /// softmax) and vStarOut is NaN.</param>
   /// <param name="qFillOut">Output buffer for q_fill (length greater than or equal to n).  May be empty if not needed.</param>
-  /// <param name="vStarOut">Output: v* = sum_a y*(a) q_fill(a).</param>
+  /// <param name="vStarOut">Output: v* = sum_a y*(a) q_fill(a).  NaN when yOut is empty (y* not computed).</param>
   /// <param name="options">Tuning knobs.  If the BisectionIterations field is 0, RPOOptions.Default is used.</param>
   /// <param name="nanFallbackQ">Fallback value used for NaN entries in q under reverse KL.  If itself NaN, the mean of the finite q's is used.</param>
   /// <param name="lambdaPerChild">Optional per-action lambda vector (length n).  When non-empty, replaces the scalar lambda in the per-action coefficient: coeff[i] = lambdaPerChild[i] * mu[i].  When empty, scalar lambda is used.  REVERSE-KL ONLY (forward-KL closed form does not generalize naturally to per-child lambda; an empty span is enforced there).</param>
@@ -197,8 +212,8 @@ public static class RegularizedPolicyOptimum
         qi = fallback;
       }
       if (opts.ClampQ)
-      { 
-        qi = Clamp(qi, -1.2, 1.2);
+      {
+        qi = Clamp(qi, CLAMP_Q_MIN, CLAMP_Q_MAX);
       }
       qFill[i] = qi;
 
@@ -225,6 +240,20 @@ public static class RegularizedPolicyOptimum
           maxQEff = qi;
         }
       }
+    }
+
+    // Imputation-only fast path (P1): the caller wants q_fill but not y*.  Under reverse
+    // KL the NaN imputation is just the fallback fill performed above - it does not
+    // depend on alpha - so the entire root-find and y construction can be skipped.
+    // q_fill is bit-identical to the full path's; vStar is NaN by contract.
+    if (yOut.IsEmpty)
+    {
+      vStarOut = double.NaN;
+      if (!qFillOut.IsEmpty)
+      {
+        qFill.CopyTo(qFillOut);
+      }
+      return;
     }
 
     // Degenerate cases: greedy on q if no positive coefficient or every lambda is tiny.
@@ -337,9 +366,27 @@ public static class RegularizedPolicyOptimum
       }
       if (opts.ClampQ)
       {
+        // Deliberately [-1, 1] (not CLAMP_Q_MIN/MAX): forward-KL q's are imputed
+        // guesses and must not reach proven-result magnitudes (see CLAMP_Q_MIN docs).
         qi = Clamp(qi, -1.0, 1.0);
       }
       qFill[i] = qi;
+    }
+
+    // Imputation-only fast path (P1): the caller wants q_fill but not y*.  q_fill is
+    // fully determined above (the softmax below never feeds back into it), so the
+    // exp-per-action softmax, its normalization, and the v* dot product are skipped.
+    // This is the hot path for the two production imputation call sites: per-child FPU
+    // (PUCTSelector.ApplyRPOImputedFPU) and the CB-GPUCT policy-shaped shrinkage prior
+    // (CBGPUCTScoreCalc.ComputePolicyImpliedQ, invoked on every ComputeVBar backup).
+    if (yOut.IsEmpty)
+    {
+      vStarOut = double.NaN;
+      if (!qFillOut.IsEmpty)
+      {
+        qFill.CopyTo(qFillOut);
+      }
+      return;
     }
 
     // Compute y_i proportional to mu_i * exp(q_i / lambda) with numerically-stable shift.
@@ -462,15 +509,18 @@ public static class RegularizedPolicyOptimum
 
 
   /// <summary>
-  /// Selects the fallback value for NaN q entries.  If the caller supplied a finite
-  /// nanFallbackQ, uses that (optionally clamped).  Otherwise uses the mean of finite
-  /// q's; if no finite q exists, returns 0.
+  /// Selects the fallback value for NaN q entries (reverse-KL path).  If the caller
+  /// supplied a finite nanFallbackQ, uses that (optionally clamped).  Otherwise uses
+  /// the mean of finite q's; if no finite q exists, returns 0.  The clamp range is
+  /// CLAMP_Q_MIN/MAX, matching the clamp applied to finite q's in SolveReverseKL
+  /// (historically this clamped to [-1, 1], inconsistently flattening proven-result
+  /// fallback values such as a parent Q slightly above 1).
   /// </summary>
-  private static double ResolveFallback(ReadOnlySpan<double> q, double nanFallbackQ, bool clampToUnit)
+  private static double ResolveFallback(ReadOnlySpan<double> q, double nanFallbackQ, bool clamp)
   {
     if (IsFinite(nanFallbackQ))
     {
-      return clampToUnit ? Clamp(nanFallbackQ, -1.0, 1.0) : nanFallbackQ;
+      return clamp ? Clamp(nanFallbackQ, CLAMP_Q_MIN, CLAMP_Q_MAX) : nanFallbackQ;
     }
     double sum = 0.0;
     int count = 0;
@@ -487,7 +537,7 @@ public static class RegularizedPolicyOptimum
       return 0.0;
     }
     double mean = sum / count;
-    return clampToUnit ? Clamp(mean, -1.0, 1.0) : mean;
+    return clamp ? Clamp(mean, CLAMP_Q_MIN, CLAMP_Q_MAX) : mean;
   }
 
 
@@ -522,10 +572,20 @@ public static class RegularizedPolicyOptimum
 
     // Bracket [xl, xh] for the strictly-increasing g(a) = 1 - S(a):
     //   xl just above the largest active qEff, where S -> +inf  => g(xl) < 0
-    //   xh grown (doubling the span above maxQEff) until S(xh) < 1 => g(xh) > 0
+    //   xh: analytic upper bound.  At a = maxQEff + sumCoeff every active term satisfies
+    //   coeff_i/(a - qEff_i) <= coeff_i/sumCoeff, so S(a) <= 1; a tiny relative margin makes
+    //   the inequality strict (covers the single-active-child equality case).  This brackets
+    //   in one evaluation and starts the solve far tighter than the historical maxQEff + 1
+    //   (sumCoeff is typically the lambda scale, i.e. << 1).  The doubling expansion below is
+    //   retained purely as an FP-safety fallback.
+    double sumCoeff = 0.0;
+    for (int i = 0; i < coeff.Length; i++)
+    {
+      sumCoeff += coeff[i];
+    }
     double xl = maxQEff + EPS;
-    double xh = maxQEff + 1.0;
-    if (!(xh > xl))
+    double xh = maxQEff + (sumCoeff * (1.0 + 1e-9)) + EPS;
+    if (!(xh > xl) || !IsFinite(xh))
     {
       xh = xl + 1.0;
     }
@@ -635,16 +695,29 @@ public static class RegularizedPolicyOptimum
                                       Span<double> d, Span<double> ratio,
                                       out double s, out double sPrime)
   {
-    // d_i = qEff_i - alpha
-    TensorPrimitives.Subtract(qEff, alpha, d);
-
-    // ratio_i = coeff_i / d_i ;  S = sum_i coeff_i/(alpha - qEff_i) = -sum_i ratio_i
-    TensorPrimitives.Divide(coeff, d, ratio);
-    s = -TensorPrimitives.Sum(ratio);
-
-    // ratio_i <- ratio_i / d_i = coeff_i / d_i^2 = coeff_i/(alpha - qEff_i)^2 ;  S' = -sum_i ratio_i
-    TensorPrimitives.Divide(ratio, d, ratio);
-    sPrime = -TensorPrimitives.Sum(ratio);
+    // Fused single pass with one reciprocal per active element.  This replaced a 5-pass
+    // TensorPrimitives formulation (Subtract, Divide, Sum, Divide, Sum): for the typical
+    // n = 5-80 the per-call dispatch and intermediate span traffic of five vector passes
+    // exceeds the cost of one scalar loop, and the reciprocal-and-multiply form trades the
+    // second division for a multiply.  Results differ from the vector form only by FP
+    // rounding (reassociation of the sums).  The d/ratio scratch spans are retained in the
+    // signature for call-site compatibility but are no longer written.
+    double sum = 0.0;
+    double sumDeriv = 0.0;
+    int n = coeff.Length;
+    for (int i = 0; i < n; i++)
+    {
+      double c = coeff[i];
+      if (c != 0.0)
+      {
+        double inv = 1.0 / (alpha - qEff[i]);
+        double r = c * inv;
+        sum += r;
+        sumDeriv += r * inv;
+      }
+    }
+    s = sum;            // S(alpha)  =  sum_i coeff_i/(alpha - qEff_i)
+    sPrime = -sumDeriv; // S'(alpha) = -sum_i coeff_i/(alpha - qEff_i)^2
   }
 
 

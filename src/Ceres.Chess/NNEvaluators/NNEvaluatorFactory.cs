@@ -371,11 +371,6 @@ namespace Ceres.Chess.NNEvaluators
 
           bool isTorchscipt = deviceDef.OverrideEngineType?.Contains("TORCHSCRIPT", StringComparison.OrdinalIgnoreCase) == true;
 
-          // Temporary hack, Ceres nets requires positions to be retained.
-          // TODO: Remove this, or make it an instance variable not global static.
-          //       Leaving this globally enabled may impact performance of all evaluators.
-          EncodedPositionBatchFlat.RETAIN_POSITION_INTERNALS = true;
-
           // TODO: Derive these values from NNEvaluatorOptions in the definition object
           const bool ENABLE_PROFILING = false;
           const bool USE_HISTORY = true;
@@ -454,7 +449,6 @@ namespace Ceres.Chess.NNEvaluators
                                              ENABLE_PROFILING, false, USE_HISTORY, optionsCeres,
                                              true, optionsCeres.UsePriorState, optionsCeres.HeadOverrides);
 
-            EncodedPositionBatchFlat.RETAIN_POSITION_INTERNALS = true; // ** TODO: remove/rework
             onnxEngine.ConverterToFlatFromTPG = (options, o, f1) => TPGConvertersToFlat.ConvertToFlatTPGFromTPG(options, o, f1.Span);
             onnxEngine.ConverterToFlat = (options, o, history, squaresBytes, squares, legalMoveIndices)
               => TPGConvertersToFlat.ConvertToFlatTPG(options, o, history, squaresBytes, squares, legalMoveIndices);

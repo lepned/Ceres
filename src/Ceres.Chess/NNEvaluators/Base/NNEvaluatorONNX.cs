@@ -81,8 +81,15 @@ public class NNEvaluatorONNX : NNEvaluator
 
   /// <summary>
   /// Types of input(s) required by the evaluator.
+  /// TPG nets consume only the TPG converter output (built from CompactHistories) plus
+  /// Positions/Moves/State; the LC0 board planes are never read, so Boards is not requested
+  /// and producers (e.g. MCGS SetBatch) skip plane encoding entirely for these nets.
   /// </summary>
-  public override InputTypes InputsRequired => InputTypes.Positions | InputTypes.Boards | InputTypes.Moves | (HasState ? InputTypes.State : 0);
+  public override InputTypes InputsRequired => Type == ONNXNetExecutor.NetTypeEnum.TPG
+                                             ? InputTypes.Positions | InputTypes.Moves
+                                               | (HasState ? InputTypes.State : 0) | InputTypes.CompactHistories
+                                             : InputTypes.Positions | InputTypes.Boards | InputTypes.Moves
+                                               | (HasState ? InputTypes.State : 0);
 
 
   /// <summary>
@@ -536,8 +543,20 @@ public class NNEvaluatorONNX : NNEvaluator
       lock (Executor)
       {
         // Do not use state if we are lacking early history (seems the net does not expect that).
-        Predicate<int> shouldUseStateForPos = i => batch.PositionsBuffer.Span[i].BoardsHistory.History_1
-                                                != batch.PositionsBuffer.Span[i].BoardsHistory.History_2;
+        Predicate<int> shouldUseStateForPos = i =>
+        {
+          if (!batch.CompactHistories.IsEmpty && batch.CompactHistories.Span[i].IsPopulated)
+          {
+            // Equivalent of the legacy History_1 != History_2 test:
+            // under history fill-in, boards 1 and 2 are identical unless at least 3 real
+            // positions exist; without fill-in, board 2 is nonempty already with 2 positions.
+            ref readonly MGPositionHistoryCompact ch = ref batch.CompactHistories.Span[i];
+            return ch.NumPositions >= (ch.FillInHistory ? 3 : 2);
+          }
+
+          throw new Exception("State-enabled evaluator requires CompactHistories on the batch "
+                            + "(populated by the producer or derived by the choke-point hook 1)");
+        };
         int numPositionsInBatchSentToExecutor = numPos < Executor.MinBatchSize ? Executor.MinBatchSize : numPos;
 
         if (HasSquaresByteInput)

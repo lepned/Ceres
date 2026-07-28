@@ -78,16 +78,40 @@ namespace Ceres.Chess.LC0.Batches
     Memory<MGMoveList> Moves { get; set; }
 
     /// <summary>
-    /// If originated from EncodedPositionWithHistory then
-    /// this field optionally holds the origin data array.
+    /// Optionally the compact per-position history records
+    /// (the canonical position-history representation consumed by TPG conversion).
     /// </summary>
-    Memory<EncodedPositionWithHistory> PositionsBuffer
+    Memory<MGPositionHistoryCompact> CompactHistories
     {
       get
       {
         return default;
       }
     }
+
+    /// <summary>
+    /// Whether the CompactHistories records for all rows [0, NumPos) are currently valid.
+    /// See EncodedPositionBatchFlat.CompactHistoriesPopulated for the staleness contract.
+    /// </summary>
+    bool CompactHistoriesPopulated { get; }
+
+    /// <summary>
+    /// Ensures CompactHistories records exist for all rows, deriving them from the LC0 plane
+    /// arrays when a producer supplied only planes. Idempotent.
+    /// </summary>
+    void EnsureCompactHistories();
+
+    /// <summary>
+    /// Whether the LC0 plane arrays for all rows [0, NumPos) are currently valid.
+    /// See EncodedPositionBatchFlat.PlanesPopulated for the staleness contract.
+    /// </summary>
+    bool PlanesPopulated { get; }
+
+    /// <summary>
+    /// Materializes the LC0 plane arrays for all rows from the compact history records, for
+    /// compact-only producers feeding LC0 nets. Idempotent.
+    /// </summary>
+    void MaterializePlanesFromCompactHistories();
 
     /// <summary>
     /// Number of positions actually used within the batch

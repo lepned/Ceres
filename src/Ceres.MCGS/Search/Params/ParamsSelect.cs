@@ -37,18 +37,14 @@ public record ParamsSelect
 
   /// <summary>
   /// Shared default for the "base" constant in the Lc0-style log growth term
-  /// log((N + base + 1) / base).  Used by the standard PUCT exploration formula
-  /// (CPUCTBase / CPUCTBaseAtRoot) and by the CB-GPUCT coefficient log term
-  /// (CBGPUCT_SelectLambdaCLogBase).
+  /// log((N + base + 1) / base), used by the standard PUCT exploration formula
+  /// (CPUCTBase / CPUCTBaseAtRoot).
   /// </summary>
   public const float DEFAULT_LOG_GROWTH_BASE = USE_ZZTUNE ? 38739.0f : 45669.0f;
 
   /// <summary>
-  /// Shared default for the multiplicative "factor" on the Lc0-style log growth term.
-  /// Used by standard PUCT (CPUCTFactor / CPUCTFactorAtRoot) and by the CB-GPUCT
-  /// coefficient log term (CBGPUCT_SelectLambdaCLogFactor).  Making CB-GPUCT use the
-  /// same constants makes its exploration scaling parallel to standard PUCT's, so the
-  /// two boosts compose (or cancel) in known ways.
+  /// Shared default for the multiplicative "factor" on the Lc0-style log growth term,
+  /// used by standard PUCT (CPUCTFactor / CPUCTFactorAtRoot).
   /// </summary>
   public const float DEFAULT_LOG_GROWTH_FACTOR = USE_ZZTUNE ? 3.894f : 3.973f;
 
@@ -80,8 +76,7 @@ public record ParamsSelect
     ///	Uses policy-based imputation to estimate Q values.
     /// Per-child imputed Q via Boltzmann calibration over the policy, with an anchor (such as parent V).
     /// The choice of KL divergence is controlled by ParamsSelect.RPOFPURegularization
-    /// (default ForwardKLSoftmax, identical to PolicyImputed; flip to ReverseKL for
-    /// FPU values that are mathematically consistent with CB-GPUCT selection).
+    /// (default ForwardKLSoftmax, identical to PolicyImputed).
     /// </summary>
     PolicyImputedRPO,
   };
@@ -94,7 +89,7 @@ public record ParamsSelect
 
   /// <summary>
   /// Temperature (lambda) of the policy->Q imputation in RegularizedPolicyOptimum.Solve
-  /// (fills Q for unvisited children = FPU, and the CB-GPUCT backup shrinkage prior).
+  /// (fills Q for unvisited children = FPU, and the TPS backup shrinkage targets).
   /// Default forward-KL form:  q(a) = anchorQ + tau*(log mu_a - E_mu[log mu]).  Higher tau
   /// spreads imputed Q further by policy (top-policy moves look better, tail moves worse),
   /// sharpening the search toward the policy rather than broadening it; tau -> 0 gives a
@@ -104,40 +99,17 @@ public record ParamsSelect
 
 
   /// <summary>
-  /// Choice of KL divergence used by the CB-GPUCT selection rule when computing pi_bar
-  /// via RegularizedPolicyOptimum.Solve.  Default ReverseKL matches Grill et al. and
-  /// the historical CBGPUCTScoreCalc behavior.
-  /// </summary>
-  public RPORegularization RPOSelectRegularization = RPORegularization.ReverseKL;
-
-  /// <summary>
-  /// Choice of KL divergence used by the CB-GPUCT V_bar backup when computing the
-  /// regularized state value via RegularizedPolicyOptimum.Solve.  Default ReverseKL
-  /// matches the historical CBGPUCTScoreCalc.ComputeVBar behavior.
-  /// </summary>
-  public RPORegularization RPOBackupRegularization = RPORegularization.ReverseKL;
-
-  /// <summary>
   /// Choice of KL divergence used by the per-child FPU imputation (FPUMode = PolicyImputed
   /// or PolicyImputedRPO).  Default ForwardKLSoftmax preserves the historical Boltzmann
-  /// behavior exactly.  Setting this to ReverseKL makes the FPU mathematically consistent
-  /// with the CB-GPUCT selection rule (at the cost of needing to retune PolicyImputationTau).
+  /// behavior exactly (and is required by the TPS backup's shrinkage targets).
   /// </summary>
   public RPORegularization RPOFPURegularization = RPORegularization.ForwardKLSoftmax;
 
   /// <summary>
-  /// Amount by which unvisited child value scores are shifted in RPO mode
+  /// Amount by which unvisited (unexpanded) child value scores are shifted in RPO mode
   /// from the value computed by RPO imputation.
   /// </summary>
-  public float RPOFPUValue = -0.15f;
-
-  /// <summary>
-  /// Apportionment algorithm used to translate pi_bar into a concrete visit allocation
-  /// in CB-GPUCT.  Default IterativeLargestDeficit matches the historical CBGPUCT inner
-  /// loop exactly; HamiltonClosedForm is behaviorally equivalent up to tie-breaking and
-  /// is faster for large batches.
-  /// </summary>
-  public RPOAllocationAlgorithm RPOSelectAllocator = RPOAllocationAlgorithm.IterativeLargestDeficit;
+  public float RPOFPUValue = 0.0f;
 
   /// <summary>
   /// Choice of base anchor VALUE used to calibrate per-child imputed Q for unvisited
@@ -152,8 +124,9 @@ public record ParamsSelect
   ///
   /// Options:
   ///   ParentV                  - node.NodeRef.V (raw NN value head; unaffected by search).
-  ///   ParentQ                  - node.Q (search-improved Q; under CBGPUCT this is the
-  ///                              previous V_bar, selfV-blended and possibly stale).
+  ///   ParentQ                  - node.Q (search-improved Q; under the TPS backup this is
+  ///                              the previous tempered-posterior V, selfV-blended and
+  ///                              possibly stale).
   ///                              This reproduces the legacy FPU anchor value exactly.
   ///   FirstChildElseParentQ    - observed Q of child 0 (parent perspective) if visited,
   ///                              else node.Q.  Useful when child 0 is reliably the
@@ -167,7 +140,7 @@ public record ParamsSelect
   ///   BlendBestChildParentQ    - 0.5 * (best visited child Q + node.Q), else node.Q.
   ///                              Compromise between BestChild and ParentQ.
   /// </summary>
-  public enum CBGPUCTQAnchorType
+  public enum FPUQAnchorType
   {
     ParentV,
     ParentQ,
@@ -182,8 +155,10 @@ public record ParamsSelect
   /// legacy behavior: anchor.Value = node.Q in both legacy branches (MatchChild
   /// when child 0 visited, MatchValue otherwise - the mode switch is unrelated to
   /// the value and remains driven by child 0's visit status regardless of this enum).
+  /// (Renamed from CBGPUCT_QAnchorTypeFPU in the 2026-07 TPS consolidation; it is
+  /// genuinely FPU-owned.)
   /// </summary>
-  public CBGPUCTQAnchorType CBGPUCT_QAnchorTypeFPU = CBGPUCTQAnchorType.ParentQ;
+  public FPUQAnchorType FPU_QAnchorType = FPUQAnchorType.ParentQ;
 
 
   /// <summary>
@@ -274,456 +249,199 @@ public record ParamsSelect
   public bool UseDynamicVLoss = false;
 
 
-  #region CB-GPUCT (visit-target regularized-policy graph MCTS) parameters
+  #region TPS (Tempered Posterior Search) parameters
 
   /// <summary>
-  /// Selects which CB-GPUCT components are active
-  /// (potentially regularized select/backup according to
-  /// "Monte-Carlo tree search as regularized policy optimization" (Grill et al 2022).
+  /// Selects which TPS components are active.  See TPS_PROPOSAL.md and
+  /// TPS_CAMPAIGN_RESULTS.md (harness repo, IntegrationTests) for the design and the
+  /// tuning/ablation evidence.
   /// </summary>
-  public enum CBGPUCTModeType
+  public enum TPSModeType
   {
     /// <summary>
-    /// CB-GPUCT off; standard PUCT selection and standard Q-pure backup.
+    /// TPS off; standard Ceres PUCT selection and standard Q-pure backup.
     /// </summary>
     None,
 
     /// <summary>
-    /// Visit-target pi_bar selection (replaces PUCT scoring); standard backup.
-    /// </summary>
-    SelectOnly,
-
-    /// <summary>
-    /// Standard PUCT selection; V_bar regularized backup (overwrites node.Q).
+    /// Standard PUCT selection; TPS tempered-posterior backup
+    /// (TPSScoreCalc.ComputeVBar overwrites node.Q).
+    /// Requires FPUMode=PolicyImputedRPO + RPOFPURegularization=ForwardKLSoftmax
+    /// (the imputation machinery supplies the shrinkage targets), graph mode, and
+    /// ParamsSearch.TrackLeafValueVolatility (the measured-noise oracle; proven
+    /// load-bearing by the 2026-07-13 frozen-s ablation) - all enforced in
+    /// Validate/ValidateAgainst.
     /// </summary>
     BackupOnly,
 
     /// <summary>
-    /// Both: pi_bar selection AND V_bar regularized backup.
+    /// PLACEHOLDER (throws NotImplementedException in Validate): TPS selection.
+    /// A new SELECT algorithm is forthcoming; the exponential-tilt and reverse-KL
+    /// noise-lambda select designs tested in the 2026-07 campaign were removed.
     /// </summary>
-    SelectAndBackup
+    SelectOnly,
+
+    /// <summary>
+    /// PLACEHOLDER (throws NotImplementedException in Validate): TPS selection + backup.
+    /// </summary>
+    SelectAndBackup,
   }
 
   /// <summary>
-  /// CB-GPUCT mode (see CBGPUCTModeType). Default None disables CB-GPUCT entirely.
+  /// TPS mode (see TPSModeType). Default None = standard Ceres PUCT throughout.
   /// </summary>
-  public CBGPUCTModeType CBGPUCT_Mode = CBGPUCTModeType.None;
+  public TPSModeType TPS_Mode = TPSModeType.None;
 
   /// <summary>
-  /// Convenience predicate: visit-target pi_bar selection is active.
+  /// Convenience predicate: TPS tempered-posterior backup is active.
   /// </summary>
   [JsonIgnore]
-  public bool CBGPUCTSelectActive => CBGPUCT_Mode == CBGPUCTModeType.SelectOnly
-                                  || CBGPUCT_Mode == CBGPUCTModeType.SelectAndBackup;
+  public bool TPSBackupActive => TPS_Mode == TPSModeType.BackupOnly
+                              || TPS_Mode == TPSModeType.SelectAndBackup;
 
   /// <summary>
-  /// Convenience predicate: visit-target pi_bar selection is active for a parent node
-  /// with the specified visit count <paramref name="n"/>.
-  ///
-  /// This is true only when CB-GPUCT select is enabled (see CBGPUCTSelectActive) AND the
-  /// parent N has not exceeded CBGPUCT_PUCTAboveN.  Once the parent N grows strictly larger
-  /// than CBGPUCT_PUCTAboveN the selection falls back to standard PUCT for that node.
-  /// </summary>
-  /// <param name="n">Parent node visit count N.</param>
-  /// <returns>True if CB-GPUCT visit-target selection should run for this parent; false to fall back to PUCT.</returns>
-  public bool CBGPUCTSelectActiveAtN(int n) => CBGPUCTSelectActive && n <= CBGPUCT_PUCTAboveN;
-
-
-  /// <summary>
-  /// Convenience predicate: V_bar regularized backup is active.
+  /// Gate for the backup call sites: the TPS recompute-from-children backup replaces
+  /// the standard visit-weighted Q backup.  (Alias of TPSBackupActive, kept as the
+  /// stable name the backup sites reference.)
   /// </summary>
   [JsonIgnore]
-  public bool CBGPUCTBackupActive => CBGPUCT_Mode == CBGPUCTModeType.BackupOnly
-                                  || CBGPUCT_Mode == CBGPUCTModeType.SelectAndBackup;
-
-  #region Support-shrinkage (the sole CB-GPUCT robustness mechanism, select + backup)
+  internal bool RegularizedBackupActive => TPSBackupActive;
 
   /// <summary>
-  /// MASTER TOGGLE + prior strength for the unified support-shrinkage backup.
-  ///
-  /// When &gt; 0, ComputeVBar uses a single posterior-mean Q estimate per child
-  ///   q_hat(a) = (N_a^p * q_obs(a) + K * m_a) / (N_a^p + K)     for visited children
-  ///   q_hat(a) = m_a                                            for unvisited (the N_a = 0 limit)
-  /// and uses it CONSISTENTLY for BOTH the pi_bar weights AND the V_bar dot product:
-  ///   pi_bar = ReverseKL(mu, q_hat, lambda_N),
-  ///   V_bar  = (sum_a pi_bar(a) * q_hat(a) * (N - 1) + selfV) / N.
-  /// Here K = this knob (prior pseudo-visit count), p = CBGPUCT_BackupSupportShrinkageDecayExponent,
-  /// N_a = child.N (statistical support; cross-parent in graph mode), and m_a is the
-  /// empirical-Bayes prior: the support-weighted consensus of the children themselves,
-  /// policy-shaped via the existing forward-KL imputation -
-  ///   q_bar = sum_a N_a q_a / sum_a N_a,   m_a = q_bar + tau*(log mu_a - E_mu[log mu]),   tau = PolicyImputationTau,
-  /// falling back to node.V when no child is visited.  N_a here (the consensus weight)
-  /// defaults to child.N but is selectable via CBGPUCT_ConsensusWeight (e.g. edge.N
-  /// for transposition-robustness); the shrinkage PRECISION below always uses child.N.
-  ///
-  /// Why one knob suffices: the bias being controlled (reverse-KL pi_bar over-weights
-  /// high-q children, so V_bar is a soft-max of noisy child Q's -> winner's-curse /
-  /// max-operator overestimation that compounds toward the root) is driven by the NOISE
-  /// in each q_obs(a), which scales as 1/sqrt(N_a).  Shrinking each estimate toward the
-  /// prior in proportion to its own support (the conjugate / James-Stein posterior mean)
-  /// denoises it by exactly that amount, and using the same denoised value in the dot
-  /// product bounds its contribution at the source.  A single-visit outlier (e.g. 12,553
-  /// visits elsewhere, one new child returning a lucky +0.8) is shrunk hard toward the
-  /// consensus so it "moves the needle a little, not a lot"; as consistent evidence
-  /// accrues N_a grows, shrinkage vanishes, and the move is progressively believed
-  /// (q_hat -> q_obs as N_a -> infinity).
-  ///
-  /// This is the SOLE backup robustness mechanism (the legacy Q-shrinkage, pi_bar caps,
-  /// mean-preserve control variate, observed-only, anchor-type/anchorK blend, fixed-point
-  /// iteration, and per-child lambda have all been removed in favor of it).  Still active
-  /// alongside it: the lambda_N schedule (CBGPUCT_BackupLambda*), RPOBackupRegularization,
-  /// and PolicyImputationTau.
-  ///
-  /// 0 disables shrinkage (plain Grill V_bar: q_hat = q_obs for visited children, the
-  /// policy-implied prior for unvisited).  Typical setting 3-10; behavior is insensitive
-  /// across that range.  Default 3.
+  /// TPS backup temperature coefficient k_b: tau_backup = k_b * sigma_bar * sqrt(2 ln k),
+  /// with k the number of visited children and sigma_bar the node's measured value-noise
+  /// scale (support-weighted median of the children's standard errors s_i / sqrt(n_i + 1),
+  /// s_i = measured leaf-value volatility).  The sqrt(2 ln k) factor is the analytic
+  /// winner's-curse scale.  Dimensionless.  Default 0.25 from the 2026-07-13 tuning
+  /// campaign (interior optimum; the analytic k_b~1 starting point was ~4x too warm).
   /// </summary>
-  public float CBGPUCT_BackupSupportShrinkageK = 3.0f;
+  public float TPS_BackupTemperatureK = 0.25f;
 
   /// <summary>
-  /// Decay exponent p in the support-shrinkage posterior mean
-  ///   q_hat(a) = (N_a^p * q_obs(a) + K * m_a) / (N_a^p + K).
-  /// p = 1 is the principled conjugate / Bayesian rate (shrink weight K/(N_a + K),
-  /// asymptotic 1/N decay).  p &gt; 1 makes the shrinkage vanish faster past N_a = 1
-  /// while leaving the N_a = 1 value unchanged (since 1^p = 1) - motivated by NN-eval-
-  /// based search where per-visit information can exceed the conjugate-Normal assumption.
-  /// Typical range [1.0, 2.0]; default 1.0.  Only used when
-  /// CBGPUCT_BackupSupportShrinkageK &gt; 0.
+  /// TPS robust-Q prior-confidence scale sigma0: each child's search Q is shrunk toward
+  /// its policy-imputed FPU value with weight w = sigma0^2 / (sigma0^2 + sigma_hat^2)
+  /// (inverse-variance shrinkage).  How much estimated standard error we tolerate before
+  /// distrusting search Q.  Equivalent to James-Stein with K_eff = (s/sigma0)^2 per unit
+  /// support.  Default 0.10 from the 2026-07-13 campaign (interior optimum; smaller
+  /// values over-shrink toward the policy consensus, larger under-guard the max).
   /// </summary>
-  public float CBGPUCT_BackupSupportShrinkageDecayExponent = 1.0f;
-
-  /// <summary>
-  /// Master toggle + strength (beta) of the BACKUP BREADTH BONUS: an additive max-entropy
-  /// style credit that makes a node with multiple good moves back up a slightly higher
-  /// value than an otherwise-equal node resting on a SINGLE good move.
-  ///
-  /// Why needed: the plain regularized value V_bar = sum_a pi_bar(a) q_hat(a) is an
-  /// expected-q (a weighted average bounded by max_a q_hat).  Near-best alternatives drag
-  /// that average DOWN, so V_bar actually mildly penalizes breadth; and as lambda_N -&gt; 0
-  /// at high N, pi_bar collapses onto the single argmax child and V_bar -&gt; max_a q_hat,
-  /// erasing any multi-move distinction entirely.  This term restores (and makes explicit)
-  /// the dropped max-entropy bonus  -lambda*KL(pi_bar||mu)  from the soft-value identity
-  ///   lambda*log sum_a mu_a exp(q_a/lambda) = E_pi[q] - lambda*KL(pi_bar||mu),
-  /// the part the energy-only V_bar discards.
-  ///
-  /// HIGH-N PERSISTENCE: breadth is measured on a value-softmax at a fixed temperature
-  /// CBGPUCT_BackupBreadthTemperature (NOT lambda_N), so unlike H(pi_bar) - which -&gt; 0 as
-  /// lambda_N collapses - this signal survives at large N, exactly where the plain
-  /// mechanism's benefit was observed to fade.
-  ///
-  /// ADVERSARIAL ASYMMETRY (free, no parity knob): the bonus is added in the node's OWN
-  /// (side-to-move) perspective.  Through the existing negamax edge negation (-edge.Q) an
-  /// ancestor reads it with alternating sign, so it rewards the mover's own optionality and
-  /// penalizes the opponent's reply breadth (prophylaxis / "pose the opponent problems").
-  ///
-  /// SAFETY: gated by (1 - |V_bar|) so it fades to 0 at decided/terminal/won-lost nodes
-  /// (proven mates already short-circuit before ComputeVBar), and hard-capped at
-  /// CBGPUCT_BackupBreadthBonusMax so it can never override a genuinely winning narrow move
-  /// (forced tactics / only-moves).  It is a tie-breaker among near-equal candidates, not a
-  /// dominant term.
-  ///
-  /// 0 disables (default; no behavior change).  Suggested starting point when enabling:
-  /// beta ~ 0.03-0.06 with the cap ~ 0.02-0.03.
-  /// Related literature: maximum-entropy MCTS (MENTS, Xiao et al. 2019), soft Q / SAC
-  /// (Haarnoja et al. 2018), MCTS-as-regularized-policy-optimization (Grill et al. 2020),
-  /// convex/Tsallis regularization (Dam et al. 2021); "empowerment differential" for the
-  /// adversarial framing.
-  /// </summary>
-  public float CBGPUCT_BackupBreadthBonusBeta = 0.0f; // 0.03 is reasonable value to enable
-
-  /// <summary>
-  /// Fixed softmax temperature tau_b used to measure breadth for the backup breadth bonus
-  ///   w(a) proportional to mu(a) * exp((q_hat(a) - max_a q_hat) / tau_b),
-  /// whose normalized entropy H(w)/log(#contributing) in [0,1] is the breadth fraction.
-  /// Deliberately decoupled from lambda_N: this is what keeps the bonus alive at high N
-  /// (a lambda_N-based measure would vanish as pi_bar sharpens).  SMALL tau_b -&gt; only
-  /// children within ~tau_b of the best count as "good" (strict); LARGE tau_b -&gt; more
-  /// children count (lenient).  Comparable in scale to the spread of the top children's Q
-  /// (single digits of a centipawn-equivalent up to ~0.3). 
-  /// Only used when CBGPUCT_BackupBreadthBonusBeta &gt; 0; tau_b &lt;= 0 disables the bonus.
-  /// </summary>
-  public float CBGPUCT_BackupBreadthTemperature = 0.02f;
-
-  /// <summary>
-  /// Hard cap on the magnitude of the backup breadth bonus (in Q units, [-1,1] value
-  /// scale).  The bonus beta*breadthFrac*(1-|V_bar|) is clamped to [0, this] before being
-  /// added to V_bar, guaranteeing it can never flip a decision dominated by a real value
-  /// gap (e.g. a winning single move stays winning).  Default 0.03 (~a few centipawns).
-  /// Only used when CBGPUCT_BackupBreadthBonusBeta &gt; 0.
-  /// </summary>
-  public float CBGPUCT_BackupBreadthBonusMax = 0.03f;
-
-  /// <summary>
-  /// Parent-N upper bound for CB-GPUCT visit-target SELECTION.  
-  /// When the parent node's visit count N is strictly greater than this value, 
-  /// CB-GPUCT selection is bypassed for that node and standard PUCT selection runs instead.
-  /// Default int.MaxValue (never bypass on the high side).  
-  /// Affects selection only; the V_bar backup (if active) is unchanged.
-  /// </summary>
-  public int CBGPUCT_PUCTAboveN = 50;
-
-  /// <summary>
-  /// Prior strength K for the SELECT support-shrinkage in ScoreCalc - the select-phase
-  /// analogue of CBGPUCT_BackupSupportShrinkageK.  Each visited child's per-edge q (-W/N)
-  /// is shrunk toward the policy-shaped consensus prior by edge.N (the per-edge q's
-  /// statistical support); unvisited children keep their FPU value untouched (the FPU
-  /// exploration signal is not altered).  The shrunk q then feeds the pi_bar visit-target Solve.
-  /// 0 disables (plain RPO select).  
-  /// Default 0 or 1 (tests suggest needs less shrinkaage than Backup uses by default).
-  /// </summary>
-  public float CBGPUCT_SelectSupportShrinkageK = 0;
-
-  /// <summary>
-  /// Decay exponent p for the SELECT support-shrinkage (see
-  /// CBGPUCT_BackupSupportShrinkageDecayExponent for semantics; select uses edge.N as the
-  /// per-child support).  Default 1.0.  Only used when CBGPUCT_SelectSupportShrinkageK &gt; 0.
-  /// </summary>
-  public float CBGPUCT_SelectSupportShrinkageDecayExponent = 1.0f;
-
-  /// <summary>
-  /// Weight basis for the children when forming the empirical-Bayes consensus anchor
-  ///   q_bar = sum_a w_a q_a / sum_a w_a
-  /// that the shrinkage prior m_a is built around.  Shared by both the select and backup
-  /// support-shrinkage. Only the consensus weight is affected by this knob - the per-child
-  /// shrinkage precision N_a^p / (N_a^p + K) uses child.N in backup and edge.N in select
-  /// (the genuine statistical support of each phase's q - reliability, not preference,
-  /// which transpositions sharpen rather than bias).
-  ///
-  /// The choice matters only in graph mode with transpositions, where child.N is
-  /// inflated by transposition density - an exogenous graph property, not a sign that
-  /// search preferred the move from this parent.  A heavily-transposed child still
-  /// drives V_bar directly through pi_bar (it is barely shrunk and wins the weight on
-  /// its own merits), so the consensus's only remaining job is to prime the prior for
-  /// UNDER-EXPLORED local moves - for which the locally-revealed preference (edge.N) is
-  /// the more relevant weight.
-  /// WHY RAW child.N IS biased: under the hierarchical model q_a | theta_a ~ N(theta_a,
-  /// s^2/N_a), theta_a ~ N(mu0, tau^2), the posterior-mean estimate of the anchor mu0 is
-  /// q_bar = sum_a w_a q_a / sum_a w_a with w_a = 1/(tau^2 + s^2/N_a) proportional to
-  /// N_a/(N_a + Kc), Kc = s^2/tau^2.  Weighting by raw N_a (the ChildN mode) is the
-  /// Kc -> infinity limit, i.e. it assumes tau^2 -> 0: that every sibling move has the
-  /// same true value.  For chess that is false (moves differ a lot -> tau^2 large -> Kc
-  /// SMALL), so the correct weights sature: once a child is out of the high-noise
-  /// region, extra N_a (e.g. from incidental transposition density) should not keep
-  /// increasing its pull on the anchor.  The *Saturating modes implement that.
-  ///   ChildN : weight by child.N (textbook precision pooling; the tau^2 = 0 limit).  A
-  ///            BAD transposition hub - or even a benign low-policy one - can drag the
-  ///            target and over-shrink a good but moderately-supported local move.
-  ///            Matches the originally-validated behavior.
-  ///   EdgeN  : weight by per-edge N (this parent's revealed preference; transposition-
-  ///            free; reduces to ChildN exactly when there are no transpositions).
-  ///   Policy : weight by the prior policy mu (i.e. anchor at E_mu[q]); fully N-free but
-  ///            trusts the network prior, which is fragile when the policy is miscalibrated.
-  ///   ChildNSaturating : weight by child.N / (child.N + Kc), Kc = CBGPUCT_ConsensusReliabilityK.
-  ///            The principled finite-tau^2 estimator: low-N children are still suppressed 
-  ///            proportional to their reliability, any sufficiently-explored child counts ~once, 
-  ///            so a single huge-N transposition can no longer dominate the anchor.
-  ///   PolicyChildNSaturating : weight by mu * child.N / (child.N + Kc).  As above, plus
-  ///            an importance term so the anchor is set by the moves the policy actually
-  ///            prioritizes - a reliable but LOW-policy drawish transposition then
-  ///            contributes little even though its gate is ~1.  Most robust for backup.
-  /// Default ChildN (no behavior change vs. the initial implementation; identical to
-  /// EdgeN whenever there are no transpositions).  Only used when
-  /// CBGPUCT_BackupSupportShrinkageK &gt; 0.  NOTE: the saturating gate is applied in the
-  /// BACKUP consensus only; the SELECT consensus (whose q support is edge.N, already
-  /// transposition-free) maps the *Saturating modes to their non-saturating equivalents
-  /// (ChildNSaturating -> edge.N, PolicyChildNSaturating -> policy).
-  /// </summary>
-  public enum CBGPUCTConsensusWeightType { ChildN, EdgeN, Policy, ChildNSaturating, PolicyChildNSaturating }
-  public CBGPUCTConsensusWeightType CBGPUCT_ConsensusWeight = CBGPUCTConsensusWeightType.PolicyChildNSaturating;
-
-  /// <summary>
-  /// Saturation half-point Kc for the *Saturating consensus weight modes: w_a =
-  /// child.N / (child.N + Kc) (optionally times mu).  Interpretable as Kc = s^2/tau^2 =
-  /// (per-visit Q noise variance) / (between-move value variance); a child reaches half
-  /// its asymptotic weight at child.N = Kc.  SMALL Kc (moves differ a lot, the chess
-  /// regime) flattens the weights quickly toward equal/importance weighting; LARGE Kc
-  /// recovers raw precision pooling (the ChildN mode in the limit).  Single digits are
-  /// expected for chess; defaults to the shrinkage K (3).  No effect unless
-  /// CBGPUCT_ConsensusWeight is one of the *Saturating modes.  Kc &lt;= 0 makes the gate
-  /// degenerate to 1 (uniform for ChildNSaturating, pure policy for PolicyChildNSaturating).
-  /// </summary>
-  public float CBGPUCT_ConsensusReliabilityK = 3.0f;
+  public float TPS_ShrinkageSigma0 = 0.10f;
 
   #endregion
 
-  /// <summary>
-  /// Schedule used to compute lambda_N (the regularization strength) from sum N_a.
-  /// LambdaExp is ignored when schedule is UCT or Log.
-  /// Phase-specific instances (CBGPUCT_SelectLambda* and CBGPUCT_BackupLambda*) below.
-  /// </summary>
-  public enum CBGPUCTLambdaScheduleType
-  {
-    /// <summary>
-    /// LambdaC * pow(sumN, LambdaExp) / (denomBase + sumN).  Grill/AlphaZero schedule:
-    /// bump-shaped, peaks near sumN == denomBase, decays as 1/sqrt(N) asymptotically.
-    /// Returns 0 at sumN == 0.  Selection default.
-    /// </summary>
-    AlphaZero,
+  #region Q-uncertainty select (QUnc) - Phase 2, NOT YET WIRED
 
-    /// <summary>
-    /// LambdaC * sqrt(log(sumN + e) / (denomBase + sumN)) UCT-style log term.
-    /// Slower asymptotic decay than AlphaZero (sqrt(log N / N) vs 1/sqrt(N)),
-    /// so regularization stays meaningful at higher sumN.
-    /// </summary>
-    UCT,
-
-    /// <summary>
-    /// LambdaC / pow(sumN, LambdaExp).  Plain inverse-power decay without a denominator
-    /// constant or bump.  Monotonically decreasing in sumN (modulo log-growth on LambdaC).
-    /// Returns 0 at sumN == 0 (avoids division by zero; no regularization to apply yet).
-    /// Backup default.
-    /// </summary>
-    Pow,
-
-    /// <summary>
-    /// LambdaC / log(sumN + e).  Even slower decay than Pow (1/log N vs 1/N^exp), so
-    /// regularization stays strong well into large N.  LambdaExp is unused.
-    /// </summary>
-    Log
-  }
+  // The QUnc parameter block configures the Q-UNCERTAINTY select methods: a small
+  // inline MLP (.qnn v3, see Search/QProbeSelect and the design/testing document
+  // Ceres.MCGS.TestSuite/QProbeTrainPy/PHASE2-INTEGRATION.md) forecasts, per child
+  // node and visit horizon dN, the distribution N(mu, sigma) of the child's QPure
+  // change after dN further visits. The methods below consume (mu, sigma) during
+  // child selection (and optionally TPS backup). ALL METHODS DEFAULT OFF; they
+  // activate only when QUncModel is set AND at least one coefficient is nonzero.
+  // Multiple methods may be combined, but see the double-counting warning on
+  // QUncMuCorrectionCoeff.
 
   /// <summary>
-  /// Discrete choices for the constant offset in the lambda_N schedule denominator.
-  /// Selection and backup take this independently (see CBGPUCT_SelectLambdaDenominatorBase
-  /// and CBGPUCT_BackupLambdaDenominatorBase).  The numeric ladder {1, 3, 5, 10, 30} covers
-  /// the practical range from "near-monotonic decay from N=1" to "Grill |A| for chess".
-  /// NumMovesWithPolicyOver5Pct adapts per-node: counts children whose policy P exceeds
-  /// 5%, giving an effective branching factor that ignores low-policy tail moves.
+  /// Path to the Q-uncertainty inline model (.qnn v3, written by qprobetrainpy
+  /// exportinline). Null (default) = all QUnc methods disabled. Master switch.
   /// </summary>
-  public enum CBGPUCTLambdaDenominatorBaseType
-  {
-    One,
-    Three,
-    Five,
-    Ten,
-    Thirty,
-    NumMovesWithPolicyOver5Pct
-  }
+  public string QUncModel = null;
 
   /// <summary>
-  /// Constant offset in the SELECTION-phase lambda_N denominator:
-  ///   Pow: lambda_N = c(sumN) * pow(sumN, LambdaExp) / (denomBase + sumN)
-  ///   UCT: lambda_N = c(sumN) * sqrt(log(sumN + e) / (denomBase + sumN))
-  /// In Grill et al. this would be |A| (the action-set cardinality).  Larger values produce
-  /// stronger regularization at low visit counts (lambda peaks near denomBase), reflecting
-  /// the algebraic accumulation of the per-child exploration floor across all actions.
-  /// Default Ten approximates a "soft effective branching factor" without literally tying
-  /// to per-node |A|.
+  /// M1 SIGMA EXPLORATION BONUS: adds k * sigma_i (dN = QUncDnShort) to each child's
+  /// PUCT score. The learned analog of a UCB variance bonus: visits flow toward
+  /// children whose value is genuinely unresolved rather than merely under-visited.
+  /// sigma is in Q units, so k is directly comparable to Q differences; suggested
+  /// scan 0.05 / 0.10 / 0.25. 0 = off.
   /// </summary>
-  public CBGPUCTLambdaDenominatorBaseType CBGPUCT_SelectLambdaDenominatorBase = CBGPUCTLambdaDenominatorBaseType.Thirty;
+  public float QUncSigmaBonusCoeff = 0f;
 
   /// <summary>
-  /// Constant offset in the BACKUP-phase lambda_N denominator.  Backup is not allocating
-  /// visits and has no exploration-floor analog, so the algebraic |A| reasoning that
-  /// motivates a larger denominator in selection does not apply.  Default One yields a
-  /// monotonically-decreasing lambda past the brief initial rise: regularization is
-  /// strongest at low total visits and decays smoothly as Q evidence accumulates - a
-  /// plain Bayesian "trust the prior less as data piles up" curve.
+  /// M2 EXPECTED-IMPROVEMENT BONUS: adds k * EI_i to each child's PUCT score, where
+  /// EI_i = s*(z*Phi(z) + phi(z)), z = (qParentPersp_i + mu_i - qBest)/s, s = sigma_i
+  /// (dN = QUncDnLong), qBest = best visited sibling's parent-perspective Q. The
+  /// classic value-of-information quantity: probability-weighted margin by which the
+  /// child would OVERTAKE the current best if its forecast distribution realizes.
+  /// Directional (uses mu): high-sigma children with negative drift earn little.
+  /// Note the SIGN CONVENTION: the model forecasts the child's own-perspective dQ,
+  /// and parent-perspective value is -Q_child, so mu enters parent-perspective
+  /// quantities negated. Suggested scan 0.5 / 1.0 / 2.0 (EI is typically an order
+  /// smaller than sigma). 0 = off.
   /// </summary>
-  public CBGPUCTLambdaDenominatorBaseType CBGPUCT_BackupLambdaDenominatorBase = CBGPUCTLambdaDenominatorBaseType.One;
+  public float QUncExpectedImprovementCoeff = 0f;
 
   /// <summary>
-  /// Lambda schedule for the SELECTION phase (visit-target deficit pi_bar).
+  /// M3 MU (DEBIAS) CORRECTION: replaces each child's exploitation Q in the PUCT
+  /// score with Q + k * mu_i (dN = QUncDnShort, applied in the correct perspective) -
+  /// "score where the value is going, not where it is". k in [0,1]; suggested scan
+  /// 0.5 / 1.0. 0 = off.
+  /// WARNING: do not combine with QUncTPSLearnedPrior (the same drift would be
+  /// applied twice, once in select and once in backup shrinkage).
   /// </summary>
-  public CBGPUCTLambdaScheduleType CBGPUCT_SelectLambdaSchedule = CBGPUCTLambdaScheduleType.AlphaZero;
+  public float QUncMuCorrectionCoeff = 0f;
 
   /// <summary>
-  /// Multiplicative scale on lambda_N for the SELECTION phase.
-  /// Larger values keep pi_bar closer to the prior P (more exploration);
-  /// smaller values let pi_bar concentrate on high-Q actions.
+  /// M4 SIGMA-SCALED U TERM: multiplies each child's standard PUCT U term by
+  /// (sigma_i / median sibling sigma)^p (dN = QUncDnShort), redirecting the EXISTING
+  /// exploration budget toward informative children instead of adding score mass
+  /// (p=0 off; suggested scan 0.5 / 1.0). Unlike M1 this is self-normalizing per
+  /// parent and cannot change the overall exploration/exploitation balance.
   /// </summary>
-  public float CBGPUCT_SelectLambdaC = 1f;
+  public float QUncUTermSigmaExponent = 0f;
 
   /// <summary>
-  /// Exponent on (sum N_a) in the Pow lambda_N schedule for the SELECTION phase.
-  /// Value of 0.5 replicate Grill et al.
+  /// M5a TPS LEARNED SIGMA: in the TPS backup kernel (TPSScoreCalc), replace the
+  /// closed-form child standard error sigma_hat = s_i/sqrt(n_i+1) with the model's
+  /// sigma_i (dN = QUncDnShort) for shrinkage weighting and temperature. Upgrades
+  /// the proven TPS backup component in place; no select-path change at all.
   /// </summary>
-  public float CBGPUCT_SelectLambdaExp = 0.5f;
+  public bool QUncTPSLearnedSigma = false;
 
   /// <summary>
-  /// Lc0-style log-growth coefficient for the SELECTION-phase lambda_N.  The effective
-  /// coefficient that scales the base schedule grows with sumN as
-  ///   c(sumN) = CBGPUCT_SelectLambdaC + CBGPUCT_SelectLambdaCLogFactor
-  ///                                  * log((sumN + CBGPUCT_SelectLambdaCLogBase + 1) / CBGPUCT_SelectLambdaCLogBase)
-  /// exactly paralleling Ceres-PUCT's CPUCT log growth.  The base lambda_N becomes
-  ///   lambda_N(sumN) = c(sumN) * pow(sumN, LambdaExp) / (LambdaDenominatorBase + sumN)
-  /// so at small sumN c(sumN) is approximately LambdaC (unchanged) and at large sumN it grows
-  /// roughly as log(sumN), counteracting the 1/sqrt(N) decay of the base schedule and
-  /// preserving exploration intensity at high visit counts.
-  ///
-  /// Defaults point to the shared DEFAULT_LOG_GROWTH_BASE / DEFAULT_LOG_GROWTH_FACTOR
-  /// constants that are also used by standard CPUCT.  This means the CB-GPUCT lambda
-  /// coefficient and the CPUCT exploration constant scale with sumN in parallel - you can
-  /// reason about their compounded effect using the same arithmetic.
-  ///
-  /// Set CBGPUCT_SelectLambdaCLogFactor = 0 to disable the log growth (recovers the
-  /// constant LambdaC schedule).  Only applies to selection - the BACKUP-phase lambda_N
-  /// has no log term because backup computes V_bar (a value estimate), not an exploration
-  /// policy.
+  /// M5b TPS LEARNED PRIOR MEAN: in the TPS backup kernel, shrink each child's
+  /// search Q toward Q + mu_i instead of the policy-imputed FPU value (the learned
+  /// drift is a better-informed prior mean). See M3 double-counting warning.
   /// </summary>
-  public float CBGPUCT_SelectLambdaCLogBase = DEFAULT_LOG_GROWTH_BASE;
-  public float CBGPUCT_SelectLambdaCLogFactor = 0;// DEFAULT_LOG_GROWTH_FACTOR;
+  public bool QUncTPSLearnedPrior = false;
 
   /// <summary>
-  /// Lambda schedule for the BACKUP phase (V_bar regularized value computation).
+  /// Short query horizon dN for M1/M3/M4/M5 (0 = use the model header's HorizonN1,
+  /// normally 4). The model conditions on dN as an input, so any value is valid.
   /// </summary>
-  public CBGPUCTLambdaScheduleType CBGPUCT_BackupLambdaSchedule = CBGPUCTLambdaScheduleType.AlphaZero;
+  public int QUncDnShort = 0;
 
   /// <summary>
-  /// Multiplicative scale on lambda_N for the BACKUP phase.
+  /// Long query horizon dN for M2 (0 = use the model header's HorizonN2, normally 64).
   /// </summary>
-  public float CBGPUCT_BackupLambdaC = 0.75f; // use 1.0 for AlphaZero schedule
+  public int QUncDnLong = 0;
 
   /// <summary>
-  /// Exponent on (sum N_a) in the Pow lambda_N schedule for the BACKUP phase.
-  /// Smaller values cause more rapid decay of lambda_N and thus weaker regularization of Q higher visit counts.
+  /// Parents with N below this run stock scoring with no model inference
+  /// (harvest snapshots start at N=8, so children of very small parents sit outside
+  /// training coverage).
   /// </summary>
-  public float CBGPUCT_BackupLambdaExp = 0.45f; // use 0.5 for AlphaZero schedule
-
-
-  /// <summary>
-  /// Fraction of the cross-parent (child node) visit count to fold into the
-  /// per-parent visit-target deficit:
-  ///   effective_N(a) = per_edge_N(a) + fraction * (child(a).N - per_edge_N(a))
-  ///                  + nInFlight(a)
-  ///
-  /// 0.0 (default): per-edge only - each parent independently aims for its own
-  ///                visit target, ignoring transposition visits via other parents.
-  ///                Matches the legacy non-graph-aware behavior.
-  /// 1.0          : fully count cross-parent visits - redirect exploration away from
-  ///                children already well-visited via other parents.  Matches the
-  ///                legacy graph-aware behavior.
-  /// (0.0, 1.0)   : blend.  Treats each cross-parent visit as partially counting
-  ///                toward this parent's visit target.
-  ///
-  /// The Q values used in V_bar are unaffected (they always reflect cross-parent
-  /// backups), so re-routing visits in this way does not distort the parent's Q.
-  /// When fraction &gt; 0 some visits may not be placeable (all children over-quota);
-  /// MCGSSelect absorbs those visits at the parent.
-  /// </summary>
-  public float CBGPUCT_SelectCrossParentNFraction = 0.3f;
+  public int QUncMinParentN = 8;
 
   /// <summary>
-  /// Convenience predicate: true iff any cross-parent N contribution is folded into
-  /// the visit-target deficit (i.e. CBGPUCT_CrossParentNFraction is strictly positive).
+  /// Maximum number of (top-policy) children queried per parent; children beyond
+  /// this fall through to their stock PUCT scores.
   /// </summary>
-  internal bool CBGPUCT_SelectCrossParentNEnabled => CBGPUCT_SelectCrossParentNFraction > 0.0f;
+  public int QUncMaxChildren = 32;
 
   /// <summary>
-  /// Optional value-uncertainty (leaf value volatility) scaling of the "actual child N"
-  /// that the CB-GPUCT visit-target deficit compares against the RPO-justified target
-  /// (pi_bar * (sumN + 1)).  When nonzero, each child's actual N is multiplied by
-  ///   1 - CBGPUCT_SelectValueUncertaintyScalingFactor * (child.LeafValueVolatilityDebiased - 0.20)
-  /// (applied only to children whose child.N exceeds 5, where the debiased volatility
-  /// estimate is meaningful; the factor is floored at 0).  0.20 is the assumed average
-  /// leaf-value volatility, so a child less (more) volatile than average is treated as if
-  /// MORE (FEWER) visits had been performed to it - shrinking (growing) its deficit and
-  /// thereby steering exploration toward the less-settled, more volatile children.
-  ///
-  /// Requires ParamsSearch.TrackLeafValueVolatility = true (enforced in ValidateAgainst).
-  /// 0 disables.
+  /// If per-search QUnc counters (gathers evaluated, cache hit rate, per-method
+  /// bonus magnitudes) are accumulated and printed at search end.
   /// </summary>
-  public float CBGPUCT_SelectValueUncertaintyScalingFactor = 0;
+  public bool QUncEnableStats = false;
+
+  /// <summary>
+  /// True when any QUnc method is configured active (model set and any method on).
+  /// </summary>
+  [JsonIgnore]
+  public bool QUncAnyMethodActive => QUncModel != null
+      && (QUncSigmaBonusCoeff != 0 || QUncExpectedImprovementCoeff != 0
+       || QUncMuCorrectionCoeff != 0 || QUncUTermSigmaExponent != 0
+       || QUncTPSLearnedSigma || QUncTPSLearnedPrior);
 
   #endregion
 
@@ -912,13 +630,57 @@ public record ParamsSelect
       ActionResortUnvisitedChildren = false;
     }
 
-    if (CBGPUCT_Mode != CBGPUCTModeType.None)
+    if (TPS_Mode == TPSModeType.SelectOnly || TPS_Mode == TPSModeType.SelectAndBackup)
+    {
+      throw new NotImplementedException(
+        $"TPS_Mode={TPS_Mode}: TPS select is not yet implemented. The Q-uncertainty "
+      + "select methods (QUnc* parameters) are defined but not yet wired - see "
+      + "Ceres.MCGS.TestSuite/QProbeTrainPy/PHASE2-INTEGRATION.md. "
+      + "Use TPS_Mode=BackupOnly or None.");
+    }
+
+    if (QUncAnyMethodActive)
+    {
+      if (!System.IO.File.Exists(QUncModel))
+      {
+        throw new Exception($"QUncModel file not found: {QUncModel}");
+      }
+      if (!QUncModel.EndsWith(".qnn", StringComparison.OrdinalIgnoreCase))
+      {
+        throw new Exception($"QUncModel must be a .qnn inline model file: {QUncModel}");
+      }
+      Search.QProbeSelect.QProbeSelectModelStore.EnsureLoaded(QUncModel); // header-validates; idempotent path-keyed store
+      if (QUncMinParentN < 2)
+      {
+        throw new Exception($"QUncMinParentN must be >= 2 (have {QUncMinParentN}).");
+      }
+      if (QUncMaxChildren < 2 || QUncMaxChildren > 64)
+      {
+        throw new Exception($"QUncMaxChildren must be in [2, 64] (have {QUncMaxChildren}).");
+      }
+      if (QUncDnShort < 0 || QUncDnLong < 0)
+      {
+        throw new Exception($"QUncDnShort/QUncDnLong must be >= 0 (0 = model header horizon).");
+      }
+      if ((QUncTPSLearnedSigma || QUncTPSLearnedPrior) && !TPSBackupActive)
+      {
+        throw new Exception($"QUncTPSLearnedSigma/QUncTPSLearnedPrior require an active TPS backup "
+                          + $"(TPS_Mode=BackupOnly or SelectAndBackup; have {TPS_Mode}).");
+      }
+      if (QUncMuCorrectionCoeff != 0 && QUncTPSLearnedPrior)
+      {
+        throw new Exception("QUncMuCorrectionCoeff and QUncTPSLearnedPrior must not be combined "
+                          + "(the same forecast drift would be applied twice, in select and in backup shrinkage).");
+      }
+    }
+
+    if (TPS_Mode != TPSModeType.None)
     {
       if (FPUMode != FPUType.PolicyImputedRPO
        || FPUModeAtRoot != FPUType.PolicyImputedRPO
        || RPOFPURegularization != RPORegularization.ForwardKLSoftmax)
       {
-        throw new Exception($"CBGPUCT_Mode={CBGPUCT_Mode} requires "
+        throw new Exception($"TPS_Mode={TPS_Mode} requires "
                           + $"FPUMode=PolicyImputedRPO, FPUModeAtRoot=PolicyImputedRPO, and "
                           + $"RPOFPURegularization=ForwardKLSoftmax "
                           + $"(have FPUMode={FPUMode}, FPUModeAtRoot={FPUModeAtRoot}, "
@@ -935,31 +697,34 @@ public record ParamsSelect
   /// <param name="paramsSearch"></param>
   internal void ValidateAgainst(ParamsSearch paramsSearch)
   {
-    if (CBGPUCT_SelectValueUncertaintyScalingFactor != 0 && !paramsSearch.TrackLeafValueVolatility)
+    if (TPSBackupActive && !paramsSearch.TrackLeafValueVolatility)
     {
-      throw new Exception("TrackLeafValueVolatility must be set to true when "
-                        + "CBGPUCT_SelectValueUncertaintyScalingFactor is nonzero.");
+      throw new Exception($"TrackLeafValueVolatility must be set to true when a TPS mode is active "
+                        + $"(TPS_Mode={TPS_Mode}); the leaf-value volatility tracker is the TPS noise oracle.");
     }
 
-    if (CBGPUCT_Mode != CBGPUCTModeType.None)
+    if (QUncAnyMethodActive && !paramsSearch.TrackLeafValueVolatility)
+    {
+      throw new Exception("TrackLeafValueVolatility must be set to true when any QUnc method is active; "
+                        + "the LeafVolatility/SigmaHat/QTrendEW model features were populated in every "
+                        + "training row and a live NaN-flagged row would sit off the training manifold.");
+    }
+
+    if (TPS_Mode != TPSModeType.None)
     {
       if (!paramsSearch.EnableGraph)
       {
-        throw new Exception($"CBGPUCT_Mode={CBGPUCT_Mode} requires ParamsSearch.EnableGraph=true.");
+        throw new Exception($"TPS_Mode={TPS_Mode} requires ParamsSearch.EnableGraph=true.");
       }
       if (paramsSearch.PathTranspositionMode != PathMode.PositionEquivalence)
       {
-        throw new Exception($"CBGPUCT_Mode={CBGPUCT_Mode} requires PathTranspositionMode=PositionEquivalence.");
+        throw new Exception($"TPS_Mode={TPS_Mode} requires PathTranspositionMode=PositionEquivalence.");
       }
 
-      if (MCGSParamsFixed.DEBUG_CBGPUCT)
+      if (MCGSParamsFixed.DEBUG_TPS)
       {
-        Console.WriteLine($"[CBGPUCT] active mode={CBGPUCT_Mode} "
-                        + $"select(C={CBGPUCT_SelectLambdaC:F3} sched={CBGPUCT_SelectLambdaSchedule} exp={CBGPUCT_SelectLambdaExp:F3} "
-                        + $"cLogBase={CBGPUCT_SelectLambdaCLogBase:F0} cLogFactor={CBGPUCT_SelectLambdaCLogFactor:F3}) "
-                        + $"backup(C={CBGPUCT_BackupLambdaC:F3} sched={CBGPUCT_BackupLambdaSchedule} exp={CBGPUCT_BackupLambdaExp:F3}) "
-                        + $"selDenom={CBGPUCT_SelectLambdaDenominatorBase} bkpDenom={CBGPUCT_BackupLambdaDenominatorBase} "
-                        + $"CrossParentNFraction={CBGPUCT_SelectCrossParentNFraction:F3} "
+        Console.WriteLine($"[TPS] active mode={TPS_Mode} "
+                        + $"backup(k_b={TPS_BackupTemperatureK:F3} sigma0={TPS_ShrinkageSigma0:F3}) "
                         + $"(graph={paramsSearch.EnableGraph}, mode={paramsSearch.PathTranspositionMode})");
       }
     }

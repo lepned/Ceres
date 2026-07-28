@@ -22,6 +22,7 @@ using Ceres.Base.DataTypes;
 using Ceres.Chess.EncodedPositions;
 using Ceres.Chess.LC0.Batches;
 using Ceres.Chess.MoveGen;
+using Ceres.Chess.MoveGen.Converters;
 using Ceres.Chess.NetEvaluation.Batch;
 
 #endregion
@@ -40,6 +41,8 @@ namespace Ceres.Chess.NNEvaluators.Remote
     HasStates = 1 << 2,
     HasLastMovePlies = 1 << 3,
     HasPositionsBuffer = 1 << 4,
+    HasCompactHistories = 1 << 5,
+    HasPlanes = 1 << 6,
   }
 
 
@@ -87,7 +90,7 @@ namespace Ceres.Chess.NNEvaluators.Remote
            + numPositions * sizeof(ulong)                    // Hashes (optional)
            + numPositions * 64                               // LastMovePlies (optional)
            + numPositions * 256 * sizeof(ushort) + numPositions * 4  // States (optional, generous)
-           + numPositions * Unsafe.SizeOf<EncodedPositionWithHistory>() // PositionsBuffer (optional)
+           + numPositions * Unsafe.SizeOf<MGPositionHistoryCompact>() // CompactHistories (optional)
            + 1024;                                           // margin
     }
 
@@ -119,29 +122,39 @@ namespace Ceres.Chess.NNEvaluators.Remote
                        && !batch.States.IsEmpty;
       bool hasLastMovePlies = requiredInputs.HasFlag(NNEvaluator.InputTypes.LastMovePlies)
                               && !batch.LastMovePlies.IsEmpty;
-      // PositionsBuffer (EncodedPositionWithHistory[]) is needed by Ceres/TPG networks.
-      bool hasPositionsBuffer = !batch.PositionsBuffer.IsEmpty;
+      // Wire flags are content-driven (v4): ship whatever representation the batch actually
+      // carries. The client fed its batch through EvaluateIntoBuffers, so hooks 1/2 already
+      // normalized it. Prefer compact records (the smaller representation): an MCGS client ships
+      // compact even to an LC0 server, which materializes planes server-side. A legacy plane
+      // producer with no compact records ships its planes.
+      bool hasCompactHistories = batch.CompactHistoriesPopulated && !batch.CompactHistories.IsEmpty;
+      bool hasPlanes = batch.PlanesPopulated && !hasCompactHistories;
 
       if (hasPositions) flags |= NNRemoteBatchFlags.HasPositions;
       if (hasHashes) flags |= NNRemoteBatchFlags.HasHashes;
       if (hasStates) flags |= NNRemoteBatchFlags.HasStates;
       if (hasLastMovePlies) flags |= NNRemoteBatchFlags.HasLastMovePlies;
-      if (hasPositionsBuffer) flags |= NNRemoteBatchFlags.HasPositionsBuffer;
+      if (hasCompactHistories) flags |= NNRemoteBatchFlags.HasCompactHistories;
+      if (hasPlanes) flags |= NNRemoteBatchFlags.HasPlanes;
 
       buffer[offset++] = (byte)flags;
 
-      // PosPlaneBitmaps: N * 112 ulongs
-      int bitmapCount = numPos * PLANES_PER_POS;
-      ReadOnlySpan<ulong> bitmaps = batch.PosPlaneBitmaps.Span.Slice(0, bitmapCount);
-      ReadOnlySpan<byte> bitmapBytes = MemoryMarshal.AsBytes(bitmaps);
-      bitmapBytes.CopyTo(buffer.Slice(offset));
-      offset += bitmapBytes.Length;
+      // Conditional: LC0 planes (bitmaps + values), only for servers requiring Boards.
+      if (hasPlanes)
+      {
+        // PosPlaneBitmaps: N * 112 ulongs
+        int bitmapCount = numPos * PLANES_PER_POS;
+        ReadOnlySpan<ulong> bitmaps = batch.PosPlaneBitmaps.Span.Slice(0, bitmapCount);
+        ReadOnlySpan<byte> bitmapBytes = MemoryMarshal.AsBytes(bitmaps);
+        bitmapBytes.CopyTo(buffer.Slice(offset));
+        offset += bitmapBytes.Length;
 
-      // PosPlaneValues: N * 112 bytes
-      int valuesCount = numPos * PLANES_PER_POS;
-      ReadOnlySpan<byte> values = batch.PosPlaneValues.Span.Slice(0, valuesCount);
-      values.CopyTo(buffer.Slice(offset));
-      offset += valuesCount;
+        // PosPlaneValues: N * 112 bytes
+        int valuesCount = numPos * PLANES_PER_POS;
+        ReadOnlySpan<byte> values = batch.PosPlaneValues.Span.Slice(0, valuesCount);
+        values.CopyTo(buffer.Slice(offset));
+        offset += valuesCount;
+      }
 
       // Conditional: Positions
       if (hasPositions)
@@ -188,13 +201,13 @@ namespace Ceres.Chess.NNEvaluators.Remote
         }
       }
 
-      // Conditional: PositionsBuffer (EncodedPositionWithHistory[] - needed by Ceres/TPG)
-      if (hasPositionsBuffer)
+      // Conditional: CompactHistories (the canonical history representation for Ceres/TPG servers)
+      if (hasCompactHistories)
       {
-        ReadOnlySpan<EncodedPositionWithHistory> posBuffer = batch.PositionsBuffer.Span.Slice(0, numPos);
-        ReadOnlySpan<byte> posBufferBytes = MemoryMarshal.AsBytes(posBuffer);
-        posBufferBytes.CopyTo(buffer.Slice(offset));
-        offset += posBufferBytes.Length;
+        ReadOnlySpan<MGPositionHistoryCompact> histories = batch.CompactHistories.Span.Slice(0, numPos);
+        ReadOnlySpan<byte> historyBytes = MemoryMarshal.AsBytes(histories);
+        historyBytes.CopyTo(buffer.Slice(offset));
+        offset += historyBytes.Length;
       }
 
       return offset;
@@ -218,17 +231,26 @@ namespace Ceres.Chess.NNEvaluators.Remote
         EncodedPositionType.PositionOnly, numPos);
       batch.NumPos = numPos;
 
-      // PosPlaneBitmaps
-      int bitmapCount = numPos * PLANES_PER_POS;
-      int bitmapByteCount = bitmapCount * sizeof(ulong);
-      ReadOnlySpan<byte> bitmapBytes = buffer.Slice(offset, bitmapByteCount);
-      MemoryMarshal.Cast<byte, ulong>(bitmapBytes).CopyTo(batch.PosPlaneBitmaps.AsSpan());
-      offset += bitmapByteCount;
+      // Conditional: LC0 planes. Only present when the client actually shipped planes; the plane
+      // arrays are otherwise never allocated (compact-only batch). Allocate lazily here.
+      if (flags.HasFlag(NNRemoteBatchFlags.HasPlanes))
+      {
+        batch.EnsurePlaneArraysAllocated();
 
-      // PosPlaneValues
-      int valuesCount = numPos * PLANES_PER_POS;
-      buffer.Slice(offset, valuesCount).CopyTo(batch.PosPlaneValues.AsSpan());
-      offset += valuesCount;
+        // PosPlaneBitmaps
+        int bitmapCount = numPos * PLANES_PER_POS;
+        int bitmapByteCount = bitmapCount * sizeof(ulong);
+        ReadOnlySpan<byte> bitmapBytes = buffer.Slice(offset, bitmapByteCount);
+        MemoryMarshal.Cast<byte, ulong>(bitmapBytes).CopyTo(batch.PosPlaneBitmaps.AsSpan());
+        offset += bitmapByteCount;
+
+        // PosPlaneValues
+        int valuesCount = numPos * PLANES_PER_POS;
+        buffer.Slice(offset, valuesCount).CopyTo(batch.PosPlaneValues.AsSpan());
+        offset += valuesCount;
+
+        batch.PlanesPopulated = true;
+      }
 
       // Conditional: Positions
       if (flags.HasFlag(NNRemoteBatchFlags.HasPositions))
@@ -290,17 +312,27 @@ namespace Ceres.Chess.NNEvaluators.Remote
         }
       }
 
-      // Conditional: PositionsBuffer (EncodedPositionWithHistory[] - needed by Ceres/TPG)
+      // The legacy PositionsBuffer never appears on the wire from v3+ clients (they always ship
+      // CompactHistories). Reject it loudly rather than silently mis-parsing the stream.
       if (flags.HasFlag(NNRemoteBatchFlags.HasPositionsBuffer))
       {
-        int posBufferSize = numPos * Unsafe.SizeOf<EncodedPositionWithHistory>();
-        if (batch.PositionsBuffer == null || batch.PositionsBuffer.Length < numPos)
+        throw new NotSupportedException("HasPositionsBuffer is no longer supported on the wire "
+                                      + "(v3+ clients ship CompactHistories instead).");
+      }
+
+      // Conditional: CompactHistories (the canonical history representation for Ceres/TPG servers)
+      if (flags.HasFlag(NNRemoteBatchFlags.HasCompactHistories))
+      {
+        int historiesSize = numPos * Unsafe.SizeOf<MGPositionHistoryCompact>();
+        if (batch.CompactHistories == null || batch.CompactHistories.Length < numPos)
         {
-          batch.PositionsBuffer = new EncodedPositionWithHistory[numPos];
+          batch.CompactHistories = new MGPositionHistoryCompact[numPos];
         }
-        MemoryMarshal.Cast<byte, EncodedPositionWithHistory>(buffer.Slice(offset, posBufferSize))
-          .CopyTo(batch.PositionsBuffer.AsSpan());
-        offset += posBufferSize;
+        MemoryMarshal.Cast<byte, MGPositionHistoryCompact>(buffer.Slice(offset, historiesSize))
+          .CopyTo(batch.CompactHistories.AsSpan());
+        offset += historiesSize;
+
+        batch.CompactHistoriesPopulated = true;
       }
 
       return batch;
