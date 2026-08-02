@@ -184,10 +184,19 @@ namespace Ceres.Features.GameEngines
       float lc0Q = (lc0Analysis.UCIInfo != null && !float.IsNaN(lc0Analysis.UCIInfo.Q))
                     ? lc0Analysis.UCIInfo.Q
                     : EncodedEvalLogistic.CentipawnToLogistic(boundedCP);
-      return new GameEngineSearchResult(lc0Analysis.BestMove, lc0Q, boundedCP, float.NaN,
-                                        searchLimit, default, 0, (int)lc0Analysis.NumNodes,
-                                        lc0Analysis.UCIInfo.NPS, lc0Analysis.UCIInfo.EPS,
-                                        (int)lc0Analysis.UCIInfo.Depth, lc0Analysis.Moves);
+
+      GameEngineSearchResult result = new(lc0Analysis.BestMove, lc0Q, boundedCP, float.NaN,
+                                          searchLimit, default, 0, (int)lc0Analysis.NumNodes,
+                                          lc0Analysis.UCIInfo.NPS, lc0Analysis.UCIInfo.EPS,
+                                          (int)lc0Analysis.UCIInfo.Depth, lc0Analysis.Moves);
+
+      // LC0Engine enables UCI_ShowWDL, so UCIInfo already carries the engine's own win/draw/loss.
+      if (lc0Analysis.UCIInfo != null)
+      {
+        result.WDL = lc0Analysis.UCIInfo.WDL;
+      }
+
+      return result;
     }
 
     /// <summary>

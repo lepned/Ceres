@@ -173,7 +173,9 @@ namespace Ceres.Chess.ExternalPrograms.UCI
         Check(i, "eps", ref EPS);
         Check(i, "time", ref EngineReportedSearchTime);
 
-        if (tokens[i].ToUpper() == "WDL")
+        // N.B. bounds check is required: engines emitting a truncated line ending in "wdl"
+        // would otherwise index past the end of the token array.
+        if (tokens[i].ToUpper() == "WDL" && i + 3 < tokens.Length)
         {
           int.TryParse(tokens[i + 1], out int w);
           int.TryParse(tokens[i + 2], out int d);
