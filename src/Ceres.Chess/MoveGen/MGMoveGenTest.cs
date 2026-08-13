@@ -1,19 +1,12 @@
 ﻿#region Using directives
 
-//using BenchmarkDotNet.Environments;
-//using DJE.Base;
-using Ceres.Base;
-using Ceres.Base.Benchmarking;
-using Ceres.Chess.EncodedPositions.Basic;
-using Ceres.Chess.MoveGen.Converters;
-using Ceres.Chess.Textual.PgnFileTools;
-using SharpCompress.Common;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 
-
+using Ceres.Base.Benchmarking;
+using Ceres.Chess.MoveGen.Converters;
 
 #endregion
 
@@ -47,23 +40,15 @@ SOFTWARE.
 #endregion
 
 using BitBoard = System.UInt64;
-//typedef uint64_t BitBoard;
-// typedef uint64_t HashKey;
 
 
 namespace Ceres.Chess.MoveGen.Test
 {
-
   public static class MGMoveGenTest
   {
-
-#if NOT
-    	// see https://chessprogramming.wikispaces.com/perft+Results
-
-#endif
+   	// see https://chessprogramming.wikispaces.com/perft+Results
     static int RAND = 33;
 
-    // --------------------------------------------------------------------------------------------
     public static ulong CalcPerftOnPosition(string fen, int depth)
     {
       MGPosition chessPos = MGChessPositionConverter.MGChessPositionFromFEN(fen);
@@ -73,15 +58,15 @@ namespace Ceres.Chess.MoveGen.Test
       return moveCount;
     }
 
-    // --------------------------------------------------------------------------------------------
 
     public static double RunPerftWithStatsOnPosition(string fen, int depth, ulong correctCount)
     {
-      Console.Write("\r\n" + fen);
+      Console.WriteLine("\r\n" + fen);
       MGPosition chessPos = MGChessPositionConverter.MGChessPositionFromFEN(fen);
       ulong moveCount = 0;
       ulong castleCount = 0;
       ulong captures = 0;
+
       //add primitive timing with stopwatch
       Stopwatch sw = new Stopwatch();
       sw.Start();
@@ -94,11 +79,11 @@ namespace Ceres.Chess.MoveGen.Test
       }
       sw.Stop();
       long ms = sw.ElapsedMilliseconds;
-      //sw.Reset();
       double secs = ms / 1000.0; //nodes per second
       double nps = moveCount / secs;
       ConsoleColor cc = Console.ForegroundColor; //get current console color
       string msg = $"NPS = {nps.ToString("N0")}, Nodes = {moveCount.ToString("N0")} with {castleCount.ToString("N0")} castles and {captures.ToString("N0")} captures\n";
+
       if (moveCount != correctCount)
       {
         //write red color to console if failed
@@ -112,12 +97,12 @@ namespace Ceres.Chess.MoveGen.Test
       else
       {
         Console.ForegroundColor = ConsoleColor.Green;
-        //Console.WriteLine(" " + moveCount.ToString("N0") + " SUCCESS ");
         Console.WriteLine("\nSuccess: " + msg);
       }
       Console.ForegroundColor = cc;
       return nps;
     }
+
 
     public static void RunPerftOnPosition(string fen, int depth, ulong correctCount)
     {
@@ -134,10 +119,11 @@ namespace Ceres.Chess.MoveGen.Test
       }
       sw.Stop();
       double ms = sw.ElapsedMilliseconds;
+
       //nodes per second
       double secs = ms / 1000.0;
       double nps = moveCount / secs;
-      //get current console color
+
       ConsoleColor cc = Console.ForegroundColor;
       if (moveCount != correctCount)
       {
@@ -158,7 +144,7 @@ namespace Ceres.Chess.MoveGen.Test
       Console.ForegroundColor = cc;
     }
 
-    // --------------------------------------------------------------------------------------------
+
     static void TestConvertPerformance()
     {
       Position posCompressedFromFEN = Position.FromFEN("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1");
@@ -180,29 +166,9 @@ namespace Ceres.Chess.MoveGen.Test
           posCompressedFromMGPos1 = mgPosFromPosCompressed.ToPosition;
         }
       }
-
-#if NOT
-      using (new TimingBlock("PieceAt"))
-      {
-        for (int i = 0; i < 1_000_000; i++)
-        {
-          for (int j = 0; j < 64; j++)
-          {
-            var pa = MGChessPositionConverter.PieceAt(mgPosFromPosCompressed, j);
-            if ((byte)pa.Type > 222) throw new NotImplementedException();
-//            var pa1 = posCompressedFromMGPos1[new Square(j)];
-//            if ((byte)pa1.Kind > 222) throw new NotImplementedException();
-          }
-        }
-      }
-#endif
-
-
     }
 
 
-    static ulong HASH_COLLISIONS = 0;
-    // --------------------------------------------------------------------------------------------
     public class Chess960Record
     {
       public int PositionNumber { get; set; }
@@ -272,12 +238,180 @@ namespace Ceres.Chess.MoveGen.Test
     }
 
 
+    /// <summary>
+    /// Verifies the table-driven attack sets in MGSliderAttacks against the
+    /// occluded-fill implementations in MGMoveGenFillFunctions, which are an
+    /// independent formulation of the same thing.
+    ///
+    /// Throws if any discrepancy is found.
+    /// </summary>
+    public static void ValidateAttackTables()
+    {
+      // Reference slider attacks: fill along each ray through empty squares, then take
+      // one further step, which adds the blocking square (if any) in each direction.
+      static BitBoard RefStraight(BitBoard from, BitBoard empty)
+      {
+        return MGMoveGenFillFunctions.MoveUpSingleOccluded(MGMoveGenFillFunctions.FillUpOccluded(from, empty), ~0UL)
+             | MGMoveGenFillFunctions.MoveDownSingleOccluded(MGMoveGenFillFunctions.FillDownOccluded(from, empty), ~0UL)
+             | MGMoveGenFillFunctions.MoveLeftSingleOccluded(MGMoveGenFillFunctions.FillLeftOccluded(from, empty), ~0UL)
+             | MGMoveGenFillFunctions.MoveRightSingleOccluded(MGMoveGenFillFunctions.FillRightOccluded(from, empty), ~0UL);
+      }
+
+      static BitBoard RefDiagonal(BitBoard from, BitBoard empty)
+      {
+        return MGMoveGenFillFunctions.MoveUpLeftSingleOccluded(MGMoveGenFillFunctions.FillUpLeftOccluded(from, empty), ~0UL)
+             | MGMoveGenFillFunctions.MoveUpRightSingleOccluded(MGMoveGenFillFunctions.FillUpRightOccluded(from, empty), ~0UL)
+             | MGMoveGenFillFunctions.MoveDownLeftSingleOccluded(MGMoveGenFillFunctions.FillDownLeftOccluded(from, empty), ~0UL)
+             | MGMoveGenFillFunctions.MoveDownRightSingleOccluded(MGMoveGenFillFunctions.FillDownRightOccluded(from, empty), ~0UL);
+      }
+
+      Random rand = new Random(20240117);
+      int numChecked = 0;
+
+      for (int sq = 0; sq < 64; sq++)
+      {
+        BitBoard from = 1UL << sq;
+
+        // Leaper attack sets must agree with the per-direction constant tables.
+        BitBoard knights = MGPositionConstants.MoveKnight1[sq] | MGPositionConstants.MoveKnight2[sq]
+                         | MGPositionConstants.MoveKnight3[sq] | MGPositionConstants.MoveKnight4[sq]
+                         | MGPositionConstants.MoveKnight5[sq] | MGPositionConstants.MoveKnight6[sq]
+                         | MGPositionConstants.MoveKnight7[sq] | MGPositionConstants.MoveKnight8[sq];
+        if (MGSliderAttacks.KnightAttacks[sq] != knights)
+        {
+          throw new Exception($"MGSliderAttacks.KnightAttacks mismatch at square {sq}");
+        }
+
+        BitBoard king = MGPositionConstants.MoveUp[sq] | MGPositionConstants.MoveDown[sq]
+                      | MGPositionConstants.MoveLeft[sq] | MGPositionConstants.MoveRight[sq]
+                      | MGPositionConstants.MoveUpLeft[sq] | MGPositionConstants.MoveUpRight[sq]
+                      | MGPositionConstants.MoveDownLeft[sq] | MGPositionConstants.MoveDownRight[sq];
+        if (MGSliderAttacks.KingAttacks[sq] != king)
+        {
+          throw new Exception($"MGSliderAttacks.KingAttacks mismatch at square {sq}");
+        }
+
+        for (int trial = 0; trial < 400; trial++)
+        {
+          BitBoard occupied = trial switch
+          {
+            0 => 0UL,
+            1 => ~0UL,
+            2 => ~from,
+            // Vary the density so both sparse and crowded boards are covered.
+            _ => RandomBits(rand, trial % 3)
+          };
+
+          BitBoard empty = ~occupied;
+
+          BitBoard gotRook = MGSliderAttacks.Rook(sq, occupied);
+          BitBoard expectRook = RefStraight(from, empty);
+          if (gotRook != expectRook)
+          {
+            throw new Exception($"MGSliderAttacks.Rook mismatch at square {sq}, occupancy {occupied:X16}: "
+                              + $"got {gotRook:X16} expected {expectRook:X16}");
+          }
+
+          BitBoard gotBishop = MGSliderAttacks.Bishop(sq, occupied);
+          BitBoard expectBishop = RefDiagonal(from, empty);
+          if (gotBishop != expectBishop)
+          {
+            throw new Exception($"MGSliderAttacks.Bishop mismatch at square {sq}, occupancy {occupied:X16}: "
+                              + $"got {gotBishop:X16} expected {expectBishop:X16}");
+          }
+
+          numChecked += 2;
+        }
+      }
+
+      // Between/Line masks: for aligned squares the between mask must be exactly the
+      // squares a slider on one is blocked by when reaching the other.
+      for (int a = 0; a < 64; a++)
+      {
+        for (int b = 0; b < 64; b++)
+        {
+          if (a == b)
+          {
+            continue;
+          }
+
+          BitBoard aBB = 1UL << a;
+          BitBoard bBB = 1UL << b;
+          BitBoard between = MGSliderAttacks.BetweenBB(a, b);
+          BitBoard line = MGSliderAttacks.LineBB(a, b);
+
+          bool rookAligned = (MGSliderAttacks.Rook(a, 0) & bBB) != 0;
+          bool bishopAligned = (MGSliderAttacks.Bishop(a, 0) & bBB) != 0;
+
+          if (!rookAligned && !bishopAligned)
+          {
+            if (between != 0 || line != 0)
+            {
+              throw new Exception($"Between/Line should be empty for unaligned {a},{b}");
+            }
+            continue;
+          }
+
+          // The squares strictly between two aligned squares are exactly those a slider
+          // on each can see when the other blocks it.
+          BitBoard expectBetween = rookAligned ? MGSliderAttacks.Rook(a, bBB) & MGSliderAttacks.Rook(b, aBB)
+                                               : MGSliderAttacks.Bishop(a, bBB) & MGSliderAttacks.Bishop(b, aBB);
+          if (between != expectBetween)
+          {
+            throw new Exception($"BetweenBB({a},{b}) = {between:X16}, expected {expectBetween:X16}");
+          }
+
+          BitBoard expectLine = (rookAligned ? MGSliderAttacks.Rook(a, 0) & MGSliderAttacks.Rook(b, 0)
+                                             : MGSliderAttacks.Bishop(a, 0) & MGSliderAttacks.Bishop(b, 0))
+                              | aBB | bBB;
+          if (line != expectLine)
+          {
+            throw new Exception($"LineBB({a},{b}) = {line:X16}, expected {expectLine:X16}");
+          }
+        }
+      }
+
+      Console.WriteLine($"Attack table validation passed ({numChecked:N0} slider probes, "
+                      + $"index method: {(MGSliderAttacks.UsesPext ? "PEXT" : "magic multiply")}).");
+    }
+
+
+    /// <summary>
+    /// Emits the magic constants in use (development helper, see MGSliderAttacks.DumpMagics).
+    /// </summary>
+    public static string DumpSliderMagics() => MGSliderAttacks.DumpMagics();
+
+
+    static BitBoard RandomBits(Random rand, int density)
+    {
+      BitBoard v = NextUInt64(rand);
+      for (int i = 0; i < density; i++)
+      {
+        v &= NextUInt64(rand);
+      }
+      return v;
+    }
+
+
+    static BitBoard NextUInt64(Random rand)
+    {
+      Span<byte> bytes = stackalloc byte[8];
+      rand.NextBytes(bytes);
+      return BitConverter.ToUInt64(bytes);
+    }
+
+
     public static void RunChess960Verification(int depth, int numberOfPositions = 960)
     {
+      ValidateAttackTables();
+
+      // First evaluate with classical start position to depth 6.
+      RunPerftWithStatsOnPosition(Position.StartPosition.FEN, 6, 3_195_901_860);
+
       IEnumerable<Chess960Record> records = GetChess960Positions(numberOfPositions); // tests.Skip(1).Select(ParseChess960Record).Take(numberOfPositions).ToArray();     
       IEnumerable<Chess960Record> ordered = records; //records.OrderBy(r => GetDepthValue(depth, r));
       List<double> npsStats = new List<double>();
-      //var nodeStats = new List<long>();
+
       foreach (Chess960Record record in ordered)
       {
         Console.WriteLine($"Position Number: {record.PositionNumber}");
@@ -285,6 +419,7 @@ namespace Ceres.Chess.MoveGen.Test
         double nps = RunPerftWithStatsOnPosition(record.FEN, depth, (ulong)perftDepth);
         npsStats.Add(nps);
       }
+
       ConsoleColor cc = Console.ForegroundColor;
       string finalStatsForAllPerftPositions = $"\nAverage NPS perft speed for {numberOfPositions} Chess960 positions at depth {depth} = {npsStats.Average().ToString("N0")}";
       Console.ForegroundColor = ConsoleColor.Green;
@@ -340,215 +475,18 @@ namespace Ceres.Chess.MoveGen.Test
 
     }
 
-    // --------------------------------------------------------------------------------------------
-    static void MovegenTest()
-    {
-      // NOTE: speed seems about 1,000,000 per second per CPU
-      const int NUM_POS = 100_000;
-      MGPosition mp = MGChessPositionConverter.MGChessPositionFromFEN(Position.StartPosition.FEN);
 
-      MGMoveList moves = new MGMoveList();
-      using (new TimingBlock("GenerateMoves " + NUM_POS))
-      {
-        for (int i = 0; i < NUM_POS; i++)
-        {
-          moves.Clear();
-          MGMoveGen.GenerateMoves(mp, moves);
-          //        if (MGMoveGen.IsInCheck(mp, false))
-          //          throw new Exception("bad");
-        }
-      }
-
-    }
-
-
-    // --------------------------------------------------------------------------------------------
     // Single core, June 2019
     // 3_195_901_860 perft(7) in 150 seconds
     //   119_060_324 perft(6) in 6 seconds
     //     4_865_609 perft(5) in 0.24 seconds
     public static void Test()
     {
+      CalcPerftOnPosition(Position.StartPosition.FEN, 6);
       RunPerftSuite();
-      return;
-
       TestConvertPerformance();
-      TestConvertPerformance();
-      TestConvertPerformance();
-      System.Environment.Exit(3);
-
-      string pgnName = @"Z:\chess\data\pgn\raw\ficsgamesdb_2011_standard_nomovetimes_1506667.pgn"; // 9GB
-#if NOT
-      string[] fens = PGNEnumerator.GetFENSOfFirstMatchingPositionInGame(pgnName, 1000, p => true);
-
-      int count = 0;
-      DateTime lastTime = default;
-      PGNEnumerator.ProcessGamesFromFile(pgnName,
-   ( gameIndex, plyWithinGame,  totalPlyCount,   posSF) =>
-   {
-     // TO DO: See FENFromBitboard for ideas of how to do reverse operation
-     //Console.WriteLine(pos.BoardPicture);
-
-     string inFEN = posSF.fen();
-     string outFEN = null;
-
-     PositionCompressed pos;
-     try
-     {
-       count++;
-       pos = MGChessPositionConverter.PositionCompressedFromMGChessPosition(MGChessPositionConverter.MGChessPositionFromFEN(inFEN));
-       outFEN = FENGenerator.GetFEN(pos);
-       if (++count % 10_000 == 0)
-       {
-         if (lastTime != default(DateTime))
-           Console.WriteLine($" {inFEN} {count} {(DateTime.Now - lastTime).TotalSeconds} {System.GC.CollectionCount(0) } { System.GC.GetAllocatedBytesForCurrentThread() / 1_000_000}");
-         lastTime = DateTime.Now;
-       }
-     }
-     catch (Exception e)
-     {
-       Console.WriteLine(e);
-     }
-     if (inFEN != outFEN)
-     {
-       Console.WriteLine();
-       Console.WriteLine(inFEN);
-       Console.WriteLine(outFEN);
-     }
-//     else
-//       Console.Write('.');
-     return false; // do not exit
-
-   }
-  );
-#endif
-      return;
-
-
-      // DOCUMENTATION STRUCTS
-      // https://docs.microsoft.com/en-us/dotnet/csharp/write-safe-efficient-code
-
-      System.Threading.Thread.CurrentThread.Priority = System.Threading.ThreadPriority.AboveNormal;
-      MGPosition startpos = new MGPosition();
-      startpos.A = 5404038077867949898;
-      startpos.B = 4323455642275676220;
-      startpos.C = 15780613094306218203;
-      startpos.D = 18446462598732840960;
-      startpos.Flags = (MGPosition.FlagsEnum)30;
-      startpos.MoveNumber = 1;
-      //startpos.HalfMoves = 0;
-      //startpos.material = 0;
-
-      if (true)
-      {
-        const int DEPTH = 5; // was 6 (or 5)
-        ulong moveCount = 0;
-        Perft(startpos, DEPTH, 1, null, ref moveCount);
-        using (new TimingBlock("Perft"))
-        {
-          if (false)
-          {
-            moveCount = 0;
-            Perft(startpos, DEPTH, 1, null, ref moveCount);
-            moveCount = 0;
-            Perft(startpos, DEPTH, 1, null, ref moveCount);
-          }
-          moveCount = 0;
-          Perft(startpos, DEPTH, 1, null, ref moveCount);
-          Console.WriteLine(moveCount);
-        }
-        return;
-      }
-
-
-      MGPosition bug = new MGPosition();
-      bug.A = 5404038077868277576;
-      bug.B = 4323455642275676220;
-      bug.C = 15780613094306545881;
-      bug.D = 18446462598732840960;
-      bug.Flags = (MGPosition.FlagsEnum)30;
-      bug.Dump();
-
-      const int MOVELIST_SIZE = 128;
-
-      MGMoveList moves = new MGMoveList(128);
-
-      for (int j = 0; j < 2; j++)
-        using (new TimingBlock("ChessMove"))
-        {
-          for (int i = 0; i < 1_000_000; i++)
-          {
-            moves.NumMovesUsed = 0;
-            moves.MovesArray[0].Flags = 0;
-
-            MGMoveGen.GenerateMoves(bug, moves);
-          }
-        }
-
-      Console.WriteLine("Num generated: " + moves.NumMovesUsed);
-
-      for (int i = 0; i < moves.NumMovesUsed; i++)
-        Console.WriteLine(i + ": " + moves.MovesArray[i].MoveStr(MGMoveNotationStyle.PieceAndCoordinates) + " " + moves.MovesArray[i].FromSquareIndex + " " + moves.MovesArray[i].ToSquareIndex + " " + moves.MovesArray[i].Flags);
-      System.Environment.Exit(3);
-
-
-
-      MGPosition moveBlack = new MGPosition();
-      moveBlack.A = 351289571361211392;
-      moveBlack.B = 1441714830716174624;
-      moveBlack.C = 1441151949483016224;
-      moveBlack.D = 1504765229790396416;
-      moveBlack.BlackToMove = true;
-
-      MGPosition promoteBlack = new MGPosition();
-      promoteBlack.A = 351289571361211904;
-      promoteBlack.B = 1441714830716174624;
-      promoteBlack.C = 1441151949483016224;
-      promoteBlack.D = 1504765229790396928;
-      promoteBlack.BlackToMove = true;
-
-
-      RAND = new Random().Next();
-
-      BitBoard bax1 = (ulong)RAND;
-      BitBoard bax2 = (ulong)new Random().Next();
-      BitBoard bax0 = (ulong)new Random().Next();
-
-      // This takes 2.5 seconds for 100,000,000 in C++
-      // Takes about 3.0 seconds in C#
-      // ChessPositionMoveGen.isWhiteInCheck(startpos))
-
-      if (false)
-      {
-        int zz = 0;
-        for (int j = 0; j < 2; j++)
-          using (new TimingBlock("ChessMove"))
-          {
-            for (int i = 0; i < 100_000_000; i++)
-            {
-              //              if (ChessPositionMoveGen.isWhiteInCheck(startpos)) return;
-#if NOT
-              ChessMove cdd = new ChessMove();
-              cdd.Piece = 3;
-              cdd.Castle = true;
-              cdd.MoveCount = 12;
-              Funky(cdd);
-              if ((cdd.Castle ? 1 : 0) + cdd.Piece + cdd.MoveCount != RAND) zz++;
-              if (!cdd.Castle) return;
-              if (cdd.MoveCount == 4) return;
-#endif
-            }
-            //Console.WriteLine(zz);
-            //Debug.Assert((int)cdd.Flags == 204472352);
-          }
-      }
-
-      return;
-
-      //      Debug.Assert(!ChessPositionMoveGen.isWhiteInCheck(startpos));
-      //      Debug.Assert(!ChessPositionMoveGen.isBlackInCheck(startpos));
-
     }
+
 
     static Dictionary<ulong, MGPosition> hashtable = new Dictionary<ulong, MGPosition>();
 
@@ -590,9 +528,8 @@ namespace Ceres.Chess.MoveGen.Test
 
     static ulong Perft(in MGPosition P, int maxdepth, int depth, MGMoveList movesThisDepth, ref ulong nodecount)
     {
-      if (movesThisDepth == null) movesThisDepth = new MGMoveList(128);
+      movesThisDepth ??= new MGMoveList(128);
       movesThisDepth.NumMovesUsed = 0;
-
 
       MGMoveGen.GenerateMoves(in P, movesThisDepth);
       if (false)
@@ -610,57 +547,24 @@ namespace Ceres.Chess.MoveGen.Test
       if (depth == maxdepth)
       {
         nodecount += (ulong)movesThisDepth.NumMovesUsed;
-#if MG_USE_HASH
-        if (TRACK_HASH)
-        {
-          if (hashtable.ContainsKey(P.HK))
-          {
-            if (hashtable[P.HK] != P)
-              HASH_COLLISIONS++;
-          }
-          hashtable[P.HK] = P;
-        }
-#endif
       }
       else
       {
         MGMoveList movesNextDepth = new MGMoveList(128);
-        //nodecount += (ulong)movesThisDepth.NumMovesUsed;
+
         for (int i = 0; i < movesThisDepth.NumMovesUsed; i++)
         {
           MGPosition Q = new MGPosition(P);
           MGMove m = movesThisDepth.MovesArray[i];
           Q.MakeMove(m);
 
-#if MG_USE_HASH
-          if (false)
-          {
-//            if (i == 0) Console.WriteLine();
-            //// ---------------------------------------------------
-            //// Do this to trap bugs with incremental Hash updates:
-            MGChessPosition Q2 = Q;
-            Q2.CalculateHash();
-
-            if (Q2.HK != Q.HK)
-            {
-              Console.WriteLine("\r\nbad " + movesThisDepth.MovesArray[i]);
-              Q.Dump();
-              Q2.Dump();
-              Console.WriteLine();
-            }
-//            else
-//              Console.WriteLine("ok " + movesThisDepth.Moves[i].MoveStr());
-            //// ---------------------------------------------------
-          }
-#endif
-
-          Perft(in Q, maxdepth, depth + 1, movesNextDepth, ref nodecount);//, pI);
+          Perft(in Q, maxdepth, depth + 1, movesNextDepth, ref nodecount);
         }
-        //Q = P; // unmake move
       }
 
       return nodecount;
     }
+
 
     // Standard Chess960 test positions.
     static readonly string CHESS960PERFT_POS = """
