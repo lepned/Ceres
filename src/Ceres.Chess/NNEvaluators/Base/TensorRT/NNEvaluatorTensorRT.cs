@@ -719,20 +719,6 @@ public class NNEvaluatorTensorRT : NNEvaluator
 
   // Thread-static buffers for native input conversion
   [ThreadStatic] static byte[] inputsPrimaryNative;
-  [ThreadStatic] static Half[] inputsPrimaryNativeF;
-
-  // Lookup table for fast byte to Half conversion
-  static bool haveInitializedLookupByteToHalf = false;
-  static readonly Half[] LookupByteToHalf = new Half[256];
-
-  static void InitLookupTable()
-  {
-    for (int i = 0; i <= byte.MaxValue; i++)
-    {
-      LookupByteToHalf[i] = (Half)i;
-    }
-    haveInitializedLookupByteToHalf = true;
-  }
 
 
   /// <summary>
@@ -803,11 +789,6 @@ public class NNEvaluatorTensorRT : NNEvaluator
       throw new Exception("ConverterToFlatFromTPG must be provided");
     }
 
-    if (!haveInitializedLookupByteToHalf)
-    {
-      InitLookupTable();
-    }
-
     EnsureInputBuffers(numPositions);
 
     // Allocate thread-static buffers if needed (sized to the actual batch, grown on demand)
@@ -816,7 +797,6 @@ public class NNEvaluatorTensorRT : NNEvaluator
     if (inputsPrimaryNative == null || inputsPrimaryNative.Length < requiredBufferSize)
     {
       inputsPrimaryNative = new byte[requiredBufferSize];
-      inputsPrimaryNativeF = new Half[requiredBufferSize];
     }
 
     // Convert native input to flat format
@@ -829,12 +809,6 @@ public class NNEvaluatorTensorRT : NNEvaluator
     }
     else
     {
-      // Convert bytes to Half (efficiently via lookup table) for Half input path
-      for (int i = 0; i < numConverted; i++)
-      {
-        inputsPrimaryNativeF[i] = LookupByteToHalf[inputsPrimaryNative[i]];
-      }
-
       // Convert byte buffer to half buffer with /100 scaling
       int elemsToCopy = numPositions * inputElementsPerPosition;
       Memory<byte> sourceBytes = new Memory<byte>(inputsPrimaryNative, 0, elemsToCopy);
