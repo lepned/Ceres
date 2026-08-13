@@ -609,10 +609,36 @@ public sealed class EnginePool : IDisposable
             continue;
           }
 
-          engine.CopyToGPUOnStreamAsync(streamId, streamBuffers[s].GpuInput, streamBuffers[s].PinnedInput, inputBytes);
+          // The transfers and the stream synchronization below are ordinary CUDA calls, and they
+          // run concurrently with other devices' warmup (MultiGPUEnginePool warms up GPUs in
+          // parallel) and potentially with graph capture by another component in this process.
+          // They therefore take the graph capture READ lock, which excludes only an in-progress
+          // capture (a capturer holds the write lock) and does not serialize the parallel warmup.
+          // The lock is released before the inference call, which acquires the WRITE lock itself
+          // if this stream still needs capture: ReaderWriterLockSlim (NoRecursion) does not permit
+          // upgrading a read lock, so these sections must not enclose that call.
+          GraphCaptureRWLock.EnterReadLock();
+          try
+          {
+            engine.CopyToGPUOnStreamAsync(streamId, streamBuffers[s].GpuInput, streamBuffers[s].PinnedInput, inputBytes);
+          }
+          finally
+          {
+            GraphCaptureRWLock.ExitReadLock();
+          }
+
           engine.InferOnStreamWithGraphAsync(streamId, streamBuffers[s].GpuInput, streamBuffers[s].GpuOutput, GraphCaptureRWLock);
-          engine.CopyFromGPUOnStreamAsync(streamId, streamBuffers[s].PinnedOutput, streamBuffers[s].GpuOutput, outputBytes);
-          engine.SyncStream(streamId, engine.BatchSize);
+
+          GraphCaptureRWLock.EnterReadLock();
+          try
+          {
+            engine.CopyFromGPUOnStreamAsync(streamId, streamBuffers[s].PinnedOutput, streamBuffers[s].GpuOutput, outputBytes);
+            engine.SyncStream(streamId, engine.BatchSize);
+          }
+          finally
+          {
+            GraphCaptureRWLock.ExitReadLock();
+          }
         }
       }
       catch (Exception ex)

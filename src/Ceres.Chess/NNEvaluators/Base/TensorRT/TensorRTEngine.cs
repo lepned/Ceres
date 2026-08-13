@@ -660,7 +660,7 @@ public sealed class TensorRTEngine : IDisposable
     {
       fixed (Half* outputPtr = output)
       {
-                                                 int result = TensorRTNative.InferHostDynamic(handle, inputPtr, actualInputElements, outputPtr, actualOutputElements, actualBatchSize);
+        int result = TensorRTNative.InferHostDynamic(handle, inputPtr, actualInputElements, outputPtr, actualOutputElements, actualBatchSize);
         if (result != 0)
         {
           string error = TensorRTNative.GetLastErrorString();
@@ -821,25 +821,41 @@ public sealed class TensorRTEngine : IDisposable
   /// <summary>
   /// Asynchronously runs inference on the specified stream with CUDA graph support and proper locking.
   /// On first call per stream, acquires write lock on graphCaptureRWLock, captures a CUDA graph, then releases.
-  /// Subsequent calls replay the graph without needing the write lock.
+  /// Subsequent calls replay the graph while holding only the read lock (many replays run concurrently).
   /// For engines with useCudaGraphs=false, this behaves like InferOnStreamAsync.
   /// Use this for Exact mode engines where batch size is fixed.
   /// </summary>
   /// <param name="streamIdx">Stream index (0 or 1)</param>
   /// <param name="gpuInput">GPU input buffer pointer</param>
   /// <param name="gpuOutput">GPU output buffer pointer</param>
-  /// <param name="graphCaptureRWLock">Reader/writer lock to acquire during graph capture (null to skip locking)</param>
+  /// <param name="graphCaptureRWLock">Reader/writer lock: read lock held while launching, write lock while capturing (null to skip locking)</param>
   public void InferOnStreamWithGraphAsync(int streamIdx, IntPtr gpuInput, IntPtr gpuOutput,
                                           System.Threading.ReaderWriterLockSlim graphCaptureRWLock)
   {
-    // Fast path: if graphs are disabled or already captured, no lock needed
+    // Fast path: graphs are disabled or already captured, so this is a plain launch or graph replay.
+    // The READ lock is still taken, because graphCaptureRWLock is shared with the other components
+    // in this process that capture CUDA graphs, and at least one of them (NNBackendCUDAGraph) begins
+    // capture with CUstreamCaptureMode.Global. Under global capture mode CUDA prohibits potentially
+    // unsafe calls from ANY thread until the capture ends, so launching here without the lock is not
+    // excluded from that window. The read lock is shared: concurrent replays do not serialize, they
+    // only wait while some component actually holds the write lock to capture.
+    // N.B. TensorRT's own capture uses cudaStreamCaptureModeThreadLocal (see TensorRTWrapper.cpp),
+    //      so this guards against those other capturers, not against TensorRT capture itself.
     if (!UsesCudaGraphs || IsStreamGraphCaptured(streamIdx))
     {
-      int result = TensorRTNative.InferOnStreamWithGraph(handle, streamIdx, gpuInput, gpuOutput);
-      if (result != 0)
+      graphCaptureRWLock?.EnterReadLock();
+      try
       {
-        string error = TensorRTNative.GetLastErrorString();
-        throw new InvalidOperationException($"InferOnStreamWithGraph failed on stream {streamIdx}: {error ?? "unknown error"}");
+        int result = TensorRTNative.InferOnStreamWithGraph(handle, streamIdx, gpuInput, gpuOutput);
+        if (result != 0)
+        {
+          string error = TensorRTNative.GetLastErrorString();
+          throw new InvalidOperationException($"InferOnStreamWithGraph failed on stream {streamIdx}: {error ?? "unknown error"}");
+        }
+      }
+      finally
+      {
+        graphCaptureRWLock?.ExitReadLock();
       }
       return;
     }
