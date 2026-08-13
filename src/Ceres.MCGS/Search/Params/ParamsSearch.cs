@@ -559,12 +559,13 @@ public record ParamsSearch
   /// history, diluting the move's value so the engine walks into a repetition with its eval frozen.
   ///   0 = off.
   ///   1 = search root's direct children only (the dominant, decision-determining case; cheap).
-  ///   N > 1 = also reconcile that many plies deeper (cost grows with depth; when > 1 a yellow
-  ///           per-search timing/stats line is printed). Only history-level repetitions are converted,
-  ///           which is sound at any depth regardless of node sharing.
+  ///   N > 1 = also reconcile that many plies deeper (cost grows with depth). 
+  ///           Only history-level repetitions are converted, which is sound at any depth regardless of node sharing.
   /// See GNode.ReconcileDrawByRepetitions. Is a no-op unless such a repetition exists in range.
+  /// N.B. Values higher than 2 are too expensive (exponential node count in depth,
+  ///      with MCGSPath.HashFoundInGraphRootPathOrPrehistory being called for each).
   /// </summary>
-  public int RepetitionDrawReconciliationDepth = 4;
+  public int RepetitionDrawReconciliationDepth = 2; // max 2; see above
 
   /// <summary>
   /// If nodes should apply supplemental updates.
