@@ -62,8 +62,6 @@ public sealed class MultiGPUEnginePool : IDisposable
   private readonly string cacheDir;
 
   // Pinned memory buffers for async transfers
-  private IntPtr pinnedInput;
-  private IntPtr pinnedOutput;
   private long pinnedInputBytes;
   private long pinnedOutputBytes;
   // Cached arrays per GPU to avoid per-batch allocations
@@ -272,8 +270,7 @@ public sealed class MultiGPUEnginePool : IDisposable
     int maxBatch = GetMaxBatchSize();
     pinnedInputBytes = maxBatch * InputElementsPerPosition * sizeof(ushort);
     pinnedOutputBytes = maxBatch * OutputElementsPerPosition * sizeof(ushort);
-    pinnedInput = TensorRTNative.AllocPinned(pinnedInputBytes);
-    pinnedOutput = TensorRTNative.AllocPinned(pinnedOutputBytes);
+
     // Initialize cached arrays for each GPU
     int numPools = pools.Count;
     cachedHalfInputs = new Half[numPools][];
@@ -1690,15 +1687,6 @@ public sealed class MultiGPUEnginePool : IDisposable
       workerThreads[i].Join(1000);
       workerStartSignals[i].Dispose();
       workerDoneSignals[i].Dispose();
-    }
-
-    if (pinnedInput != IntPtr.Zero)
-    {
-      TensorRTNative.FreePinned(pinnedInput);
-    }
-    if (pinnedOutput != IntPtr.Zero)
-    {
-      TensorRTNative.FreePinned(pinnedOutput);
     }
 
     foreach (EnginePool pool in pools)
