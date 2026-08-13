@@ -197,6 +197,20 @@ public sealed class MultiGPUEnginePool : IDisposable
       }
     }
 
+    // Normalize each GPU's batch sizes exactly once, here at the boundary: sorted ascending with
+    // duplicates removed (SM alignment can snap two configured sizes onto the same multiple, see
+    // NNEvaluatorTensorRT.AdjustToSM). EnginePool builds one engine per distinct size, and Warmup
+    // below measures execution times walking these arrays in this order, so this normalization is
+    // what keeps engines, batch sizes and timings in agreement (EnginePool.SetExecutionTimes
+    // verifies the correspondence). Copies are made, so caller arrays are never mutated.
+    int[][] normalizedSizesPerGPU = new int[this.sizesPerGPU.Length][];
+    for (int i = 0; i < this.sizesPerGPU.Length; i++)
+    {
+      normalizedSizesPerGPU[i] = EnginePool.SortedDistinctSizes(this.sizesPerGPU[i], descending: false);
+    }
+    this.sizesPerGPU = normalizedSizesPerGPU;
+    sizesPerGPU = normalizedSizesPerGPU;  // parameter is also referenced directly by the load paths below
+
     // Load engines in parallel across GPUs when enabled, multi-GPU, and all device IDs are unique
     // (duplicate device IDs can occur for testing purposes and require sequential loading)
     bool hasDuplicateDevices = deviceIds.Length != deviceIds.Distinct().Count();
@@ -359,11 +373,9 @@ public sealed class MultiGPUEnginePool : IDisposable
         continue;  // Singleton (heterogeneous) group — nothing to share.
       }
 
-      // The cache filename's batch order matches EnginePool's internal descending sort, so sort a
-      // copy the same way before resolving the blob's cache filename.
-      int[] leaderSizes = (int[])sizesPerGPU[leaderIdx].Clone();
-      Array.Sort(leaderSizes);
-      Array.Reverse(leaderSizes);
+      // The cache filename's batch order matches EnginePool's internal descending ordering, so
+      // apply the same normalization to a copy before resolving the blob's cache filename.
+      int[] leaderSizes = EnginePool.SortedDistinctSizes(sizesPerGPU[leaderIdx], descending: true);
 
       bool haveBlob = trt.TryReadMultiProfileBlobFromCache(onnxPath, leaderSizes, options, cacheDir,
                                                            deviceIds[leaderIdx], out IntPtr blob, out long size);
@@ -717,13 +729,32 @@ public sealed class MultiGPUEnginePool : IDisposable
         string avgStr = string.Join(", ", executionTimesPerGPU[g].Select(t => t.ToString("F1")));
         Console.WriteLine($"DEVICE {deviceIDs[g]} averaged timings: [{avgStr}] ms");
       }
-      pools[g].ExecutionTimes = executionTimesPerGPU[g];
+      // Pass the sizes the timings were measured at along with the timings; the pool maps them
+      // onto its engines by batch size (it holds them in descending order) and throws on mismatch.
+      pools[g].SetExecutionTimes(sizesPerGPU[g], executionTimesPerGPU[g]);
     }
 
     // Run batch size optimization if enabled. Skipped for shared pools: their engine sizes are
     // fixed by the reference's already-built engines, and rebuilding would deserialize fresh
     // engines and defeat the sharing.
-    if (APPLY_BATCH_SIZE_OPTIMIZATION && mode == EnginePoolMode.Exact && !isSharedPool)
+    // The optimizer interpolates GPU 0's sizes against every GPU's timings, so it requires all
+    // GPUs to have the same number of batch sizes (which can differ across heterogeneous devices
+    // if SM alignment collapsed a different number of duplicates on each).
+    bool uniformSizeCounts = true;
+    for (int g = 1; g < numGPUs; g++)
+    {
+      if (sizesPerGPU[g].Length != sizesPerGPU[0].Length)
+      {
+        uniformSizeCounts = false;
+        break;
+      }
+    }
+
+    if (APPLY_BATCH_SIZE_OPTIMIZATION && mode == EnginePoolMode.Exact && !isSharedPool && !uniformSizeCounts)
+    {
+      Console.WriteLine("Batch size optimization skipped: GPUs have differing numbers of engine batch sizes.");
+    }
+    else if (APPLY_BATCH_SIZE_OPTIMIZATION && mode == EnginePoolMode.Exact && !isSharedPool)
     {
       int maxBatchSize = sizesPerGPU[0][^1] * numGPUs;
       BatchSizeOptimizer.OptimizationResult result = BatchSizeOptimizer.Optimize(sizesPerGPU[0], executionTimesPerGPU, numGPUs, 1024);

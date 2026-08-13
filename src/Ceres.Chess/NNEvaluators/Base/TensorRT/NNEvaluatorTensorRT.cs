@@ -2609,8 +2609,11 @@ public class NNEvaluatorTensorRT : NNEvaluator
 
 
   /// <summary>
-  /// Modifies in place a sequence of batch sizes to be 
-  /// aligned with exact SM count (if within a specified tolerance).
+  /// Returns a sequence of batch sizes aligned with the exact SM count of the specified device
+  /// (if within a specified tolerance). The returned sizes are sorted ascending with duplicates
+  /// removed, since snapping can map two nearby anchor sizes onto the same SM multiple and
+  /// downstream code (engine construction, engine lookup by batch size, execution time lookup,
+  /// batch size optimization) requires a strictly ascending set of distinct sizes.
   /// </summary>
   /// <param name="anchorBatchSizes"></param>
   /// <returns></returns>
@@ -2662,7 +2665,14 @@ public class NNEvaluatorTensorRT : NNEvaluator
       adjustedSizes[i] = bestAdjusted;
     }
 
-    return adjustedSizes;
+    int[] normalizedSizes = EnginePool.SortedDistinctSizes(adjustedSizes, descending: false);
+    if (normalizedSizes.Length != adjustedSizes.Length)
+    {
+      Console.WriteLine($"  NOTE: GPU {deviceID} SM alignment ({smCount} SMs) collapsed batch sizes "
+                      + $"[{string.Join(", ", anchorBatchSizes)}] --> [{string.Join(", ", normalizedSizes)}]");
+    }
+
+    return normalizedSizes;
   }
 
 

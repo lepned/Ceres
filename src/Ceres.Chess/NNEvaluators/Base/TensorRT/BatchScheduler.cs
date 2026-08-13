@@ -269,15 +269,26 @@ public static class BatchScheduler
             bestPad = dpPadNext[uOff + r];
           }
 
-          // Option B: GPU g is active (requires u >= 1 and r >= 1)
-          if (u >= 1 && r >= 1)
+          // Option B: GPU g is active (requires u >= 1, and at least one position for each
+          // of the u active GPUs, i.e. r >= u)
+          if (u >= 1 && r >= u)
           {
             int prevUOff = (u - 1) * stride;
+
+            // Largest n leaving a feasible remainder: the other (u-1) active GPUs downstream
+            // each require at least one position, so h(n) = dpNext[u-1][r-n] is float.MaxValue
+            // (infeasible) for every n > r - (u-1). That infeasible tail breaks the monotonicity
+            // the binary searches below rely on: searching up to r lets lo converge into the
+            // tail, where the +/-1 check window sees only infeasible n, leaving activeBestMs at
+            // MaxValue and silently discarding the active option (which happens whenever a fast
+            // GPU should take the largest share, and is only masked for u <= 2 because the tail
+            // is then at most one element wide). So bound every search by nMax.
+            int nMax = r - (u - 1);
 
             // Binary search for crossing: smallest n where f(n) >= h(n)
             // f(n) = ActualTime(g, n) = gpuCost[g][n] + overlapCredit
             // h(n) = dpNext[u-1][r-n]
-            int lo = 1, hi = r;
+            int lo = 1, hi = nMax;
             while (lo < hi)
             {
               int mid = lo + (hi - lo) / 2;
@@ -297,7 +308,7 @@ public static class BatchScheduler
             float activeBestMs = float.MaxValue;
             int activeBestN = 1;
             int checkLo = Math.Max(1, lo - 1);
-            int checkHi = Math.Min(r, lo + 1);
+            int checkHi = Math.Min(nMax, lo + 1);
             for (int n = checkLo; n <= checkHi; n++)
             {
               float fn = gpuCost[gOff + n] + overlapCredit;
@@ -322,7 +333,7 @@ public static class BatchScheduler
               // Smallest n (>=1) where dpNext[u-1][r-n] <= threshold
               int nMinH;
               {
-                int sLo = 1, sHi = r;
+                int sLo = 1, sHi = nMax;
                 while (sLo < sHi)
                 {
                   int mid = sLo + (sHi - sLo) / 2;
@@ -339,10 +350,10 @@ public static class BatchScheduler
                 nMinH = sLo;
               }
 
-              // Largest n (<=r) where ActualTime(g,n) <= threshold
+              // Largest n (<=nMax) where ActualTime(g,n) <= threshold
               int nMaxF;
               {
-                int sLo = 1, sHi = r;
+                int sLo = 1, sHi = nMax;
                 while (sLo < sHi)
                 {
                   int mid = sLo + (sHi - sLo + 1) / 2;

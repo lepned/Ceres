@@ -199,17 +199,101 @@ public sealed class EnginePool : IDisposable
   public int ExactModeBatchNumPositionsAcceptablePadding { get; set; }
 
   /// <summary>
-  /// Execution times in milliseconds for each engine batch size.
-  /// Index corresponds to the engine index (same order as ranges).
-  /// Set by MultiGPUEnginePool.Warmup() or manually for optimized scheduling.
+  /// Execution times in milliseconds as measured during warmup, indexed in the order of the
+  /// batch sizes that were passed to SetExecutionTimes (i.e. the caller's ascending order,
+  /// which is NOT the engine order because engines are sorted descending in Exact mode).
+  /// Null until SetExecutionTimes has been called (typically by MultiGPUEnginePool.Warmup).
+  /// Internal lookups use executionTimesByEngineIndex instead.
   /// </summary>
-  public float[] ExecutionTimes { get; set; }
+  public float[] ExecutionTimes { get; private set; }
+
+  /// <summary>
+  /// Execution times in milliseconds indexed by engine index (same order as engines/ranges).
+  /// Built by SetExecutionTimes by matching batch sizes, so correctness does not depend on
+  /// any assumed relationship between the measurement order and the engine order.
+  /// </summary>
+  private float[] executionTimesByEngineIndex;
+
+  /// <summary>
+  /// Batch size associated with each engine (index matches engines/ranges).
+  /// For Exact mode this is the engine's exact batch size, for Range mode the range maximum
+  /// (the size at which that range's engine is benchmarked).
+  /// Guaranteed distinct (see constructor), since batch size is used as a key to find engines.
+  /// </summary>
+  private int[] engineBatchSizes;
 
   /// <summary>
   /// Engine sizes array (batch sizes) for use by the optimized scheduler.
   /// In Exact mode, these are the exact batch sizes sorted descending.
   /// </summary>
   public int[] EngineSizes => ranges.Select(r => r.min).ToArray();
+
+
+  /// <summary>
+  /// Returns the specified batch sizes sorted (ascending or descending) with duplicates removed.
+  /// Engine construction, batch size to engine index lookup, and execution time lookup all
+  /// require a set of distinct sizes. Duplicates can arise from SM alignment snapping two
+  /// nearby configured sizes onto the same multiple (see NNEvaluatorTensorRT.AdjustToSM).
+  /// </summary>
+  public static int[] SortedDistinctSizes(int[] sizes, bool descending)
+  {
+    if (sizes == null)
+    {
+      return null;
+    }
+
+    return descending ? sizes.Distinct().OrderByDescending(s => s).ToArray()
+                      : sizes.Distinct().OrderBy(s => s).ToArray();
+  }
+
+
+  /// <summary>
+  /// Sets the execution times measured during warmup, together with the batch sizes at which
+  /// they were measured. The sizes are passed explicitly (rather than assumed to line up
+  /// positionally with the engines) because the constructor reorders sizes into descending order
+  /// whereas the benchmark loop runs in the caller's ascending order. Times are mapped to engine
+  /// indices by matching batch sizes, and any mismatch throws instead of silently attributing
+  /// timings to the wrong engines (which would yield wrong but plausible looking batch plans).
+  /// </summary>
+  /// <param name="measuredBatchSizes">Batch sizes at which the times were measured (distinct).</param>
+  /// <param name="executionTimesMS">Execution time in milliseconds for each measured batch size.</param>
+  public void SetExecutionTimes(int[] measuredBatchSizes, float[] executionTimesMS)
+  {
+    if (measuredBatchSizes == null || executionTimesMS == null)
+    {
+      ExecutionTimes = null;
+      executionTimesByEngineIndex = null;
+      return;
+    }
+
+    if (measuredBatchSizes.Length != executionTimesMS.Length)
+    {
+      throw new ArgumentException($"Device {deviceId}: {measuredBatchSizes.Length} measured batch sizes "
+                                + $"but {executionTimesMS.Length} execution times.");
+    }
+
+    if (measuredBatchSizes.Length != engineBatchSizes.Length)
+    {
+      throw new ArgumentException($"Device {deviceId}: execution times measured at "
+                                + $"[{string.Join(", ", measuredBatchSizes)}] but pool has engines "
+                                + $"[{string.Join(", ", engineBatchSizes)}].");
+    }
+
+    float[] byEngineIndex = new float[engineBatchSizes.Length];
+    for (int i = 0; i < engineBatchSizes.Length; i++)
+    {
+      int measuredIndex = Array.IndexOf(measuredBatchSizes, engineBatchSizes[i]);
+      if (measuredIndex < 0)
+      {
+        throw new ArgumentException($"Device {deviceId}: no execution time measured for engine batch size "
+                                  + $"{engineBatchSizes[i]} (measured [{string.Join(", ", measuredBatchSizes)}]).");
+      }
+      byEngineIndex[i] = executionTimesMS[measuredIndex];
+    }
+
+    ExecutionTimes = executionTimesMS;
+    executionTimesByEngineIndex = byEngineIndex;
+  }
 
 
   public int InputElementsPerPosition { get; private set; }
@@ -314,6 +398,9 @@ public sealed class EnginePool : IDisposable
     {
       // sizes defines range boundaries: [1..sizes[0]], [sizes[0]+1..sizes[1]], etc.
       // e.g., sizes = {15, 127, 1024} means [1..15], [16..127], [128..1024]
+      // Boundaries must be ascending and distinct (a duplicate would produce an empty range).
+      sizes = SortedDistinctSizes(sizes, descending: false);
+
       int prevMax = 0;
       foreach (int maxSize in sizes)
       {
@@ -332,9 +419,11 @@ public sealed class EnginePool : IDisposable
     }
     else // Exact mode
     {
-      // sizes defines exact batch sizes, sorted descending for processing
-      Array.Sort(sizes);
-      Array.Reverse(sizes);
+      // sizes defines exact batch sizes, sorted descending for processing.
+      // Duplicates are removed (they can be created by SM alignment snapping two nearby
+      // configured sizes onto the same multiple) so that engine index, engine batch size
+      // and warmup execution time stay in one-to-one correspondence.
+      sizes = SortedDistinctSizes(sizes, descending: true);
 
       // Build a single multi-profile engine with shared weights across all batch sizes.
       // This eliminates N-fold weight duplication in VRAM and requires only one cache file.
@@ -369,6 +458,21 @@ public sealed class EnginePool : IDisposable
       }
     }
 
+
+    // Cache the batch size associated with each engine (Range mode engines are benchmarked and
+    // selected at their range maximum). Verify distinctness: batch size is used as the key both
+    // to map a scheduled batch size back to an engine and to attach warmup execution times to
+    // engines, so a duplicate would silently misattribute work or timings.
+    engineBatchSizes = new int[ranges.Count];
+    for (int i = 0; i < ranges.Count; i++)
+    {
+      engineBatchSizes[i] = mode == EnginePoolMode.Range ? ranges[i].max : ranges[i].min;
+    }
+    if (engineBatchSizes.Distinct().Count() != engineBatchSizes.Length)
+    {
+      throw new Exception($"EnginePool device {deviceId}: engine batch sizes must be distinct, "
+                        + $"saw [{string.Join(", ", engineBatchSizes)}].");
+    }
 
     // Compute per-position sizes from largest engine
     // For Exact mode, engines are sorted descending so [0] is largest
@@ -927,33 +1031,15 @@ public sealed class EnginePool : IDisposable
     if (totalPositions <= 0
      || mode != EnginePoolMode.Exact
      || !OPTIMIZED_SCHEDULING
-     || ExecutionTimes == null)
+     || executionTimesByEngineIndex == null)
     {
       return totalPositions;
     }
 
     return paddedCapacityCache.GetOrAdd(totalPositions, n =>
     {
-      // Mirror ComputeBatchPlanOptimized: build sizes/timings in ranges (descending) order.
-      int numEngines = ranges.Count;
-      Span<int> engineSizes = stackalloc int[numEngines];
-      Span<float> orderedExecutionTimes = stackalloc float[numEngines];
-      for (int i = 0; i < numEngines; i++)
-      {
-        int size = ranges[i].min;
-        engineSizes[i] = size;
-        int originalIndex = 0;
-        for (int j = 0; j < numEngines; j++)
-        {
-          if (ranges[j].min < size)
-          {
-            originalIndex++;
-          }
-        }
-        orderedExecutionTimes[i] = ExecutionTimes[originalIndex];
-      }
-
-      int[] batchSizes = BatchScheduler.ScheduleSingleGPU(engineSizes, orderedExecutionTimes, n,
+      // Mirror ComputeBatchPlanOptimized: sizes and timings are both in engine index order.
+      int[] batchSizes = BatchScheduler.ScheduleSingleGPU(engineBatchSizes, executionTimesByEngineIndex, n,
                                                           deviceId, concurrent: NUM_COMPUTE_STREAMS > 1);
       int capacity = 0;
       foreach (int batchSize in batchSizes)
@@ -999,7 +1085,7 @@ public sealed class EnginePool : IDisposable
     }
 
     // Use optimized scheduling if enabled and execution times are available (Exact mode only)
-    if (OPTIMIZED_SCHEDULING && ExecutionTimes != null && mode == EnginePoolMode.Exact)
+    if (OPTIMIZED_SCHEDULING && executionTimesByEngineIndex != null && mode == EnginePoolMode.Exact)
     {
       ComputeBatchPlanOptimized(totalPositions);
     }
@@ -1034,34 +1120,10 @@ public sealed class EnginePool : IDisposable
   /// </summary>
   private void ComputeBatchPlanOptimized(int totalPositions)
   {
-    int numEngines = ranges.Count;
-
-    // Build engine sizes array - ranges[i].min contains the size in Exact mode
-    // Note: ranges is sorted descending, but ExecutionTimes is indexed by original (ascending) order
-    Span<int> engineSizes = stackalloc int[numEngines];
-    for (int i = 0; i < numEngines; i++)
-    {
-      engineSizes[i] = ranges[i].min;
-    }
-
-    // Build correctly-ordered execution times array to match engineSizes order
-    // ExecutionTimes is indexed by original order (ascending), we need it in ranges order (descending)
-    Span<float> orderedExecutionTimes = stackalloc float[numEngines];
-    for (int i = 0; i < numEngines; i++)
-    {
-      int size = engineSizes[i];
-      // Find this size's index in ascending order (original ExecutionTimes order)
-      // Since ranges is descending and ExecutionTimes is ascending, index is (numEngines - 1 - position in descending)
-      int originalIndex = 0;
-      for (int j = 0; j < numEngines; j++)
-      {
-        if (ranges[j].min < size)
-        {
-          originalIndex++;
-        }
-      }
-      orderedExecutionTimes[i] = ExecutionTimes[originalIndex];
-    }
+    // Engine sizes and execution times are both indexed by engine index (engineBatchSizes and
+    // executionTimesByEngineIndex are built together, matching timings to engines by batch size).
+    int[] engineSizes = engineBatchSizes;
+    float[] orderedExecutionTimes = executionTimesByEngineIndex;
 
     // Use the optimized single-GPU scheduler (accepts ReadOnlySpan, no allocation needed)
     // When concurrent compute is enabled, use the concurrent-aware scheduler
@@ -1073,14 +1135,11 @@ public sealed class EnginePool : IDisposable
     foreach (int batchSize in batchSizes)
     {
       // Find engine index by linear scan (numEngines is small, typically < 8)
-      int engineIndex = -1;
-      for (int i = 0; i < numEngines; i++)
+      int engineIndex = Array.IndexOf(engineSizes, batchSize);
+      if (engineIndex < 0)
       {
-        if (ranges[i].min == batchSize)
-        {
-          engineIndex = i;
-          break;
-        }
+        throw new Exception($"EnginePool device {deviceId}: scheduled batch size {batchSize} "
+                          + $"does not correspond to any engine ([{string.Join(", ", engineSizes)}]).");
       }
 
       TensorRTEngine engine = engines[engineIndex];
@@ -1104,14 +1163,7 @@ public sealed class EnginePool : IDisposable
       float totalTime = 0;
       foreach (int b in batchSizes)
       {
-        for (int i = 0; i < numEngines; i++)
-        {
-          if (engineSizes[i] == b)
-          {
-            totalTime += orderedExecutionTimes[i];
-            break;
-          }
-        }
+        totalTime += orderedExecutionTimes[Array.IndexOf(engineSizes, b)];
       }
       Console.WriteLine($"OPTIMIZED_PLAN [device {deviceId}]: {totalPositions} -> [{string.Join(", ", batchSizes)}] " +
                         $"total={totalPos} padding={totalPos - totalPositions} time={totalTime:F1}ms");
@@ -1125,12 +1177,11 @@ public sealed class EnginePool : IDisposable
   /// </summary>
   private void DumpBatchPlanVerbose(int totalPositions)
   {
-    if (!BatchScheduler.VERBOSE_DETAILS || cachedBatchPlan.Count == 0 || ExecutionTimes == null)
+    if (!BatchScheduler.VERBOSE_DETAILS || cachedBatchPlan.Count == 0 || executionTimesByEngineIndex == null)
     {
       return;
     }
 
-    int numEngines = ranges.Count;
     int totalBatched = 0;
     float totalTime = 0;
     Span<int> planSizes = stackalloc int[cachedBatchPlan.Count];
@@ -1140,16 +1191,8 @@ public sealed class EnginePool : IDisposable
       planSizes[i] = batchSize;
       totalBatched += batchSize;
 
-      // Map engine batch size to ExecutionTimes index (ascending order)
-      int originalIndex = 0;
-      for (int j = 0; j < numEngines; j++)
-      {
-        if (ranges[j].min < batchSize)
-        {
-          originalIndex++;
-        }
-      }
-      totalTime += ExecutionTimes[originalIndex];
+      // Timings are indexed by engine index, which the plan entry carries directly
+      totalTime += executionTimesByEngineIndex[cachedBatchPlan[i].engineIndex];
     }
 
     // Add overhead (concurrent or sequential) matching the execution strategy
