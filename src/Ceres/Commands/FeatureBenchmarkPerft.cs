@@ -16,12 +16,7 @@
 using System;
 using System.Collections.Generic;
 
-using Ceres.Chess;
-using Ceres.Chess.GameEngines;
-using Ceres.Chess.NNEvaluators.Defs;
-using Ceres.Chess.Positions;
-using Ceres.MCTS.Params;
-using Ceres.Features.GameEngines;
+using Ceres.Chess.MoveGen.Test;
 
 #endregion
 
@@ -29,25 +24,28 @@ namespace Ceres.Commands
 {
   public record FeatureBenchmarkPerft
   {
-
     /// <summary>
     /// Constructor which parses arguments.
     /// </summary>
-    /// <param name="fen"></param>
     /// <param name="args"></param>
     /// <returns></returns>
     public static void Execute(string args)
     {
-      //Console.WriteLine("Perft benchmark under development: ");
-      var perftParts = args.Split(" ");
-      if (perftParts.Length == 1 && int.TryParse(args, out int n1) && n1 > 1 && n1 < 7)
-        Chess.MoveGen.Test.MGMoveGenTest.RunChess960Verification(n1, 960);
-      else if (perftParts.Length == 2 && int.TryParse(perftParts[1], out int n2) && n2 > 1 && n2 < 7)
-        Chess.MoveGen.Test.MGMoveGenTest.RunChess960Verification(n2, int.Parse(perftParts[0]));
+      const int MAX_DEPTH = 7;
+
+      string[] perftParts = args.Split(" ");
+      if (perftParts.Length == 1 && int.TryParse(args, out int n1) && n1 > 1 && n1 < MAX_DEPTH)
+      {
+        MGMoveGenTest.RunChess960Verification(n1, 960);
+      }
+      else if (perftParts.Length == 2 && int.TryParse(perftParts[1], out int n2) && n2 > 1 && n2 < MAX_DEPTH)
+      {
+        MGMoveGenTest.RunChess960Verification(n2, int.Parse(perftParts[0]));
+      }
       else
       {
         Console.WriteLine("No valid depth number given to Perft, defaulting to depth 5 and 960 positions");
-        Chess.MoveGen.Test.MGMoveGenTest.RunChess960Verification(5, 960);
+        MGMoveGenTest.RunChess960Verification(5, 960);
       }
     }
   }
