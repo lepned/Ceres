@@ -278,7 +278,7 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
         squareValuesByteTemporary ??= new byte[137 * 64 * 1024];   // intial guess for max batch size 1024
         if (squareValuesByteTemporary.Length < numConvertedElements)
         {
-          squareValuesByteTemporary ??= new byte[numConvertedElements];
+          squareValuesByteTemporary = new byte[numConvertedElements];
         }
         squareValuesByte = squareValuesByteTemporary;
       }
