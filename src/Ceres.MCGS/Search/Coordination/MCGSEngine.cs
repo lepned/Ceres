@@ -17,6 +17,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Ceres.Base.DataTypes;
@@ -161,10 +162,10 @@ public partial class MCGSEngine
   {
     Manager = manager;
 
-    // Cache evaluator metadata (constant for the search) used to bound batch sizes.
-    NNEvaluator evaluator0 = Manager.NNEvaluator0;
-    cachedNumDevicesInEvaluator = evaluator0?.NumDevices ?? 1;
-    cachedNetFileSizeBytes = evaluator0?.Info?.NetworkFileSizeBytes ?? -1;
+    // Evaluator metadata used to bound batch sizes, resolved once per evaluator instance.
+    (int numDevices, long netFileSizeBytes) = BatchSizingInfoForEvaluator(Manager.NNEvaluator0);
+    cachedNumDevicesInEvaluator = numDevices;
+    cachedNetFileSizeBytes = netFileSizeBytes;
 
     PostBatchHook = manager.ParamsSearch.PostBatchHook;
 
@@ -304,6 +305,34 @@ public partial class MCGSEngine
 
     Select = new MCGSSelect(this);
     Backup = new MCGSBackup(this);
+  }
+
+
+  /// <summary>
+  /// Per-evaluator memo of the values passed to OptimalBatchSizeCalculator (device count and
+  /// network file size). Keyed weakly on the evaluator instance so a retired evaluator is not
+  /// kept alive by this cache.
+  /// </summary>
+  static readonly ConditionalWeakTable<NNEvaluator, Tuple<int, long>> batchSizingInfoCache = new();
+
+
+  /// <summary>
+  /// Returns the (device count, network file size) pair used to bound batch sizes for the
+  /// specified evaluator, computing it at most once per evaluator instance.
+  /// </summary>
+  /// <param name="evaluator"></param>
+  /// <returns></returns>
+  static (int numDevices, long netFileSizeBytes) BatchSizingInfoForEvaluator(NNEvaluator evaluator)
+  {
+    if (evaluator == null)
+    {
+      return (1, -1);
+    }
+
+    Tuple<int, long> info = batchSizingInfoCache.GetValue(evaluator,
+                              e => new Tuple<int, long>(e.NumDevices, e.Info?.NetworkFileSizeBytes ?? -1));
+
+    return (info.Item1, info.Item2);
   }
 
 
@@ -974,7 +1003,7 @@ public partial class MCGSEngine
 
       // If EnablePolicyUncertaintyTemperatureBoosting is enabled and UncertaintyP head is populated,
       // apply supplemental temperature.
-      if (Manager.ParamsSearch.EnablePolicyUncertaintyTemperatureBoosting 
+      if (Manager.ParamsSearch.EnablePolicyUncertaintyTemperatureBoosting
        && !FP16.IsNaN(evalResult.UncertaintyP))
       {
         float up = evalResult.UncertaintyP.ToFloat;
@@ -984,8 +1013,8 @@ public partial class MCGSEngine
           <= 0.031f => AGGRESSIVE ? 0.92f : 0.94f,
           <= 0.076f => AGGRESSIVE ? 0.94f : 0.97f,
           <= 0.168f => 1.00f,// no adjustment
-          <= 0.321f => AGGRESSIVE ? 1.06f :1.05f,
-          _         => AGGRESSIVE ? 1.13f : 1.09f
+          <= 0.321f => AGGRESSIVE ? 1.06f : 1.05f,
+          _ => AGGRESSIVE ? 1.13f : 1.09f
         };
 
         effectivePolicySoftmax *= tempMultiplier;

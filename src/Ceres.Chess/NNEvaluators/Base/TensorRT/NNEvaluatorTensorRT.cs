@@ -19,6 +19,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Numerics.Tensors;
+using System.Threading;
 using System.Threading.Tasks;
 
 using Ceres.Base.DataTypes;
@@ -59,7 +60,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
   const int NAN_LOG_MIN_INTERVAL_SECONDS = 5 * 60;
   static long nanOccurrenceCount;
   static long nanLastLoggedTicks;
-  static readonly object nanLogLock = new();
+  static readonly Lock nanLogLock = new();
 
   /// <summary>
   /// If true, loads TensorRT engines in parallel across GPUs (legacy path: each device independently
@@ -249,8 +250,29 @@ public class NNEvaluatorTensorRT : NNEvaluator
   /// <inheritdoc/>
   public override int NumDevices => GpuIDs.Length;
 
+  /// <summary>
+  /// Lazily computed backing value for Info, and the object guarding its initialization.
+  /// </summary>
+  EvaluatorInfo infoCached;
+  readonly Lock infoCachedLockObj = new();
+
   /// <inheritdoc/>
-  public override EvaluatorInfo Info => ONNXFileName == null ? null : new EvaluatorInfo(0, FileSizeBytesOrZero(ONNXFileName));
+
+  public override EvaluatorInfo Info
+  {
+    get
+    {
+      if (ONNXFileName == null)
+      {
+        return null;
+      }
+
+      lock (infoCachedLockObj)
+      {
+        return infoCached ??= new EvaluatorInfo(0, FileSizeBytesOrZero(ONNXFileName));
+      }
+    }
+  }
 
   /// <inheritdoc/>
   public override int PaddedBatchCapacity(int numPositions)

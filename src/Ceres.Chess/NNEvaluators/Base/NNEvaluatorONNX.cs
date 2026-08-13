@@ -206,9 +206,30 @@ public class NNEvaluatorONNX : NNEvaluator
 
 
   /// <summary>
+  /// Lazily computed backing value for Info, and the object guarding its initialization.
+  /// </summary>
+  EvaluatorInfo infoCached;
+  readonly object infoCachedLockObj = new();
+
+
+  /// <summary>
   /// Miscellaneous information about the evaluator.
   /// </summary>
-  public override EvaluatorInfo Info => ONNXFileName == null ? null : new EvaluatorInfo(new ONNXNet(ONNXFileName).NumParams, FileSizeBytesOrZero(ONNXFileName));
+  public override EvaluatorInfo Info
+  {
+    get
+    {
+      if (ONNXFileName == null)
+      {
+        return null;
+      }
+
+      lock (infoCachedLockObj)
+      {
+        return infoCached ??= new EvaluatorInfo(new ONNXNet(ONNXFileName).NumParams, FileSizeBytesOrZero(ONNXFileName));
+      }
+    }
+  }
 
 
 
