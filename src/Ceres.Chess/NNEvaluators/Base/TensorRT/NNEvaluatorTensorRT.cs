@@ -207,7 +207,6 @@ public class NNEvaluatorTensorRT : NNEvaluator
   private CompressedPolicyVector[] policiesBuffer;
   private CompressedPolicyVector[] policies2Buffer;
   private CompressedActionVector[] actionsBuffer;
-  private ParallelOptions cachedParallelOptions;
 
   // Network capabilities (determined from output tensors)
   private readonly bool isWDL;
@@ -579,12 +578,6 @@ public class NNEvaluatorTensorRT : NNEvaluator
     plyBinCaptureBuffer = hasPlyBinOutputs ? new Half[maxBatchSize * 512] : Array.Empty<Half>();
     punimSelfBuffer = hasPunimOutputs ? new Half[maxBatchSize * 8] : Array.Empty<Half>();
     punimOpponentBuffer = hasPunimOutputs ? new Half[maxBatchSize * 8] : Array.Empty<Half>();
-
-    // Cache ParallelOptions to avoid allocation per batch
-    cachedParallelOptions = new ParallelOptions
-    {
-      MaxDegreeOfParallelism = ParallelUtils.CalcMaxParallelism(maxBatchSize, 32)
-    };
 
     // Important to capture possible CUDA graphs and timing statistics up front
     Warmup();
@@ -1216,7 +1209,8 @@ public class NNEvaluatorTensorRT : NNEvaluator
     float policyTemperature = Options?.PolicyTemperature ?? 1.0f;
 
     // Parallel extraction of per-position results
-    Parallel.For(0, count, new ParallelOptions() { MaxDegreeOfParallelism = 1 + count / 48 }, i =>
+    const int MIN_PARALLEL_COUNT = 48;
+    Parallel.For(0, count, count < MIN_PARALLEL_COUNT ? null : new ParallelOptions() { MaxDegreeOfParallelism = 1 + count / MIN_PARALLEL_COUNT }, i =>
     {
       int resultIndex = startPos + i;
 
