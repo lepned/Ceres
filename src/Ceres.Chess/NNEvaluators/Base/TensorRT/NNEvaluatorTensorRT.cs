@@ -1092,16 +1092,17 @@ public class NNEvaluatorTensorRT : NNEvaluator
 
   /// <summary>
   /// Converts the output heads from FP16 to float, EXCEPT the large policy head, and only
-  /// for the used positions [0, count). The policy head is read sparsely (legal moves only)
-  /// directly from the FP16 buffer by ExtractSubBatchResults — (float)Half is exact — so
-  /// bulk-converting all ~1858 policy entries per position would be wasted work (the policy
-  /// is ~99% of the output for typical LC0 nets). Other heads (value/MLH/uncertainty and,
-  /// when present, policy2/action/ply-bin/PUNIM/qDev) are still converted here and read from
-  /// the float buffer as before. Walks tensors with the identical offset/alignment logic as
-  /// ComputeTensorOffsets so offsets stay consistent.
+  /// for the used positions [0, count).
   /// </summary>
-  private void PerfConvertNonPolicyHeads(ReadOnlySpan<Half> rawSpan, Span<float> floatBuf, int count, int engineBatchSize)
+  /// <remarks>
+  /// Also reports (and neutralizes) any NaN in the heads it converts. The test rides along with
+  /// the conversion, while each head is still hot in cache.
+  /// </remarks>
+  /// <returns>True if any converted head contained a NaN (which has been replaced by 0).</returns>
+  private bool PerfConvertNonPolicyHeads(ReadOnlySpan<Half> rawSpan, Span<float> floatBuf, int count, int engineBatchSize)
   {
+    bool anyNaN = false;
+
     const int ALIGN = 128;
     int currentOffset = 0;
     for (int t = 0; t < outputInfos.Length; t++)
@@ -1112,11 +1113,31 @@ public class NNEvaluatorTensorRT : NNEvaluator
       if (t != policyTensorIndex && sizePerPos > 0)
       {
         int n = count * sizePerPos;
-        TensorPrimitives.ConvertToSingle(rawSpan.Slice(currentOffset, n), floatBuf.Slice(currentOffset, n));
+        ReadOnlySpan<Half> sourceSlice = rawSpan.Slice(currentOffset, n);
+        Span<float> destSlice = floatBuf.Slice(currentOffset, n);
+        TensorPrimitives.ConvertToSingle(sourceSlice, destSlice);
+
+        // Tested on the FP16 source (half the bandwidth of the float result, and an early-exit
+        // bitmask test rather than a full reduction).
+        if (MathUtils.ContainsNaN(sourceSlice))
+        {
+          anyNaN = true;
+
+          // Substitute 0 so downstream consumers of this head see a sane value.
+          for (int i = 0; i < destSlice.Length; i++)
+          {
+            if (float.IsNaN(destSlice[i]))
+            {
+              destSlice[i] = 0;
+            }
+          }
+        }
       }
 
       currentOffset += (tensorSize + ALIGN - 1) / ALIGN * ALIGN;
     }
+
+    return anyNaN;
   }
 
 
@@ -1777,44 +1798,24 @@ public class NNEvaluatorTensorRT : NNEvaluator
     {
       ReadOnlySpan<Half> rawSpan = new ReadOnlySpan<Half>((void*)rawOutputPtr, outputElementCount);
 
-      // Check for NaNs on raw Half data (half the bandwidth vs checking floats).
-      // outputElementsPerPosition is a single global, floor(largestEngine.TotalOutputSize /
-      // largestBatch); because TotalOutputSize sums each output tensor aligned-up independently,
-      // positionCount * outputElementsPerPosition can slightly EXCEED this engine's actual aligned
-      // output (outputElementCount = rawSpan.Length) for some bucket sets — e.g. an exact-fit batch
-      // on a mid engine whose per-tensor alignment padding amortizes less than the largest engine's.
-      // Clamp to the real buffer length to avoid over-reading rawSpan (was an ArgumentOutOfRange in
-      // the NaN slice). The genuine per-head data is read via aligned per-tensor offsets elsewhere
-      // (PerfConvertNonPolicyHeads / ExtractSubBatchResults / ComputeTensorOffsets), so this scan is
-      // only an approximate sanity bound; when it clamps, positionCount == engineBatchSize and the
-      // whole buffer is valid used data anyway. A no-op whenever the product already fits.
-      int usedOutputElements = Math.Min(positionCount * outputElementsPerPosition, outputElementCount);
-      bool hasNaN = MathUtils.ContainsNaN(rawSpan.Slice(0, usedOutputElements));
-
-      // Convert only the small heads (value/MLH/uncertainty/etc.) to float. The large
-      // policy/policy2/action heads are NOT converted here: extraction reads only the
-      // handful of legal-move logits it needs directly from this Half buffer (and
-      // (float)Half is exact), so converting the full ~1858-wide policy per position is
-      // pure waste. Only the used positions (count, not engineBatchSize) are converted.
-      PerfConvertNonPolicyHeads(rawSpan, threadLocalOutputFloatBuffer.AsSpan(), positionCount, engineBatchSize);
+      // Convert every head except policy to float, for the used positions only. The policy head is
+      // not converted: extraction reads only the handful of legal-move logits it needs directly
+      // from this Half buffer ((float)Half is exact), so converting all ~1858 entries per position
+      // would be pure waste.
+      //
+      // The NaN check for those heads is performed inside the same walk (and substitutes 0), rather
+      // than as a separate dense pass over the whole raw buffer — see the method's remarks. The
+      // policy head is therefore no longer scanned; its own extraction NaN-guards each logit it
+      // reads (see ExtractSubBatchResults), so values stay sane either way.
+      bool hasNaN = PerfConvertNonPolicyHeads(rawSpan, threadLocalOutputFloatBuffer.AsSpan(), positionCount, engineBatchSize);
 
       if (hasNaN)
       {
-        // Identify which head(s) contain the NaN before we substitute zeros.
+        // Report which head(s) contain the NaN. Unlike the trigger above, this scan covers ALL
+        // heads (policy included), so the message still names policy when it is also affected.
         string nanHeads = IdentifyNaNHeads(rawSpan, positionCount, engineBatchSize);
 
-        // Substitute NaN with 0 in the converted float buffer so downstream
-        // consumers see sane values, then emit a rate-limited warning.
-        Span<float> usedFloats = threadLocalOutputFloatBuffer.AsSpan(0, usedOutputElements);
-        for (int i = 0; i < usedFloats.Length; i++)
-        {
-          if (float.IsNaN(usedFloats[i]))
-          {
-            usedFloats[i] = 0;
-          }
-        }
-
-        ReportNaNOccurrence(positionCount, usedOutputElements, nanHeads);
+        ReportNaNOccurrence(positionCount, outputElementCount, nanHeads);
       }
     }
 
