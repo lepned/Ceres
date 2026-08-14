@@ -129,7 +129,16 @@ public partial class MCGSBackup
         break;
 
       case MCGSPathTerminationReason.AlreadyNNEvaluated:
-        // Already evaluated and applied to node.
+        // Already evaluated; the node's own evaluation visit is installed by whichever path
+        // created it, never here. Deliberately NO BackupToNode, even when leafNode.N == 0:
+        // the node may have been created by a TranspositionCopyValues path IN THIS BATCH
+        // (values are copied during select, so it is evaluated with N == 0 while select is
+        // still running, and a later path reaching it through a different parent edge
+        // terminates here). That creator installs it from its own case above, and since
+        // this loop may run in parallel over paths a conditional install here would race it
+        // and could double-count, breaking the node.N == 1 + sum(childEdge.N) invariant
+        // asserted in MCGSStrategyPUCT.BackupToNode and GraphStore.Validate.
+        // Reading an uninstalled node's Q/D is handled in InitialBackupValueForPath below.
         Debug.Assert(leafNode.IsEvaluated);
         break;
 
@@ -233,8 +242,21 @@ public partial class MCGSBackup
 
       case MCGSPathTerminationReason.AlreadyNNEvaluated:
       case MCGSPathTerminationReason.PiggybackPendingNNEval:
-        Debug.Assert(!double.IsNaN(path.LeafNode.Q));
-        return new BackupValue(leafEdge.ChildNode.Q, path.LeafNode.D);
+        {
+          // Both reasons extract the value of a node which some OTHER path installs
+          // (see the AlreadyNNEvaluated case in ApplyLeafNodeUpdates above).
+          // If that installing path has not yet run its leaf update then the node is
+          // evaluated (WinP/LossP/DrawP are set) but its Q and D - which are written only by
+          // BackupToNode - are still at their as-allocated zero. 
+          GNode leafChildNode = leafEdge.ChildNode;
+          if (leafChildNode.N == 0)
+          {
+            return new BackupValue(leafChildNode.V, leafChildNode.DrawP);
+          }
+
+          Debug.Assert(!double.IsNaN(path.LeafNode.Q));
+          return new BackupValue(leafChildNode.Q, path.LeafNode.D);
+        }
 
       case MCGSPathTerminationReason.Terminal:
         Debug.Assert(path.LeafNode.IsEvaluated);
