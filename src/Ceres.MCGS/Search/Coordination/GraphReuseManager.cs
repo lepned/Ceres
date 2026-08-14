@@ -16,6 +16,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Threading;
 
 using Ceres.Base.Misc;
 using Ceres.Base.OperatingSystem;
@@ -95,6 +96,76 @@ public static class GraphReuseManager
 
   #endregion
 
+  #region Diagnostic counters
+
+  // Cumulative (process-wide) tallies of what happened to reusable graphs, so a long run can be
+  // summarized without parsing the per-decision log lines below. Every decision path increments
+  // exactly one counter. Purely diagnostic - nothing reads these to make decisions.
+
+  static long numReuse;
+  static long numExtract;
+  static long numAbandonPolicy;
+  static long numAbandonExtractFailed;
+  static long numAbandonStoreTooSmall;
+  static long numNotContinuable;
+
+  /// <summary>Graphs carried forward unchanged.</summary>
+  public static long NumReuse => Volatile.Read(ref numReuse);
+
+  /// <summary>Graphs replaced by a smaller extracted copy of the reachable subgraph.</summary>
+  public static long NumExtract => Volatile.Read(ref numExtract);
+
+  /// <summary>Graphs discarded by the memory/utilization policy (see DecideAction).</summary>
+  public static long NumAbandonPolicy => Volatile.Read(ref numAbandonPolicy);
+
+  /// <summary>Graphs discarded because a decided extraction did not complete.</summary>
+  public static long NumAbandonExtractFailed => Volatile.Read(ref numAbandonExtractFailed);
+
+  /// <summary>Graphs discarded because their stores were too small for the upcoming search.</summary>
+  public static long NumAbandonStoreTooSmall => Volatile.Read(ref numAbandonStoreTooSmall);
+
+  /// <summary>
+  /// Graphs dropped before any reuse decision because they did not continue the current position
+  /// (history mismatch, reuse disabled, or an unevaluated root) - not a policy abandonment.
+  /// </summary>
+  public static long NumNotContinuable => Volatile.Read(ref numNotContinuable);
+
+  /// <summary>Total graphs discarded, by any route.</summary>
+  public static long NumAbandonTotal => NumAbandonPolicy + NumAbandonExtractFailed + NumAbandonStoreTooSmall;
+
+
+  /// <summary>
+  /// Records a graph discarded by the caller (MCGSSearch) because its stores, fixed at creation,
+  /// are too small to accommodate the upcoming search.
+  /// </summary>
+  public static void RecordAbandonStoreTooSmall() => Interlocked.Increment(ref numAbandonStoreTooSmall);
+
+
+  /// <summary>
+  /// Resets all counters. Call at the start of a run if per-run rather than per-process figures
+  /// are wanted (they are never reset automatically).
+  /// </summary>
+  public static void ResetStats()
+  {
+    Volatile.Write(ref numReuse, 0);
+    Volatile.Write(ref numExtract, 0);
+    Volatile.Write(ref numAbandonPolicy, 0);
+    Volatile.Write(ref numAbandonExtractFailed, 0);
+    Volatile.Write(ref numAbandonStoreTooSmall, 0);
+    Volatile.Write(ref numNotContinuable, 0);
+  }
+
+
+  /// <summary>
+  /// Returns a one-line summary of the cumulative outcome counts.
+  /// </summary>
+  public static string StatsSummary()
+    => $"[reuse={NumReuse:N0} extract={NumExtract:N0} abandon={NumAbandonTotal:N0}"
+     + $"(policy={NumAbandonPolicy:N0},extractFailed={NumAbandonExtractFailed:N0},storeTooSmall={NumAbandonStoreTooSmall:N0})"
+     + $" notContinuable={NumNotContinuable:N0}]";
+
+  #endregion
+
   #region Graph Reuse Decision
 
   /// <summary>
@@ -120,6 +191,7 @@ public static class GraphReuseManager
     if (!paramsSearch.GraphReuseEnabled
      || !graphToPossiblyReuse.Store.PositionHistory.HasContinuationOf(priorMoves))
     {
+      Interlocked.Increment(ref numNotContinuable);
       graphToPossiblyReuse.Dispose();
       return null;
     }
@@ -129,6 +201,7 @@ public static class GraphReuseManager
     if (searchRootPathFromGraphRoot == null)
     {
       // History prefix mismatch (or path lookup failed); cannot reuse.
+      Interlocked.Increment(ref numNotContinuable);
       graphToPossiblyReuse.Dispose();
       return null;
     }
@@ -143,6 +216,7 @@ public static class GraphReuseManager
       GNode rootNode = graphToPossiblyReuse.GraphRootNode;
       if (!rootNode.IsEvaluated)
       {
+        Interlocked.Increment(ref numNotContinuable);
         graphToPossiblyReuse.Dispose();
         searchRootPathFromGraphRoot = null;
         return null;
@@ -162,6 +236,7 @@ public static class GraphReuseManager
     // Search root node must be evaluated
     if (!searchRootNodeInfo.ChildNode.IsEvaluated)
     {
+      Interlocked.Increment(ref numNotContinuable);
       graphToPossiblyReuse.Dispose();
       searchRootNodeInfo = default;
       searchRootPathFromGraphRoot = null;
@@ -203,10 +278,12 @@ public static class GraphReuseManager
 
     if (decision.Action == GraphReuseAction.Reuse)
     {
+      Interlocked.Increment(ref numReuse);
       MaybeLogReachabilityCheck("REUSE", decision, graph);
       return graph;
     }
 
+    bool extractionFellThrough = false;
     if (decision.Action == GraphReuseAction.Extract)
     {
       // Reuse the reachable set the decision already enumerated — single BFS, no re-enumeration.
@@ -214,7 +291,8 @@ public static class GraphReuseManager
         graph, searchRootNodeInfo.ChildNode.Index, priorMoves, decision.Reachable, decision.ReachabilityCheckSeconds);
       if (ex.Succeeded)
       {
-        LogExtraction(ex, searchRootNodeInfo.ChildNode.N, reason);
+        Interlocked.Increment(ref numExtract);
+        LogExtraction(ex, searchRootNodeInfo.ChildNode.N, reason, graph.Store.NodesStore.MaxNodes);
 
         // Switch over to the new (smaller) graph and dispose the old one. Returning a different
         // Graph object is contract-compatible with the caller (it installs whatever is returned);
@@ -225,10 +303,20 @@ public static class GraphReuseManager
       }
 
       // Extraction unexpectedly failed: fall through to abandonment rather than carry an over-budget graph.
+      extractionFellThrough = true;
       reason = "extraction did not complete; " + reason;
     }
 
     // Abandon (decided, or extraction fell through).
+    if (extractionFellThrough)
+    {
+      Interlocked.Increment(ref numAbandonExtractFailed);
+    }
+    else
+    {
+      Interlocked.Increment(ref numAbandonPolicy);
+    }
+
     LogAbandon(graph, searchRootNodeInfo, reason);
     MaybeLogReachabilityCheck("ABANDON", decision, graph);
     graph.Dispose();
@@ -351,7 +439,7 @@ public static class GraphReuseManager
     return new ReuseDecision(GraphReuseAction.Reuse, null, reachabilitySeconds, reachableNodes, reachable);
   }
 
-#endregion
+  #endregion
 
   #region Memory + Logging
 
@@ -383,11 +471,15 @@ public static class GraphReuseManager
   /// Logs (unconditionally, in yellow) a one-line summary of a graph EXTRACT decision and its stats.
   /// When GraphExtractor.LOG_EXTRACT_PHASE_TIMINGS is enabled, also logs a per-phase timing breakdown.
   /// </summary>
-  private static void LogExtraction(GraphExtractor.ExtractResult ex, int searchRootN, string reason)
+  /// <param name="storeMaxNodes">Node store capacity (unchanged by extraction), so the log shows
+  /// how much headroom the extraction actually recovered.</param>
+  private static void LogExtraction(GraphExtractor.ExtractResult ex, int searchRootN, string reason, int storeMaxNodes)
   {
     ConsoleUtils.WriteLineColored(ConsoleColor.Yellow,
       $"Graph EXTRACT: {reason}; searchRootN={searchRootN:N0}, "
-    + $"{ex.NodesBefore:N0} -> {ex.NodesAfter:N0} nodes ({ex.RetentionFraction:P1}), {ex.ElapsedSeconds * 1000:F0}ms");
+    + $"{ex.NodesBefore:N0} -> {ex.NodesAfter:N0} nodes ({ex.RetentionFraction:P1}), {ex.ElapsedSeconds * 1000:F0}ms, "
+    + $"store cap {storeMaxNodes:N0} ({FractionString(ex.NodesBefore, storeMaxNodes)} -> "
+    + $"{FractionString(ex.NodesAfter, storeMaxNodes)} full) {StatsSummary()}");
 
     if (GraphExtractor.LOG_EXTRACT_PHASE_TIMINGS)
     {
@@ -425,14 +517,25 @@ public static class GraphReuseManager
 
 
   /// <summary>
-  /// Logs (unconditionally, in yellow) a one-line explanation of a graph ABANDON decision.
+  /// Logs (unconditionally, in yellow) a one-line explanation of a graph ABANDON decision,
+  /// including node store occupancy (the dimension the memory-based reason does not show).
   /// </summary>
   private static void LogAbandon(Graph graph, GraphRootToSearchRootNodeInfo searchRootNodeInfo, string reason)
   {
+    GNodeStore nodesStore = graph.Store.NodesStore;
     ConsoleUtils.WriteLineColored(ConsoleColor.Yellow,
       $"Graph ABANDON: {reason} "
-    + $"(graphRootN={graph.GraphRootNode.N:N0}, searchRootN={searchRootNodeInfo.ChildNode.N:N0})");
+    + $"(graphRootN={graph.GraphRootNode.N:N0}, searchRootN={searchRootNodeInfo.ChildNode.N:N0}, "
+    + $"store {nodesStore.NumTotalNodes:N0}/{nodesStore.MaxNodes:N0} nodes "
+    + $"{FractionString(nodesStore.NumTotalNodes, nodesStore.MaxNodes)} full) {StatsSummary()}");
   }
+
+
+  /// <summary>
+  /// Formats numerator/denominator as a percentage (guarding against a zero denominator).
+  /// </summary>
+  private static string FractionString(long numerator, long denominator)
+    => denominator <= 0 ? "n/a" : ((double)numerator / denominator).ToString("P0");
 
   #endregion
 }

@@ -180,31 +180,32 @@ This isn't currently easy in the MCGS engine.
 As a workaround, EvaluatorSygyzy will just return as if no hit.
 
 #endif
-    SearchLimit searchLimitAdjusted = AdjustedSearchLimit(searchLimit, paramsSearch);
 
 #if NOT
 // Have to disable this to avoid overflows
 // The problem is probably that the sizing here doesn't account for the fact
 // that the graph can grow thru reuse very large.
+// (Superseded by the live store sizing below; the move overhead reserve that used to be
+//  computed here is now applied to the per-move limit, see AdjustedPerMoveSearchLimit.)
 
     int maxNodes;
-    if (!searchLimitAdjusted.SearchCanBeExpanded && searchLimitAdjusted.IsNodesLimit)
+    if (!searchLimit.SearchCanBeExpanded && searchLimit.IsNodesLimit)
     {
-      maxNodes = (int)(searchLimitAdjusted.Value + searchLimitAdjusted.ValueIncrement + 5000);
+      maxNodes = (int)(searchLimit.Value + searchLimit.ValueIncrement + 5000);
     }
     else
     {
       // In this mode, we are just reserving virtual address space
       // from a very large pool (e.g. 256TB for Windows).
       // Therefore it is safe to reserve a very large block.
-      if (searchLimitAdjusted.MaxTreeNodes != null)
+      if (searchLimit.MaxTreeNodes != null)
       {
         // Reseve somewhat more storage than the maximum requested tree nodes
         // if the search can be expenaded because during tree rewrite
-        // a preparatory step (MaterializeNodesWithNonRetainedTranspositionRoots) 
+        // a preparatory step (MaterializeNodesWithNonRetainedTranspositionRoots)
         // will initially make the store larger (before it is subsequently compacted).
-        double NODES_BUFFER_MULTIPLIER = searchLimitAdjusted.SearchCanBeExpanded ? 1.2 : 1.0;
-        long maxNodesLong = (long)(NODES_BUFFER_MULTIPLIER * searchLimitAdjusted.MaxTreeNodes.Value) + 100_000;
+        double NODES_BUFFER_MULTIPLIER = searchLimit.SearchCanBeExpanded ? 1.2 : 1.0;
+        long maxNodesLong = (long)(NODES_BUFFER_MULTIPLIER * searchLimit.MaxTreeNodes.Value) + 100_000;
         maxNodes = (int)Math.Min(maxNodesLong, int.MaxValue - 100_000);
       }
       else
@@ -250,6 +251,13 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
       searchLimitToUse = gameLimitsOutputs.LimitTarget;
     }
 
+    // Hold back the configured move overhead (UCI MoveOverheadMs) from the time actually searched.
+    // Applied here, to the PER-MOVE limit, rather than to the incoming limit: the reserve compensates
+    // for fixed per-move latency (move emission, GUI/network lag), so subtracting it from a per-game
+    // clock before the allocation above would spread it across all remaining moves and reserve
+    // essentially nothing for any one of them.
+    searchLimitToUse = AdjustedPerMoveSearchLimit(searchLimitToUse, paramsSearch);
+
 
     List<MGMove> searchMovesTablebaseRestricted = null;
     if (searchLimit.SearchMoves != null)
@@ -277,6 +285,41 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
 
     // Process graph rewrite if needed (handles memory pressure, low ratio triggers)
     Graph graphToUse = GraphReuseManager.PrepareGraphToUse(graphToReuse, searchRootNodeInfo, ref searchRootPathFromGraphRoot, paramsSearch, searchLimitToUse, priorMoves);
+
+    // The graph stores were sized (and fixed) when the graph was created, based on the search limit
+    // in effect at that time, and cannot subsequently grow. Therefore if this search is much larger
+    // than the graph can accommodate (e.g. an interactive session issuing "go nodes 1" and then
+    // "go nodes 100000") the stores would overflow partway through the search. In this situation
+    // abandon the graph so a new one, sized for this search, is created below.
+    // Note that the test is against actual remaining capacity (not the much larger allocation
+    // GraphStoreSizeNodes would choose for a new graph, which anticipates reuse over many moves),
+    // so an increase in search limit does not needlessly discard a graph which is still large enough.
+    if (graphToUse != null)
+    {
+      int nodesInGraph = graphToUse.Store.NodesStore.NumTotalNodes;
+      int estNodesThisSearch = searchLimitToUse.EstNumSearchNodes(nodesInGraph, 1 + (int)Manager.NNEvaluator0.EstNPSBatch);
+
+      // The estimate above is explicitly not a hard upper bound, so require considerable headroom.
+      const float SAFETY_MARGIN = 2.0f;
+      long nodesNeeded = nodesInGraph + (long)(SAFETY_MARGIN * estNodesThisSearch) + 10_000;
+
+      if (graphToUse.Store.MaxNodes < nodesNeeded)
+      {
+        GraphReuseManager.RecordAbandonStoreTooSmall();
+
+        if (MCGSParamsFixed.GRAPH_REWRITE_DUMP_REUSE_DIAGNOSTICS)
+        {
+          ConsoleUtils.WriteLineColored(ConsoleColor.Yellow,
+            $"Graph ABANDON: stores sized for {graphToUse.Store.MaxNodes:N0} nodes (currently {nodesInGraph:N0} used, "
+          + $"{graphToUse.Store.FractionInUse:P0} full) are too small for search limit {searchLimitToUse} "
+          + $"(needs about {nodesNeeded:N0}) {GraphReuseManager.StatsSummary()}");
+        }
+
+        graphToUse.Dispose();
+        graphToUse = null;
+        searchRootPathFromGraphRoot = null;
+      }
+    }
 
     // If a reusable graph was abandoned, the search will run from a fresh (empty) graph.
     // The allocation above used the (now-discarded) reuse candidate's root N, which with QuickMoves
@@ -308,51 +351,14 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
         + $"(was sized for warm root N={gameLimitsInputs.RootN:N0}).");
       }
 
-      searchLimitToUse = coldOutputs.LimitTarget;
+      searchLimitToUse = AdjustedPerMoveSearchLimit(coldOutputs.LimitTarget, paramsSearch);
       Manager.OverrideSearchLimit(searchLimitToUse, coldInputs, coldOutputs);
     }
 
     // Create new graph if needed (either no prior graph, or prior graph was abandoned)
     if (graphToUse == null)
     {
-      const long MAX_NODES = 1_100_000_000L;
-
-      // Attempt to find some safe (hopefully lower value)
-      // to use for max nodes than MAX_NODES to reduce virtual memory reservation length.
-      // Note that if GraphReuseRewriteEnabled then we can be more aggressive in allowing more nodes
-      // because we will rewrite the graph to reduce if approaches the limit.
-      // TODO: possibly unify this with code already in SearchLimit
-      long MAX_MOVES_PER_GRAPH = paramsSearch.GraphReuseEnabled ? (paramsSearch.GraphReuseRewriteEnabled ? 150L : 400L) : 5L;
-      const long MAX_NODES_PER_SECOND = 500_000L;
-      long maxNodes = searchLimit.Type switch
-      {
-        SearchLimitType.BestValueMove => 1,
-        SearchLimitType.BestActionMove => 1,
-
-        SearchLimitType.NodesPerMove => (long)(MAX_MOVES_PER_GRAPH * (float)(searchLimit.Value + searchLimit.ValueIncrement)),
-        SearchLimitType.NodesForAllMoves => (long)(searchLimit.Value + searchLimit.ValueIncrement * MAX_MOVES_PER_GRAPH),
-
-        SearchLimitType.SecondsPerMove => (long)((searchLimit.Value + searchLimit.ValueIncrement) * MAX_NODES_PER_SECOND * MAX_MOVES_PER_GRAPH),
-        SearchLimitType.SecondsForAllMoves => (long)((searchLimit.Value + (searchLimit.ValueIncrement * MAX_MOVES_PER_GRAPH)) * MAX_NODES_PER_SECOND),
-        _ => MAX_NODES
-      };
-
-      maxNodes = Math.Min(MAX_NODES, maxNodes);
-
-      // Possibly apply tighter constraint based on fixedSearchLimit
-      if (fixedSearchLimit != null && fixedSearchLimit.IsNodesLimit)
-      {
-        long fixedMax = MAX_MOVES_PER_GRAPH * (long)(fixedSearchLimit.Value + fixedSearchLimit.ValueIncrement);
-        maxNodes = Math.Min(maxNodes, fixedMax);
-      }
-
-      // Possibly apply constraint based on max memory
-      long maxBytes = paramsSearch.MaxMemoryBytes;
-      const long MIN_BYTES_PER_NODE = 200; // average probably more typically 400 considering all associated data structures
-      long maxNodesAllowedInMemory = maxBytes / MIN_BYTES_PER_NODE;
-      maxNodes = Math.Min(maxNodes, maxNodesAllowedInMemory);
-
-      int maxNodesInt = (int)Math.Min(maxNodes + 1000, MAX_NODES);
+      int maxNodesInt = GraphStoreSizeNodes(searchLimit, fixedSearchLimit, paramsSearch);
 
       bool hasAction = Manager.NNEvaluator0.HasAction;
 
@@ -376,7 +382,7 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
       // Right-size the transposition dictionaries to the realistic expected number of distinct
       // positions for this search budget, instead of the worst-case node-buffer reservation (maxNodes).
       int dictionarySizeHint = EstimateInitialDictionaryCapacity(searchLimitToUse, Manager.ParamsSearch, 1 + (int)Manager.NNEvaluator0.EstNPSBatch);
-//      ConsoleUtils.WriteLineColored(ConsoleColor.Red, $"dict= {(float)dictionarySizeHint/1_000_000}  graph={maxNodesInt/1_000_000.0}");
+      //      ConsoleUtils.WriteLineColored(ConsoleColor.Red, $"dict= {(float)dictionarySizeHint/1_000_000}  graph={maxNodesInt/1_000_000.0}");
 
       graphToUse = new(maxNodesInt, hasAction,
                        Manager.ParamsSearch.EnableState,
@@ -406,6 +412,57 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
     (MGMove bestMove, BestMoveInfoMCGS moveInfo) = DoSearch(Manager, verbose, progressCallback,
                                                             moveImmediateIfOnlyOneMove, forcedMove);
     BestMove = bestMove;
+  }
+
+
+  /// <summary>
+  /// Returns the number of nodes for which the stores of a new graph should be sized
+  /// to accommodate a search with the specified limit (allowing also for the graph
+  /// possibly being reused over many subsequent moves).
+  /// </summary>
+  /// <param name="searchLimit">Search limit for which the graph is being sized.</param>
+  /// <param name="fixedSearchLimit">Optionally a fixed (per-move) limit known to apply to all moves.</param>
+  /// <param name="paramsSearch">Search parameters (used to read graph reuse and memory settings).</param>
+  internal static int GraphStoreSizeNodes(SearchLimit searchLimit, SearchLimit fixedSearchLimit, ParamsSearch paramsSearch)
+  {
+    const long MAX_NODES = 1_100_000_000L;
+
+    // Attempt to find some safe (hopefully lower value)
+    // to use for max nodes than MAX_NODES to reduce virtual memory reservation length.
+    // Note that if GraphReuseRewriteEnabled then we can be more aggressive in allowing more nodes
+    // because we will rewrite the graph to reduce if approaches the limit.
+    // TODO: possibly unify this with code already in SearchLimit
+    long MAX_MOVES_PER_GRAPH = paramsSearch.GraphReuseEnabled ? (paramsSearch.GraphReuseRewriteEnabled ? 150L : 400L) : 5L;
+    const long MAX_NODES_PER_SECOND = 500_000L;
+    long maxNodes = searchLimit.Type switch
+    {
+      SearchLimitType.BestValueMove => 1,
+      SearchLimitType.BestActionMove => 1,
+
+      SearchLimitType.NodesPerMove => (long)(MAX_MOVES_PER_GRAPH * (float)(searchLimit.Value + searchLimit.ValueIncrement)),
+      SearchLimitType.NodesForAllMoves => (long)(searchLimit.Value + searchLimit.ValueIncrement * MAX_MOVES_PER_GRAPH),
+
+      SearchLimitType.SecondsPerMove => (long)((searchLimit.Value + searchLimit.ValueIncrement) * MAX_NODES_PER_SECOND * MAX_MOVES_PER_GRAPH),
+      SearchLimitType.SecondsForAllMoves => (long)((searchLimit.Value + (searchLimit.ValueIncrement * MAX_MOVES_PER_GRAPH)) * MAX_NODES_PER_SECOND),
+      _ => MAX_NODES
+    };
+
+    maxNodes = Math.Min(MAX_NODES, maxNodes);
+
+    // Possibly apply tighter constraint based on fixedSearchLimit
+    if (fixedSearchLimit != null && fixedSearchLimit.IsNodesLimit)
+    {
+      long fixedMax = MAX_MOVES_PER_GRAPH * (long)(fixedSearchLimit.Value + fixedSearchLimit.ValueIncrement);
+      maxNodes = Math.Min(maxNodes, fixedMax);
+    }
+
+    // Possibly apply constraint based on max memory
+    long maxBytes = paramsSearch.MaxMemoryBytes;
+    const long MIN_BYTES_PER_NODE = 200; // average probably more typically 400 considering all associated data structures
+    long maxNodesAllowedInMemory = maxBytes / MIN_BYTES_PER_NODE;
+    maxNodes = Math.Min(maxNodes, maxNodesAllowedInMemory);
+
+    return (int)Math.Min(maxNodes + 1000, MAX_NODES);
   }
 
 
@@ -445,42 +502,40 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
 
 
   /// <summary>
-  /// Returns new SearchLimit, possibly adjusted for time overhead and max graph nodes.
+  /// Returns the specified per-move search limit adjusted for actual execution:
+  ///
+  ///   - the configured move overhead (ParamsSearch.MoveOverheadSeconds, settable via the UCI
+  ///     MoveOverheadMs option) is held back from a time limit, so that the time spent emitting
+  ///     the move and any GUI/network latency do not push the move past its allotted time.
+  ///     The reserve is capped at half of the allotted time so that a short search (e.g. a
+  ///     "go movetime 100" analysis probe, where the overhead exceeds the whole budget) is
+  ///     shortened proportionally rather than collapsed to nothing.
+  ///
+  ///   - any MaxTreeNodes configured in Ceres.json is installed if the limit does not already
+  ///     carry an explicit value (the UCI layer applies this setting itself; this covers the
+  ///     in-process entry points, such as tournaments and test suites, which do not).
+  ///     Note that the store's own capacity is enforced independently of this setting
+  ///     (see MCGSManager.CalcSearchStopStatus).
   /// </summary>
-  /// <param name="limit"></param>
+  /// <param name="limit">The per-move limit about to be searched.</param>
   /// <param name="paramsSearch"></param>
   /// <returns></returns>
-  SearchLimit AdjustedSearchLimit(SearchLimit limit, ParamsSearch paramsSearch)
+  static SearchLimit AdjustedPerMoveSearchLimit(SearchLimit limit, ParamsSearch paramsSearch)
   {
-    // Determine maximum number of tree nodes to allow store to grow to.
-    int? maxTreeNodes;
-    if (limit.MaxTreeNodes is not null)
+    if (limit.MaxTreeNodes is null && CeresUserSettingsManager.Settings.MaxTreeNodes is not null)
     {
-      // Use explicit value specified.
-      maxTreeNodes = limit.MaxTreeNodes;
-    }
-    else if (CeresUserSettingsManager.Settings.MaxTreeNodes is not null)
-    {
-      // Use value explicitly set in Ceres.json.
-      maxTreeNodes = CeresUserSettingsManager.Settings.MaxTreeNodes;
-    }
-    else
-    {
-      // Use default value based on amount of physical memory.
-      maxTreeNodes = GraphStore.MAX_NODES - 2500;
+      limit = limit with { MaxTreeNodes = CeresUserSettingsManager.Settings.MaxTreeNodes };
     }
 
-    if (limit.IsTimeLimit)
+    if (!limit.IsTimeLimit || paramsSearch.MoveOverheadSeconds <= 0 || limit.Value <= 0)
     {
-      return limit with
-      {
-        MaxTreeNodes = maxTreeNodes,
-        Value = Math.Max(0.01f, limit.Value - paramsSearch.MoveOverheadSeconds)
-      };
+      return limit;
     }
-    else
-    {
-      return limit with { MaxTreeNodes = maxTreeNodes };
-    }
+
+    const float MIN_SEARCH_SECONDS = 0.01f;
+    const float MAX_FRACTION_RESERVED = 0.5f;
+
+    float overhead = Math.Min(paramsSearch.MoveOverheadSeconds, MAX_FRACTION_RESERVED * limit.Value);
+    return limit with { Value = Math.Max(MIN_SEARCH_SECONDS, limit.Value - overhead) };
   }
 }

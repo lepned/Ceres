@@ -17,6 +17,7 @@ using System;
 using System.Diagnostics;
 
 using Ceres.Base.Math;
+using Ceres.Base.Misc;
 using Ceres.Chess;
 using Ceres.Chess.MoveGen;
 using Ceres.MCGS.Graphs.GEdges;
@@ -49,7 +50,7 @@ public partial class MCGSManager : IDisposable
       float remainingTime = SearchLimit.Value - elapsedTime;
 
       // TODO: tune these based on hardware and network (EstimatedNPS)
-      return  remainingTime switch
+      return remainingTime switch
       {
         < 0.05f => 96,
         < 0.10f => 192,
@@ -98,6 +99,13 @@ public partial class MCGSManager : IDisposable
       return remainingTime;
     }
   }
+
+
+  /// <summary>
+  /// Set once the node-store-capacity stop has been logged for this search
+  /// (the stop condition is re-evaluated every batch, but is worth only one line).
+  /// </summary>
+  private bool haveLoggedNodeCapStop;
 
 
   /// <summary>
@@ -171,10 +179,32 @@ public partial class MCGSManager : IDisposable
       return SearchStopStatus.MaxGraphVisitsExceeded;
     }
 
-    if (SearchLimit.MaxTreeNodes != null
-     && Engine.SearchRootNode.Graph.Store.NodesStore.NumTotalNodes >= (SearchLimit.MaxTreeNodes - 2048)
+    // Stop before the node store fills. The ceiling is the smaller of any explicitly requested
+    // MaxTreeNodes and the store's own hard reservation: allocating past the latter throws from the
+    // incremental memory manager ("Allocation overflow"), so without this clamp a search which is
+    // never given a MaxTreeNodes (the usual case - it defaults to null) has no graceful stop at all.
+    GNodeStore nodesStore = Engine.SearchRootNode.Graph.Store.NodesStore;
+    long maxNodesAllowed = Math.Min(SearchLimit.MaxTreeNodes ?? int.MaxValue, nodesStore.MaxNodes);
+
+    // Leave room for the batches already in flight, and never let the margin swallow a store
+    // so small that the search could not proceed at all.
+    long stopMargin = Math.Min(Math.Max(2048, 2 * ParamsSearch.Execution.MaxBatchSize), maxNodesAllowed / 8);
+
+    if (nodesStore.NumTotalNodes >= maxNodesAllowed - stopMargin
      && NumNodesVisitedThisSearch > 0) // always allow a little search to insure state fully initialized
     {
+      if (!haveLoggedNodeCapStop)
+      {
+        // Reaching here means the search is being cut short by store capacity rather than by its
+        // own limit, which would otherwise be silent (StopStatus is only surfaced in dump-info).
+        // Logged once per search so a run can be scanned for how often this backstop engages.
+        haveLoggedNodeCapStop = true;
+        ConsoleUtils.WriteLineColored(ConsoleColor.Yellow,
+          $"Search STOP on node store capacity: {nodesStore.NumTotalNodes:N0} of {nodesStore.MaxNodes:N0} nodes used "
+        + $"(ceiling {maxNodesAllowed:N0}, margin {stopMargin:N0}), searchRootN={Engine.SearchRootNode.N:N0}, "
+        + $"limit {SearchLimit}");
+      }
+
       return SearchStopStatus.MaxGraphAllocatedNodesExceeded;
     }
 
@@ -262,7 +292,7 @@ public partial class MCGSManager : IDisposable
   /// </summary>
   public void UpdateTopNodeInfo()
   {
-    Debug.Assert(Engine.SearchRootNode.NodeRef.LockRef.IsLocked); 
+    Debug.Assert(Engine.SearchRootNode.NodeRef.LockRef.IsLocked);
 
     if (Engine.SearchRootNode.N > 1 && Engine.SearchRootNode.NumEdgesExpanded > 0)
     {

@@ -62,8 +62,8 @@ public partial class MCGSManager
     MaxGraphVisitsExceeded,
 
     /// <summary>
-    /// The MaxTreeNodes field in the SearchLimit was set
-    /// and the store backing the search graph has reached that limit.
+    /// The store backing the search graph has reached its capacity: either the MaxTreeNodes
+    /// field in the SearchLimit (if set), or the store's own allocated node reservation.
     /// </summary>
     MaxGraphAllocatedNodesExceeded,
 
