@@ -14,15 +14,9 @@
 #region Using directives
 
 using System;
-using System.Buffers;
+using System.Numerics.Tensors;
 using System.Runtime.InteropServices;
-using System.Runtime.Intrinsics;
-using System.Runtime.Intrinsics.X86;
-using System.Threading.Tasks;
 using Ceres.Chess.LC0.Batches;
-using Ceres.Chess.NNEvaluators;
-//using CeresTrain.NNEvaluators;
-using Ceres.Chess.NNEvaluators.Ceres.TPG;
 
 #endregion 
 
@@ -110,139 +104,59 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
 
 
     /// <summary>
-    /// Copies sourceBytes into targetFloats, also dividing by divisor.
+    /// Number of elements converted per tile by CopyAndDivideSIMD.
+    ///
+    /// The float intermediate is 4x the size of the byte source, so converting a whole batch in one
+    /// pass would push tens of megabytes through memory three times (widen, scale, narrow). Working
+    /// in tiles keeps the intermediate resident in L1/L2 so only the source and destination touch
+    /// memory. Measured on x64 (AVX-512 capable) over 0.5 - 9 MB inputs, a 4096-element tile was
+    /// consistently the fastest of 4096 / 8192 / 16384 / 32768 / 65536 and was ~1.5x faster than the
+    /// former hand-written AVX2 implementation; the untiled form was ~4x SLOWER than that AVX2 code.
+    /// </summary>
+    const int COPY_AND_DIVIDE_TILE = 4096;
+
+    /// <summary>
+    /// Scratch buffer holding one tile of widened float values (see CopyAndDivideSIMD).
+    /// Thread static because conversion runs concurrently on multiple GPU worker threads.
+    /// </summary>
+    [ThreadStatic]
+    static float[] copyAndDivideScratch;
+
+
+    /// <summary>
+    /// Copies sourceBytes into targetHalfs, also dividing by divisor.
+    ///
+    /// Implemented with TensorPrimitives so that it vectorizes on every architecture (in particular
+    /// the narrowing to Half lowers to native FCVTN on ARM64, which has no F16C equivalent).
+    /// This replaced a hand-written AVX2 implementation which it outperformed on x64.
     /// </summary>
     /// <param name="sourceBytes"></param>
     /// <param name="targetHalfs"></param>
-    internal static unsafe void CopyAndDivideSIMD(Memory<byte> sourceBytes, Memory<Half> targetHalfs, float divisor)
+    /// <param name="divisor"></param>
+    internal static void CopyAndDivideSIMD(Memory<byte> sourceBytes, Memory<Half> targetHalfs, float divisor)
     {
-      int vectorSize = Vector256<byte>.Count;
-      int i = 0;
+      ReadOnlySpan<byte> source = sourceBytes.Span;
+      Span<Half> target = targetHalfs.Span;
 
-      if (Avx2.IsSupported)
+      if (target.Length < source.Length)
       {
-        Vector256<float> divisorVec = Vector256.Create(divisor);
-        using MemoryHandle sourceHandle = sourceBytes.Pin();
-        using MemoryHandle targetHandle = targetHalfs.Pin();
-
-        byte* squareBytesAllPtr = (byte*)sourceHandle.Pointer;
-        ushort* targetFlatValuesPrimaryPtr = (ushort*)targetHandle.Pointer;
-
-        // Process in chunks of 32 bytes
-        for (i = 0; i <= sourceBytes.Length - vectorSize; i += vectorSize)
-        {
-          // Load 32 bytes from the byte array
-          Vector256<byte> byteVec = Avx.LoadVector256(&squareBytesAllPtr[i]);
-
-          // Convert the 32 bytes to 32 floats
-          Vector256<short> ushortLow = Avx2.ConvertToVector256Int16(byteVec.GetLower());
-          Vector256<float> floatLowLow = Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(ushortLow.GetLower()));
-          Vector256<float> floatLowHigh = Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(ushortLow.GetUpper()));
-          Vector256<uint> r1 = SingleToHalfAsWidenedUInt32_Vector256(floatLowLow, divisorVec);
-          Vector256<uint> r2 = SingleToHalfAsWidenedUInt32_Vector256(floatLowHigh, divisorVec);
-          Vector256<ushort> source2 = Vector256.Narrow(r1, r2);
-          Avx.Store(&targetFlatValuesPrimaryPtr[i], source2);
-
-          Vector256<short> ushortHigh = Avx2.ConvertToVector256Int16(byteVec.GetUpper());
-          Vector256<float> floatHighLow = Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(ushortHigh.GetLower()));
-          Vector256<float> floatHighHigh = Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(ushortHigh.GetUpper()));
-          Vector256<uint> r1H = SingleToHalfAsWidenedUInt32_Vector256(floatHighLow, divisorVec);
-          Vector256<uint> r2H = SingleToHalfAsWidenedUInt32_Vector256(floatHighHigh, divisorVec);
-          Vector256<ushort> source2H = Vector256.Narrow(r1H, r2H);
-
-          // Store the results
-          Avx.Store(&targetFlatValuesPrimaryPtr[i + 16], source2H);
-        }
-      }
-#if NOT
-      else if (AdvSimd.IsSupported)
-      {
-        throw new NotImplementedException("this code is not yet tested");
-
-        Vector128<float> divisorVec = Vector128.Create(divisor);
-        Vector128<float> reciprocalDivisorVec = AdvSimd.ReciprocalEstimate(divisorVec);
-        fixed (byte* sourceBytesPtr = sourceBytes)
-        fixed (Half* targetFloatsPtr = targetFloats)
-        {
-          for (i = 0; i <= sourceBytes.Length - vectorSize; i += vectorSize)
-          {
-            // Load 16 bytes from the byte array
-            Vector128<byte> byteVec = AdvSimd.LoadVector128(&sourceBytesPtr[i]);
-
-            // Split the vector into two 64-bit parts
-            Vector64<byte> byteVecLower = byteVec.GetLower();
-            Vector64<byte> byteVecUpper = byteVec.GetUpper();
-
-            // Zero extend the lower and upper parts
-            Vector128<ushort> ushortVecLower = AdvSimd.ZeroExtendWideningLower(byteVecLower);
-            Vector128<ushort> ushortVecUpper = AdvSimd.ZeroExtendWideningLower(byteVecUpper);
-
-            // Zero extend the widened vectors to 32-bit integers
-            Vector128<uint> uintVecLower1 = AdvSimd.ZeroExtendWideningLower(ushortVecLower.GetLower());
-            Vector128<uint> uintVecLower2 = AdvSimd.ZeroExtendWideningUpper(ushortVecLower);
-            Vector128<uint> uintVecUpper1 = AdvSimd.ZeroExtendWideningLower(ushortVecUpper.GetLower());
-            Vector128<uint> uintVecUpper2 = AdvSimd.ZeroExtendWideningUpper(ushortVecUpper);
-
-            // Convert the 32-bit integers to single-precision floats
-            Vector128<float> floatVecLower1 = AdvSimd.ConvertToSingle(uintVecLower1);
-            Vector128<float> floatVecLower2 = AdvSimd.ConvertToSingle(uintVecLower2);
-            Vector128<float> floatVecUpper1 = AdvSimd.ConvertToSingle(uintVecUpper1);
-            Vector128<float> floatVecUpper2 = AdvSimd.ConvertToSingle(uintVecUpper2);
-
-            // Divide by the divisor using reciprocal approximation
-            Vector128<float> resultVecLower1 = AdvSimd.Multiply(floatVecLower1, reciprocalDivisorVec);
-            Vector128<float> resultVecLower2 = AdvSimd.Multiply(floatVecLower2, reciprocalDivisorVec);
-            Vector128<float> resultVecUpper1 = AdvSimd.Multiply(floatVecUpper1, reciprocalDivisorVec);
-            Vector128<float> resultVecUpper2 = AdvSimd.Multiply(floatVecUpper2, reciprocalDivisorVec);
-
-            // Store the results
-            AdvSimd.Store(&targetFloatsPtr[i], resultVecLower1);
-            AdvSimd.Store(&targetFloatsPtr[i + 4], resultVecLower2);
-            AdvSimd.Store(&targetFloatsPtr[i + 8], resultVecUpper1);
-            AdvSimd.Store(&targetFloatsPtr[i + 12], resultVecUpper2);
-          }
-        }
-      }
-#endif
-      // Process remaining elements (15x slower than vectorized).
-      Span<byte> sourceSpan = sourceBytes.Span;
-      Span<Half> targetSpan = targetHalfs.Span;
-      for (; i < sourceBytes.Length; i++)
-      {
-        targetSpan[i] = (Half)(sourceSpan[i] / divisor);
+        throw new ArgumentException($"Target length {target.Length} is less than source length {source.Length}");
       }
 
-    }
+      // Scale by the reciprocal rather than dividing: measured ~25% faster.
+      float reciprocal = 1.0f / divisor;
 
-    /// <summary>
-    /// Converts a float (after a division by a constant) to a half-precision float using vectorized instructions.
-    /// 
-    /// Code heavily based on .NET runtime (System.Numerics.Tensors.TensorPrimitives)
-    /// </summary>
-    /// <param name="value"></param>
-    /// <param name="divisorVec"></param>
-    /// <returns></returns>
-    static Vector256<uint> SingleToHalfAsWidenedUInt32_Vector256(Vector256<float> value, Vector256<float> divisorVec)
-    {
-      value = Avx.Divide(value, divisorVec);
-      Vector256<uint> vector8 = value.AsUInt32();
-      Vector256<uint> vector9 = Vector256.ShiftRightLogical(vector8 & Vector256.Create(2147483648u), 16);
-      Vector256<uint> vector10 = Vector256.Equals(value, value).AsUInt32();
-      value = Vector256.Abs(value);
-      value = Vector256.Min(Vector256.Create(65520f), value);
-      Vector256<uint> vector11 = Vector256.Max(value, Vector256.Create(947912704u).AsSingle()).AsUInt32();
-      vector11 &= Vector256.Create(2139095040u);
-      vector11 += Vector256.Create(109051904u);
-      value += vector11.AsSingle();
-      vector8 = value.AsUInt32();
-      Vector256<uint> vector12 = ~vector10 & Vector256.Create(31744u);
-      vector8 -= Vector256.Create(1056964608u);
-      Vector256<uint> vector13 = Vector256.ShiftRightLogical(vector8, 13);
-      vector8 &= vector10;
-      vector8 += vector13;
-      vector8 &= ~vector12;
-      Vector256<uint> vector14 = vector12 | vector9;
-      return vector8 | vector14;
+      float[] scratch = copyAndDivideScratch ??= new float[COPY_AND_DIVIDE_TILE];
+
+      for (int offset = 0; offset < source.Length; offset += COPY_AND_DIVIDE_TILE)
+      {
+        int count = Math.Min(COPY_AND_DIVIDE_TILE, source.Length - offset);
+        Span<float> tile = scratch.AsSpan(0, count);
+
+        TensorPrimitives.ConvertChecked<byte, float>(source.Slice(offset, count), tile);
+        TensorPrimitives.Multiply(tile, reciprocal, tile);
+        TensorPrimitives.ConvertToHalf(tile, target.Slice(offset, count));
+      }
     }
 
 
@@ -296,77 +210,6 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
         CopyAndDivide(new Memory<byte>(squareValuesByteTemporary, 0, numConvertedElements),
                       squareValues, TPGSquareRecord.SQUARE_BYTES_DIVISOR);
       }
-
-
     }
-
-
-#if BUGGY
-    /// <summary>
-    /// Converts a batch of encoded positions into TPG combo format values (floats)
-    /// ready to then be sent into neural network.
-    /// </summary>
-    /// <param name="batch"></param>
-    /// <param name="flatValues"></param>
-    static void ConvertToFlatTPG(IEncodedPositionBatchFlat batch, float[] flatValues)
-    {
-      Parallel.For(0, batch.NumPos, i =>
-      {
-        int offset = i * TPGRecordCombo.BYTES_PER_MOVE_AND_SQUARE_RECORD;
-
-        Position pos = batch.Positions[i].ToPosition;
-
-        TPGRecordCombo tpgRecordCombo = default;
-        TPGRecordConverter.ConvertToTPGCombo(in pos, false, default, ref tpgRecordCombo);
-
-        float[] rawData = tpgRecordCombo.RawBoardInputs;
-        for (int j = 0; j < rawData.Length; j++)
-        {
-          flatValues[offset + j] = rawData[j];
-        }
-      });
-
-    }
-#endif
-
   }
 }
-
-
-#if NOT
-          //          if (bestMoveNNEncoded.Move.IndexNeuralNet == 97 || bestMoveNNEncoded.Move.IndexNeuralNet == 103)
-          if (pos.MiscInfo.EnPassantFileIndex != PositionMiscInfo.EnPassantFileIndexEnum.FileNone)
-          {
-            Console.WriteLine("................................ " + bestMoveTraining + " " + bestMoveNN);
-          }
-
-          //          Console.WriteLine("\r\n" + pos.FEN + "  " + bestMoveTraining + " " + bestMoveNN.Move);
-          //          Console.WriteLine(evalResult.Policy);
-
-          int promotionCount = 0;
-          int epCount = 0;
-          for (int ix = 0; ix < 64; ix++)
-          {
-            if (rawPosBuffer[i].SquaresAndMoves[ix].MoveRecord.PromotionBytes[0] > 0
-             || rawPosBuffer[i].SquaresAndMoves[ix].MoveRecord.PromotionBytes[1] > 0)
-              promotionCount++;
-            if (rawPosBuffer[i].SquaresAndMoves[ix].SquareRecord.IsEnPassant > 0)
-            {
-              epCount++;
-            }
-          }
-
-          if (promotionCount > 0)
-          {
-            Console.WriteLine(i + " found promotion " + pos.FEN);
-          }
-          if (epCount > 0)
-          {
-            Console.WriteLine(i + " found en passant " + pos.FEN);
-          }
-}
-#endif
-
-
-
-
