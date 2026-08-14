@@ -577,6 +577,16 @@ public static class BatchScheduler
       k = Math.Max(0, k - engineSizes[e]);
     }
 
+    // Emit the chosen multiset in descending size order. The DP above prices the plan as a
+    // sequence, but the executor runs sub-batches concurrently in pairs across compute streams,
+    // where a pair costs about max(tA, tB): pairing adjacent entries of a descending sequence
+    // minimizes the sum of pair maxima, whereas the backtrack order does not (e.g. a plan
+    // [1024, 16, 1024] pairs (1024, 16) then (1024) for ~2 x t1024, versus (1024, 1024) then
+    // (16) for ~t1024 + t16 once sorted). Ordering does not change the multiset, the total
+    // padding, or the sequential cost, so this is free for the non-concurrent case too.
+    Array.Sort(result);
+    Array.Reverse(result);
+
     if (VERBOSE_DETAILS)
     {
       float time = cost[N] + overlapCredit;

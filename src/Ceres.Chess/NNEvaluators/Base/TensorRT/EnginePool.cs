@@ -58,6 +58,15 @@ public sealed class EnginePool : IDisposable
   /// </summary>
   public static bool OPTIMIZED_SCHEDULING = true;
 
+  /// <summary>
+  /// If true, multi-sub-batch processing refills each compute stream as soon as its previous
+  /// sub-batch has been handled, instead of processing sub-batches in lockstep groups of
+  /// NUM_COMPUTE_STREAMS (which leaves the GPU idle while the group's handlers run on the
+  /// dispatch thread). Applies only when no sub-batch uses dynamic inference.
+  /// Set false to restore the lockstep schedule (see ProcessSubBatchesPipelined).
+  /// </summary>
+  public static bool ROLLING_SUBBATCH_PIPELINE = true;
+
 
   private readonly TensorRT trt;
   private readonly bool ownsTrt;
@@ -901,7 +910,6 @@ public sealed class EnginePool : IDisposable
 
   /// <summary>
   /// Unified pipelined sub-batch processing for both byte and Half inputs.
-  /// Processes sub-batches in groups of NUM_COMPUTE_STREAMS with per-stream pipelining:
   ///
   /// Each stream issues the complete H2D -> Compute -> D2H sequence asynchronously,
   /// enabling true concurrent compute across streams (separate TRT execution contexts)
@@ -911,8 +919,12 @@ public sealed class EnginePool : IDisposable
   ///   Stream B: [H2D(1)] [Compute(1)] [D2H(1)]
   ///                       ^concurrent^  ^overlap^
   ///
+  /// Sub-batches beyond the first NUM_COMPUTE_STREAMS are issued either as each stream frees up
+  /// (rolling schedule, keeping the GPU busy across handler execution) or in lockstep groups,
+  /// per ROLLING_SUBBATCH_PIPELINE; see the comments at the multi-batch loop below.
+  ///
   /// For dynamic inference (no CUDA graphs), compute is serialized across streams
-  /// since both streams share a single TRT execution context.
+  /// since both streams share a single TRT execution context (lockstep schedule only).
   /// </summary>
   private unsafe void ProcessSubBatchesPipelined<TInput>(TInput[] input, SubBatchOutputHandler handler,
                                                           int globalPositionOffset, int inputElementOffset)
@@ -953,12 +965,75 @@ public sealed class EnginePool : IDisposable
       return;
     }
 
-    // Multi-batch: process in groups of NUM_COMPUTE_STREAMS with per-stream pipelining.
-    // Each stream issues H2D -> Compute -> D2H asynchronously, enabling concurrent
-    // compute and overlapping D2H(s) with Compute(s+1) across streams.
-    Span<long> groupOutputBytes = stackalloc long[NUM_COMPUTE_STREAMS];
+    // Multi-batch: two schedules are available.
+    //
+    //   Rolling (ROLLING_SUBBATCH_PIPELINE, static inference only): a sub-batch is issued as
+    //   soon as the buffers it needs are free, which is immediately after the handler of the
+    //   sub-batch two slots earlier (the previous user of that stream's buffers) has run:
+    //
+    //     stream A |b0........||b2........||b4...
+    //     stream B      |b1........||b3........|
+    //     this CPU       h(b0) issue(b2)  h(b1) issue(b3)  h(b2) ...
+    //
+    //   so the GPU always has the other stream's sub-batch in flight while a result is being
+    //   post-processed here. Only the issue ORDER changes: each stream keeps its own buffers,
+    //   so the captured CUDA graphs still see the tensor addresses they were captured with
+    //   (the native layer silently falls back to plain enqueue when addresses differ, so
+    //   rotating GPU buffers across sub-batches would quietly cost more than it gains).
+    //
+    //   Lockstep (below): sub-batches are issued in groups of NUM_COMPUTE_STREAMS, and the
+    //   whole group is synced and handled before the next group is issued, leaving the GPU
+    //   idle for the duration of the group's handlers. Required when any sub-batch uses
+    //   dynamic inference, whose compute must be serialized across streams (they can share
+    //   one TRT execution context) — a constraint the rolling schedule cannot express.
+    bool anyDynamicInPlan = false;
+    for (int i = 0; i < batchCount; i++)
+    {
+      if (cachedBatchPlan[i].useDynamic)
+      {
+        anyDynamicInPlan = true;
+        break;
+      }
+    }
+
     Span<int> groupOutputPositions = stackalloc int[NUM_COMPUTE_STREAMS];
     Span<int> groupOutputElements = stackalloc int[NUM_COMPUTE_STREAMS];
+
+    if (ROLLING_SUBBATCH_PIPELINE && !anyDynamicInPlan && NUM_COMPUTE_STREAMS > 1)
+    {
+      // Prime the pipeline with one sub-batch per stream.
+      int primeCount = Math.Min(NUM_COMPUTE_STREAMS, batchCount);
+      for (int i = 0; i < primeCount; i++)
+      {
+        IssueStaticSubBatch(input, inputElementOffset, i, i, groupOutputPositions, groupOutputElements);
+      }
+
+      for (int i = 0; i < batchCount; i++)
+      {
+        int streamSlot = i % NUM_COMPUTE_STREAMS;
+        int streamId = COMPUTE_STREAM_IDS[streamSlot];
+        (int start, int count, TensorRTEngine engine, _, _, _) = cachedBatchPlan[i];
+
+        // Waits for this sub-batch only: the sub-batch that reuses this stream is not issued
+        // until after the handler below has released these buffers.
+        engine.SyncStream(streamId, count);
+
+        handler(globalPositionOffset + start, count, groupOutputPositions[streamSlot],
+                streamBuffers[streamSlot].PinnedOutput, groupOutputElements[streamSlot]);
+
+        // These buffers are free again, so refill this stream now rather than after the rest of
+        // the group has been handled. The other stream's sub-batch keeps the GPU busy meanwhile.
+        int next = i + NUM_COMPUTE_STREAMS;
+        if (next < batchCount)
+        {
+          IssueStaticSubBatch(input, inputElementOffset, next, streamSlot, groupOutputPositions, groupOutputElements);
+        }
+      }
+
+      return;
+    }
+
+    Span<long> groupOutputBytes = stackalloc long[NUM_COMPUTE_STREAMS];
     for (int groupStart = 0; groupStart < batchCount; groupStart += NUM_COMPUTE_STREAMS)
     {
       int groupEnd = Math.Min(groupStart + NUM_COMPUTE_STREAMS, batchCount);
@@ -1039,6 +1114,47 @@ public sealed class EnginePool : IDisposable
 
 
   /// <summary>
+  /// Issues the complete H2D -> Compute -> D2H sequence for one statically sized sub-batch on the
+  /// stream owned by the specified slot, and records the output geometry the handler will need.
+  /// All three steps are asynchronous, so this returns as soon as the work is queued.
+  /// Only valid for static (non-dynamic) inference; see ProcessSubBatchesPipelined.
+  /// The caller must have synchronized (and handled) this slot's previous sub-batch, since the
+  /// pinned input written here and the pinned output written by the D2H are reused per slot.
+  /// </summary>
+  private unsafe void IssueStaticSubBatch<TInput>(TInput[] input, int inputElementOffset,
+                                                  int batchIdx, int streamSlot,
+                                                  Span<int> outputPositionsPerSlot,
+                                                  Span<int> outputElementsPerSlot)
+      where TInput : unmanaged
+  {
+    int streamId = COMPUTE_STREAM_IDS[streamSlot];
+    (int start, int count, TensorRTEngine engine, int engineBatchSize, _, _) = cachedBatchPlan[batchIdx];
+
+    int inputBytes = count * InputElementsPerPosition * sizeof(TInput);
+    int elementOffset = inputElementOffset + start * InputElementsPerPosition;
+
+    fixed (TInput* srcPtr = input)
+    {
+      Buffer.MemoryCopy(srcPtr + elementOffset, (void*)streamBuffers[streamSlot].PinnedInput, inputBytes, inputBytes);
+    }
+
+    engine.CopyToGPUOnStreamAsync(streamId, streamBuffers[streamSlot].GpuInput,
+                                  streamBuffers[streamSlot].PinnedInput, inputBytes);
+
+    engine.InferOnStreamWithGraphAsync(streamId, streamBuffers[streamSlot].GpuInput,
+                                       streamBuffers[streamSlot].GpuOutput);
+
+    // Static inference always runs the engine's full batch, so the output covers engineBatchSize.
+    int outputElements = ComputeAlignedOutputSize(engineBatchSize);
+    outputPositionsPerSlot[streamSlot] = engineBatchSize;
+    outputElementsPerSlot[streamSlot] = outputElements;
+
+    engine.CopyFromGPUOnStreamAsync(streamId, streamBuffers[streamSlot].PinnedOutput,
+                                    streamBuffers[streamSlot].GpuOutput, (long)outputElements * sizeof(ushort));
+  }
+
+
+  /// <summary>
   /// Cache for PaddedBatchCapacity results (thread-safe; plan is invariant per position count).
   /// </summary>
   private readonly ConcurrentDictionary<int, int> paddedCapacityCache = new();
@@ -1067,10 +1183,20 @@ public sealed class EnginePool : IDisposable
       // Mirror ComputeBatchPlanOptimized: sizes and timings are both in engine index order.
       int[] batchSizes = BatchScheduler.ScheduleSingleGPU(engineBatchSizes, executionTimesByEngineIndex, n,
                                                           deviceId, concurrent: NUM_COMPUTE_STREAMS > 1);
+      // Sum only the sub-batches that will actually be executed: ComputeBatchPlanOptimized stops
+      // as soon as the positions are covered, which (now that the plan is emitted largest first)
+      // can leave a trailing small sub-batch unused. Counting it here would overstate the
+      // capacity that callers fill to.
       int capacity = 0;
+      int covered = 0;
       foreach (int batchSize in batchSizes)
       {
         capacity += batchSize;
+        covered += Math.Min(batchSize, n - covered);
+        if (covered >= n)
+        {
+          break;
+        }
       }
       return Math.Max(capacity, n);
     });

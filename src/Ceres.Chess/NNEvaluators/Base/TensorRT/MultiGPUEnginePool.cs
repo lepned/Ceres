@@ -908,6 +908,96 @@ public sealed class MultiGPUEnginePool : IDisposable
   }
 
 
+  /// <summary>
+  /// Rotating counter used to spread single-GPU batches across equally fast GPUs.
+  /// </summary>
+  private int singleGPURotation;
+
+  /// <summary>
+  /// Chooses which pool executes a batch that ShouldUseSingleGPU has routed to one GPU.
+  ///
+  /// Prefers the GPU with the lowest estimated execution time for this batch size, which on a
+  /// heterogeneous system is not necessarily pool 0 (the previous unconditional choice), and
+  /// rotates among GPUs that are equally fast so consecutive small batches do not all land on
+  /// the same device.
+  ///
+  /// N.B. Rotation only raises utilization when batches can actually overlap, i.e. when several
+  ///      evaluators drive these engines concurrently (see the engine sharing path,
+  ///      CloneSharingEngine). One caller submitting batches through this API synchronously
+  ///      still keeps just one GPU busy at a time whichever GPU is picked; making sub-threshold
+  ///      batches genuinely parallel requires accepting concurrent requests (per-GPU queue plus
+  ///      per-GPU dispatch state), which this class is not structured for today: the multi-GPU
+  ///      path uses shared worker fields (workerByteInput/cachedStarts/...) that assume exactly
+  ///      one batch in flight.
+  /// </summary>
+  /// <param name="totalPositions">Positions in the batch to be executed.</param>
+  /// <param name="rotate">If true, advances the rotation (pass false for pure queries).</param>
+  private int SelectSingleGPUIndex(int totalPositions, bool rotate)
+  {
+    int numPools = pools.Count;
+
+    // Without cost tables (Range mode, or before warmup) there is no basis for choosing; the
+    // cost table is also the only thing that makes the choice sane on heterogeneous GPUs.
+    if (numPools == 1
+     || gpuCostTable == null
+     || totalPositions <= 0
+     || totalPositions > maxCostTableSize)
+    {
+      return 0;
+    }
+
+    float bestCost = float.MaxValue;
+    for (int g = 0; g < numPools; g++)
+    {
+      float cost = gpuCostTable[g][totalPositions];
+      if (cost < bestCost)
+      {
+        bestCost = cost;
+      }
+    }
+
+    // GPUs within a small tolerance of the best are treated as interchangeable.
+    const float EQUIVALENT_COST_TOLERANCE = 1.10f;
+    float threshold = bestCost * EQUIVALENT_COST_TOLERANCE;
+
+    int numCandidates = 0;
+    for (int g = 0; g < numPools; g++)
+    {
+      if (gpuCostTable[g][totalPositions] <= threshold)
+      {
+        numCandidates++;
+      }
+    }
+
+    if (numCandidates <= 1)
+    {
+      // A single fastest GPU: always use it (rotating onto a slower one would cost latency).
+      for (int g = 0; g < numPools; g++)
+      {
+        if (gpuCostTable[g][totalPositions] <= threshold)
+        {
+          return g;
+        }
+      }
+      return 0;
+    }
+
+    int rotation = rotate ? Interlocked.Increment(ref singleGPURotation) - 1
+                          : Volatile.Read(ref singleGPURotation);
+    int pick = (int)((uint)rotation % (uint)numCandidates);  // unsigned so counter wraparound stays in range
+
+    for (int g = 0; g < numPools; g++)
+    {
+      if (gpuCostTable[g][totalPositions] <= threshold && pick-- == 0)
+      {
+        return g;
+      }
+    }
+
+    return 0;
+  }
+
+
   private bool ShouldUseSingleGPU(int totalPositions)
   {
     if (pools.Count == 1)
@@ -994,7 +1084,8 @@ public sealed class MultiGPUEnginePool : IDisposable
 
     if (ShouldUseSingleGPU(totalPositions))
     {
-      return pools[0].PaddedBatchCapacity(totalPositions);
+      // Query only: do not advance the rotation (this is called to size batches, not to run them).
+      return pools[SelectSingleGPUIndex(totalPositions, rotate: false)].PaddedBatchCapacity(totalPositions);
     }
 
     // Mirror the distribution logic of the Process methods.
@@ -1033,7 +1124,7 @@ public sealed class MultiGPUEnginePool : IDisposable
 
     if (ShouldUseSingleGPU(totalPositions))
     {
-      pools[0].Process(input, output, totalPositions);
+      pools[SelectSingleGPUIndex(totalPositions, rotate: true)].Process(input, output, totalPositions);
       return;
     }
 
@@ -1094,7 +1185,7 @@ public sealed class MultiGPUEnginePool : IDisposable
 
     if (ShouldUseSingleGPU(totalPositions))
     {
-      pools[0].ProcessBytes(input, output, totalPositions);
+      pools[SelectSingleGPUIndex(totalPositions, rotate: true)].ProcessBytes(input, output, totalPositions);
       return;
     }
 
@@ -1157,7 +1248,7 @@ public sealed class MultiGPUEnginePool : IDisposable
 
     if (ShouldUseSingleGPU(totalPositions))
     {
-      pools[0].ProcessWithHandler(input, totalPositions, handler, globalPositionOffset: 0);
+      pools[SelectSingleGPUIndex(totalPositions, rotate: true)].ProcessWithHandler(input, totalPositions, handler, globalPositionOffset: 0);
       return;
     }
 
@@ -1223,7 +1314,7 @@ public sealed class MultiGPUEnginePool : IDisposable
 
     if (ShouldUseSingleGPU(totalPositions))
     {
-      pools[0].ProcessWithHandlerDirect(totalPositions, fillInput, handler, fallbackBuffer, globalPositionOffset: 0);
+      pools[SelectSingleGPUIndex(totalPositions, rotate: true)].ProcessWithHandlerDirect(totalPositions, fillInput, handler, fallbackBuffer, globalPositionOffset: 0);
       return;
     }
 
@@ -1244,7 +1335,7 @@ public sealed class MultiGPUEnginePool : IDisposable
 
     if (ShouldUseSingleGPU(totalPositions))
     {
-      pools[0].ProcessBytesWithHandler(input, totalPositions, handler, globalPositionOffset: 0);
+      pools[SelectSingleGPUIndex(totalPositions, rotate: true)].ProcessBytesWithHandler(input, totalPositions, handler, globalPositionOffset: 0);
       return;
     }
 
