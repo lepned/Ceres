@@ -226,14 +226,72 @@ namespace Ceres.Features.Tournaments
     public float RemainingTimeEngine2;
 
     /// <summary>
+    /// Minimum excess (seconds by which a move exceeded its full time allotment) for the
+    /// move to count as a time forfeit at all; smaller overshoots are ignored (grace).
+    /// </summary>
+    public const float FORFEIT_MIN_EXCESS_SECONDS = 0.5f;
+
+    /// <summary>
+    /// A time forfeit whose excess exceeds this threshold is classified as big
+    /// (suggestive of a process-wide stall such as a blocking GC rather than
+    /// ordinary time-management overshoot); forfeits between FORFEIT_MIN_EXCESS_SECONDS
+    /// and this threshold are classified as small.
+    /// </summary>
+    public const float BIG_FORFEIT_MIN_EXCESS_SECONDS = 2.0f;
+
+    /// <summary>
+    /// Number of moves on which engine 1 should have forfeited
+    /// (exceeded its full time allotment by more than FORFEIT_MIN_EXCESS_SECONDS).
+    /// </summary>
+    public int NumForfeitsEngine1;
+
+    /// <summary>
+    /// Number of engine 1 forfeits with excess between FORFEIT_MIN_EXCESS_SECONDS
+    /// and BIG_FORFEIT_MIN_EXCESS_SECONDS (small).
+    /// </summary>
+    public int NumSmallForfeitsEngine1;
+
+    /// <summary>
+    /// Number of engine 1 forfeits with excess above BIG_FORFEIT_MIN_EXCESS_SECONDS (big).
+    /// </summary>
+    public int NumBigForfeitsEngine1;
+
+    /// <summary>
+    /// Largest excess (seconds) among engine 1 forfeits (0 if none).
+    /// </summary>
+    public float MaxForfeitExcessSecondsEngine1;
+
+    /// <summary>
+    /// Number of moves on which engine 2 should have forfeited
+    /// (exceeded its full time allotment by more than FORFEIT_MIN_EXCESS_SECONDS).
+    /// </summary>
+    public int NumForfeitsEngine2;
+
+    /// <summary>
+    /// Number of engine 2 forfeits with excess between FORFEIT_MIN_EXCESS_SECONDS
+    /// and BIG_FORFEIT_MIN_EXCESS_SECONDS (small).
+    /// </summary>
+    public int NumSmallForfeitsEngine2;
+
+    /// <summary>
+    /// Number of engine 2 forfeits with excess above BIG_FORFEIT_MIN_EXCESS_SECONDS (big).
+    /// </summary>
+    public int NumBigForfeitsEngine2;
+
+    /// <summary>
+    /// Largest excess (seconds) among engine 2 forfeits (0 if none).
+    /// </summary>
+    public float MaxForfeitExcessSecondsEngine2;
+
+    /// <summary>
     /// If engine 1 should have forfeited due to exceeding specified search limit at least once.
     /// </summary>
-    public bool ShouldHaveForfeitedOnLimitsEngine1;
+    public bool ShouldHaveForfeitedOnLimitsEngine1 => NumForfeitsEngine1 > 0;
 
     /// <summary>
     /// If engine 2 should have forfeited due to exceeding specified search limit at least once.
     /// </summary>
-    public bool ShouldHaveForfeitedOnLimitsEngine2;
+    public bool ShouldHaveForfeitedOnLimitsEngine2 => NumForfeitsEngine2 > 0;
 
     /// <summary>
     /// If check engine is in use, the number of moves for which engine 2 played a different move from check engine.
@@ -459,7 +517,8 @@ namespace Ceres.Features.Tournaments
       {
         limitBase = SearchLimitWhite.Value;
         limitIncrement = SearchLimitWhite.ValueIncrement;
-      };
+      }
+      ;
 
       // Build lists of used search values.
       bool isTime = SearchLimitWhite.IsTimeLimit;
@@ -486,7 +545,7 @@ namespace Ceres.Features.Tournaments
 
     }
 
-#endregion
+    #endregion
 
 
   }

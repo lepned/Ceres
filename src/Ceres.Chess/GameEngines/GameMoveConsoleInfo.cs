@@ -43,7 +43,10 @@ namespace Ceres.Chess.GameEngines
     public int WhiteStartN;
     public int WhiteFinalN;
     public float WhiteMAvg;
-    public bool WhiteShouldHaveForfeitedOnLimit;
+    /// <summary>
+    /// Seconds by which this white move exceeded its full time allotment (0 if it did not).
+    /// </summary>
+    public float WhiteForfeitExcessSeconds;
     public int WhiteDepth;
 
     public float BlackNodesAllMoves;
@@ -58,7 +61,10 @@ namespace Ceres.Chess.GameEngines
     public int BlackStartN;
     public int BlackFinalN;
     public float BlackMAvg;
-    public bool BlackShouldHaveForfeitedOnLimit;
+    /// <summary>
+    /// Seconds by which this black move exceeded its full time allotment (0 if it did not).
+    /// </summary>
+    public float BlackForfeitExcessSeconds;
     public int BlackDepth;
 
     public int WhiteNumNodesComputed => WhiteFinalN - WhiteStartN;
@@ -84,7 +90,7 @@ namespace Ceres.Chess.GameEngines
       {
         Console.SetCursorPosition(0, Console.CursorTop);
       }
-      catch 
+      catch
       {
         // Silently ignore. The SetCursorPosition may fail if running from environments such as Linqpad.
       }

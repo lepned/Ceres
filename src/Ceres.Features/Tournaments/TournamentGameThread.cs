@@ -191,39 +191,69 @@ namespace Ceres.Features.Tournaments
       Def.parentDef.PauseController?.RegisterActive();
       try
       {
-      while (!Def.parentDef.ShouldShutDown)
-      {
-        int openingIndex = getGamePairToProcess(openings.Count);
-
-        // Look for sentinel indicating end
-        if (openingIndex < 0)
+        while (!Def.parentDef.ShouldShutDown)
         {
-          break;
-        }
+          int openingIndex = getGamePairToProcess(openings.Count);
+
+          // Look for sentinel indicating end
+          if (openingIndex < 0)
+          {
+            break;
+          }
 #if NOT
         // Some engines such as LZ0 doesn't seem to support "setoption name Clear Hash"
         // Therefore we don't clear cache every time, instead let it stick around unless first game in a set
         bool clearHashTable = isFirstGameOfPossiblePair;
 #endif
 
-        int numEngines = Run.Engines.Length;
-        int pairsPerOpening = string.IsNullOrEmpty(Def.ReferenceEngineId)
-          ? (numEngines * (numEngines - 1)) / 2
-          : numEngines - 1;
-        int baseGameSequenceNum = openingIndex * pairsPerOpening * 2;
-        int roundNumber = 1 + openingIndex;
+          int numEngines = Run.Engines.Length;
+          int pairsPerOpening = string.IsNullOrEmpty(Def.ReferenceEngineId)
+            ? (numEngines * (numEngines - 1)) / 2
+            : numEngines - 1;
+          int baseGameSequenceNum = openingIndex * pairsPerOpening * 2;
+          int roundNumber = 1 + openingIndex;
 
-        if (string.IsNullOrEmpty(Def.ReferenceEngineId))
-        {
-          List<GameEngine> list = new List<GameEngine>(Run.Engines);
-          int engine1Index = 0;
-          int pairCount = 0;
-          while (list.Count > 1)
+          if (string.IsNullOrEmpty(Def.ReferenceEngineId))
           {
-            for (int i = 1; i < list.Count; i++)
+            List<GameEngine> list = new List<GameEngine>(Run.Engines);
+            int engine1Index = 0;
+            int pairCount = 0;
+            while (list.Count > 1)
             {
-              Run.SetEnginePair(engine1Index, i + engine1Index);
+              for (int i = 1; i < list.Count; i++)
+              {
+                Run.SetEnginePair(engine1Index, i + engine1Index);
 
+                bool engine2White = (numPairsProcessed + runnerIndex + pairCount) % 2 == 0;
+                int pairSeqNum = baseGameSequenceNum + pairCount * 2;
+                TournamentGameInfo gameInfo = RunGame(pgnFileName, engine2White, openingIndex, pairSeqNum, roundNumber);
+                TournamentGameInfo gameReverseInfo = RunGame(pgnFileName, !engine2White, openingIndex, pairSeqNum + 1, roundNumber);
+                doneGamePairCallback?.Invoke(gameInfo, gameReverseInfo);
+                pairCount++;
+              }
+              list.RemoveAt(0);
+              engine1Index++;
+            }
+            numPairsProcessed++;
+          }
+
+          else
+          {
+            GameEngine refEngine = Run.Engines.FirstOrDefault(e => e.ID == Def.ReferenceEngineId);
+            if (refEngine == null)
+            {
+              throw new Exception("Error in loading reference engine");
+            }
+
+            int index = Array.IndexOf(Run.Engines, refEngine);
+            int pairCount = 0;
+            for (int i = 0; i < Run.Engines.Length; i++)
+            {
+              if (index == i)
+              {
+                continue;
+              }
+              Run.SetEnginePair(index, i);
               bool engine2White = (numPairsProcessed + runnerIndex + pairCount) % 2 == 0;
               int pairSeqNum = baseGameSequenceNum + pairCount * 2;
               TournamentGameInfo gameInfo = RunGame(pgnFileName, engine2White, openingIndex, pairSeqNum, roundNumber);
@@ -231,39 +261,9 @@ namespace Ceres.Features.Tournaments
               doneGamePairCallback?.Invoke(gameInfo, gameReverseInfo);
               pairCount++;
             }
-            list.RemoveAt(0);
-            engine1Index++;
+            numPairsProcessed++;
           }
-          numPairsProcessed++;
         }
-
-        else
-        {
-          GameEngine refEngine = Run.Engines.FirstOrDefault(e => e.ID == Def.ReferenceEngineId);
-          if (refEngine == null)
-          {
-            throw new Exception("Error in loading reference engine");
-          }
-
-          int index = Array.IndexOf(Run.Engines, refEngine);
-          int pairCount = 0;
-          for (int i = 0; i < Run.Engines.Length; i++)
-          {
-            if (index == i)
-            {
-              continue;
-            }
-            Run.SetEnginePair(index, i);
-            bool engine2White = (numPairsProcessed + runnerIndex + pairCount) % 2 == 0;
-            int pairSeqNum = baseGameSequenceNum + pairCount * 2;
-            TournamentGameInfo gameInfo = RunGame(pgnFileName, engine2White, openingIndex, pairSeqNum, roundNumber);
-            TournamentGameInfo gameReverseInfo = RunGame(pgnFileName, !engine2White, openingIndex, pairSeqNum + 1, roundNumber);
-            doneGamePairCallback?.Invoke(gameInfo, gameReverseInfo);
-            pairCount++;
-          }
-          numPairsProcessed++;
-        }
-      }
       }
       finally
       {
@@ -534,7 +534,8 @@ namespace Ceres.Features.Tournaments
                   + $"OppTotalTime={oppTotalTime} OppRemainingTime={oppRemainingTime}");
       sb.AppendLine($"TotalNodesEngine1={info.TotalNodesEngine1} TotalNodesEngine2={info.TotalNodesEngine2}");
       sb.AppendLine($"TotalEvaluationsEngine1={info.TotalEvaluationsEngine1} TotalEvaluationsEngine2={info.TotalEvaluationsEngine2}");
-      sb.AppendLine($"ShouldHaveForfeitedEngine1={info.ShouldHaveForfeitedOnLimitsEngine1} ShouldHaveForfeitedEngine2={info.ShouldHaveForfeitedOnLimitsEngine2}");
+      sb.AppendLine($"ForfeitsEngine1={info.NumForfeitsEngine1} (small={info.NumSmallForfeitsEngine1}, big={info.NumBigForfeitsEngine1}, maxExcess={info.MaxForfeitExcessSecondsEngine1:F2}s) "
+                  + $"ForfeitsEngine2={info.NumForfeitsEngine2} (small={info.NumSmallForfeitsEngine2}, big={info.NumBigForfeitsEngine2}, maxExcess={info.MaxForfeitExcessSecondsEngine2:F2}s)");
       sb.Append("=== END GAME RESULT ===");
       return sb.ToString();
     }
@@ -842,8 +843,8 @@ namespace Ceres.Features.Tournaments
         GameInfoFirstFinishedForByOpening[openingIndex] = thisResult;
       }
 
-      string player1ForfeitChar = thisResult.ShouldHaveForfeitedOnLimitsEngine1 ? "f" : " ";
-      string player2ForfeitChar = thisResult.ShouldHaveForfeitedOnLimitsEngine2 ? "f" : " ";
+      string player1ForfeitChar = ForfeitMarker(thisResult.NumForfeitsEngine1, thisResult.NumBigForfeitsEngine1);
+      string player2ForfeitChar = ForfeitMarker(thisResult.NumForfeitsEngine2, thisResult.NumBigForfeitsEngine2);
 
       const string TournamentGameResultReasonCodes = "CSTMERAL";
 
@@ -1009,11 +1010,57 @@ namespace Ceres.Features.Tournaments
     }
 
 
+    /// <summary>
+    /// Per-engine tally of time-limit forfeits within one game (moves which consumed more
+    /// than their entire time allotment), classified by the size of the excess:
+    /// excesses at or below TournamentGameInfo.FORFEIT_MIN_EXCESS_SECONDS are ignored,
+    /// those above BIG_FORFEIT_MIN_EXCESS_SECONDS are big, the rest small.
+    /// </summary>
+    struct ForfeitStats
+    {
+      public int NumTotal;
+      public int NumSmall;
+      public int NumBig;
+      public float MaxExcessSeconds;
+
+      public void Add(float excessSeconds)
+      {
+        if (excessSeconds <= TournamentGameInfo.FORFEIT_MIN_EXCESS_SECONDS)
+        {
+          return;
+        }
+
+        NumTotal++;
+        if (excessSeconds > TournamentGameInfo.BIG_FORFEIT_MIN_EXCESS_SECONDS)
+        {
+          NumBig++;
+        }
+        else
+        {
+          NumSmall++;
+        }
+        MaxExcessSeconds = Math.Max(MaxExcessSeconds, excessSeconds);
+      }
+    }
+
+
+    /// <summary>
+    /// Returns the one-character console marker summarizing an engine's time forfeits in a game:
+    /// "F" if any big forfeit occurred, "f" if forfeits occurred but none big, else a space.
+    /// </summary>
+    static string ForfeitMarker(int numForfeits, int numBigForfeits)
+      => numBigForfeits > 0 ? "F" : (numForfeits > 0 ? "f" : " ");
+
+
     private void OutputHeaders(string pgnFileName)
     {
       Def.Logger.WriteLine();
       Def.Logger.WriteLine($"Games will be incrementally written to file: {pgnFileName}");
       Def.Logger.WriteLine("Result codes: C=checkmate S=stalemate T=tablebase M=insufficient material E=excessive moves R=draw by repetition A=adjudicate eval agreement F=time forfeit");
+      Def.Logger.WriteLine($"Time forfeit marker (after TIME1/TIME2): some move exceeded its full time allotment "
+                         + $"by more than {TournamentGameInfo.FORFEIT_MIN_EXCESS_SECONDS:F1}s; "
+                         + $"f = all excesses <= {TournamentGameInfo.BIG_FORFEIT_MIN_EXCESS_SECONDS:F1}s, "
+                         + $"F = some excess > {TournamentGameInfo.BIG_FORFEIT_MIN_EXCESS_SECONDS:F1}s (possible process stall, e.g. GC pause).");
       Def.Logger.WriteLine("Note: the +/- and LOS columns use pentanomial (paired-game) analysis (shown once each game pair completes).");
       Def.Logger.WriteLine("Pair marker (after OP#): = pair completed with identical moves, ! pair completed with differing moves.");
       Def.Logger.WriteLine("The * column (immediately right of ELO) marks games output at the instant every thread is simultaneously at a completed-pair boundary (a fair Elo evaluation point).");
@@ -1134,8 +1181,8 @@ namespace Ceres.Features.Tournaments
       double backendSearchEngine2Tot = 0;
       int movesEngine1 = 0;
       int movesEngine2 = 0;
-      bool engine1ShouldHaveForfieted = false;
-      bool engine2ShouldHaveForfieted = false;
+      ForfeitStats engine1Forfeits = default;
+      ForfeitStats engine2Forfeits = default;
       int numNodesForcedDeterministic = 0;
 
       // Most recent move string played (used by blunder detection to report the opponent's prior move).
@@ -1186,8 +1233,14 @@ namespace Ceres.Features.Tournaments
           NumMovesForcedDeterministic = numNodesForcedDeterministic,
           RemainingTimeEngine1 = RemainingTime(searchLimitEngine1, movesEngine1, timeEngine1Tot),
           RemainingTimeEngine2 = RemainingTime(searchLimitEngine2, movesEngine2, timeEngine2Tot),
-          ShouldHaveForfeitedOnLimitsEngine1 = engine1ShouldHaveForfieted,
-          ShouldHaveForfeitedOnLimitsEngine2 = engine2ShouldHaveForfieted,
+          NumForfeitsEngine1 = engine1Forfeits.NumTotal,
+          NumSmallForfeitsEngine1 = engine1Forfeits.NumSmall,
+          NumBigForfeitsEngine1 = engine1Forfeits.NumBig,
+          MaxForfeitExcessSecondsEngine1 = engine1Forfeits.MaxExcessSeconds,
+          NumForfeitsEngine2 = engine2Forfeits.NumTotal,
+          NumSmallForfeitsEngine2 = engine2Forfeits.NumSmall,
+          NumBigForfeitsEngine2 = engine2Forfeits.NumBig,
+          MaxForfeitExcessSecondsEngine2 = engine2Forfeits.MaxExcessSeconds,
           NumEngine2MovesDifferentFromCheckEngine = numEngine2MovesDifferentFromCheckEngine,
           GameMoveHistory = gameMoveHistory
         };
@@ -1300,12 +1353,12 @@ namespace Ceres.Features.Tournaments
 
           if (engine2IsWhite)
           {
-            engine2ShouldHaveForfieted |= info.WhiteShouldHaveForfeitedOnLimit;
+            engine2Forfeits.Add(info.WhiteForfeitExcessSeconds);
             moveStat = new GameMoveStat(plyCount, SideType.White, position, info.WhiteScoreQ, info.WhiteScoreCentipawns, engine2.CumulativeSearchTimeSeconds, numPieces, info.WhiteMAvg, info.WhiteFinalN, info.WhiteNumNodesComputed, info.WhiteSearchLimitPre, info.WhiteMoveTimeUsed);
           }
           else
           {
-            engine2ShouldHaveForfieted |= info.BlackShouldHaveForfeitedOnLimit;
+            engine2Forfeits.Add(info.BlackForfeitExcessSeconds);
             moveStat = new GameMoveStat(plyCount, SideType.Black, position, info.BlackScoreQ, info.BlackScoreCentipawns, engine2.CumulativeSearchTimeSeconds, numPieces, info.BlackMAvg, info.BlackFinalN, info.BlackNumNodesComputed, info.BlackSearchLimitPre, info.BlackMoveTimeUsed);
           }
         }
@@ -1322,12 +1375,12 @@ namespace Ceres.Features.Tournaments
           movesEngine1++;
           if (engine2IsWhite)
           {
-            engine1ShouldHaveForfieted |= info.BlackShouldHaveForfeitedOnLimit;
+            engine1Forfeits.Add(info.BlackForfeitExcessSeconds);
             moveStat = new GameMoveStat(plyCount, SideType.Black, position, info.BlackScoreQ, info.BlackScoreCentipawns, engine1.CumulativeSearchTimeSeconds, numPieces, info.BlackMAvg, info.BlackFinalN, info.BlackNumNodesComputed, info.BlackSearchLimitPre, info.BlackMoveTimeUsed);
           }
           else
           {
-            engine1ShouldHaveForfieted |= info.WhiteShouldHaveForfeitedOnLimit;
+            engine1Forfeits.Add(info.WhiteForfeitExcessSeconds);
             moveStat = new GameMoveStat(plyCount, SideType.White, position, info.WhiteScoreQ, info.WhiteScoreCentipawns, engine1.CumulativeSearchTimeSeconds, numPieces, info.WhiteMAvg, info.WhiteFinalN, info.WhiteNumNodesComputed, info.WhiteSearchLimitPre, info.WhiteMoveTimeUsed);
           }
         }
@@ -1457,22 +1510,18 @@ namespace Ceres.Features.Tournaments
         GameEngineSearchResult engineMove = engine.Search(curPositionAndMoves, thisMoveSearchLimit, gameMoveHistory, progressCb);
         float engineTime = (float)engineMove.TimingStats.ElapsedTimeSecs;
 
-        // Check for time forfeit
-        bool shouldHaveForfeited = false;
-        if (thisMoveSearchLimit.IsTimeLimit)
+        // Check for time forfeit: did this move consume more than its entire time allotment
+        // (for per-game time controls thisMoveSearchLimit.Value is the full remaining clock)?
+        // The raw excess is recorded here; classification happens at aggregation (ForfeitStats):
+        // excesses at or below TournamentGameInfo.FORFEIT_MIN_EXCESS_SECONDS are ignored (grace),
+        // those up to BIG_FORFEIT_MIN_EXCESS_SECONDS are small (ordinary time-management
+        // overshoot), and larger ones are big (suggestive of a process-wide stall such as a
+        // blocking GC pause) - shown as f/F respectively in the console markers.
+        // The first two game moves are excluded (startup effects can inflate measured time).
+        float forfeitExcessSeconds = 0;
+        if (thisMoveSearchLimit.IsTimeLimit && gameMoveHistory.Count >= 2)
         {
-          const float GRACE_FRACTION = 0.02f; // Allow up to 2% over
-          float GRACE_SECONDS = searchLimit.Value * GRACE_FRACTION;
-          float timeExcess = engineTime - thisMoveSearchLimit.Value;
-          if (gameMoveHistory.Count >= 2 && timeExcess > GRACE_SECONDS)
-          {
-            shouldHaveForfeited = true;
-
-            // TODO: (a) remove the "Count > 2" restriction above,
-            //       (b) reconsider the GRACE_FRACTION above
-            //       (b) log this
-            //throw new Exception($"Time forfeit, allotted {thisMoveSearchLimit.Value} used {engineTime} for engine {engine}");
-          }
+          forfeitExcessSeconds = Math.Max(0, engineTime - thisMoveSearchLimit.Value);
         }
 
         GameEngineSearchResult checkSearch = default;
@@ -1576,7 +1625,7 @@ namespace Ceres.Features.Tournaments
           info.WhiteFinalN = engineMove.FinalN;
           info.WhiteMAvg = moveMAvg;
           info.WhiteCheckMoveStr = checkMove;
-          info.WhiteShouldHaveForfeitedOnLimit = shouldHaveForfeited;
+          info.WhiteForfeitExcessSeconds = forfeitExcessSeconds;
           info.WhiteDepth = moveDepth;
         }
         else
@@ -1593,7 +1642,7 @@ namespace Ceres.Features.Tournaments
           info.BlackFinalN = engineMove.FinalN;
           info.BlackMAvg = moveMAvg;
           info.BlackCheckMoveStr = checkMove;
-          info.BlackShouldHaveForfeitedOnLimit = shouldHaveForfeited;
+          info.BlackForfeitExcessSeconds = forfeitExcessSeconds;
           info.BlackDepth = moveDepth;
         }
 
