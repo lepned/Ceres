@@ -918,6 +918,9 @@ public unsafe partial class Graph : IDisposable
     // Other fields such as uncertainty and child index
     // can remain at their default values (zero).
 
+    // Edge is fully written; make it visible to readers.
+    PublishNewEdge(parentNode);
+
     return new GEdge(ref thisEdgeRef, parent: parentNode, child: default);
   }
 
@@ -1074,6 +1077,9 @@ public unsafe partial class Graph : IDisposable
       thisEdgeRef.SetUncertaintyValues(childNode.UncertaintyValue, childNode.UncertaintyPolicy);
     }
 
+    // Edge is fully written; make it visible to readers.
+    PublishNewEdge(parentNode);
+
     return new GEdge(ref thisEdgeRef, parentNode, child: childNode);
   }
 
@@ -1095,16 +1101,10 @@ public unsafe partial class Graph : IDisposable
     }
     Debug.Assert(indexOfChildInParent < parentNode.NumPolicyMoves);
 
-    // Update number of expanded edges at the parent.
-    // N.B. A node may have NumEdgesExpanded > 0 with corresponding edge N values of 0,
-    //      yielding N = sumEdgeN + 1 where sumEdgeN = 0.
-    //      This occurs when an edge is created during selection but the visit is 
-    //      subsequently aborted (e.g.PiggybackPendingNNEval failure or transposition collision),
-    //      so BackupToEdge/ BackupToNode are never called.
-    //      The state is harmless — PUCT treats an expanded edge with N = 0 identically
-    //      to an unexpanded move — and self-corrects on the next visit.
-    parentNode.NodeRef.NumEdgesExpanded++;
-
+    // N.B. The parent's NumEdgesExpanded is NOT incremented here. It is the flag by which readers
+    //      decide that an edge exists at a given index, so it is incremented only once the header
+    //      AND the edge body have been fully written - see PublishNewEdge, which every caller
+    //      invokes as its last step.
     Span<GEdgeHeaderStruct> edgeHeaderStructsSpan = parentNode.EdgeHeadersSpan;
 
     int edgesStartBlockIndex;
@@ -1135,6 +1135,24 @@ public unsafe partial class Graph : IDisposable
     Span<GEdgeStruct> edgeSpanThisBlock = Store.EdgesStore.SpanAtBlockIndex(edgesStartBlockIndex);
     return ref edgeSpanThisBlock[edgesIndexInBlock];
 #endif
+  }
+
+
+  /// <summary>
+  /// Publishes an edge created by InitializeNewEdge, by incrementing the parent's count of
+  /// expanded edges. Must be called only after both the edge header and the edge body have been
+  /// fully written.
+  ///
+  /// NumEdgesExpanded is what tells a reader that an edge exists at a given index, so it is the
+  /// publication flag for everything written above it. 
+  /// The volatile write orders the header and body stores ahead of the count store. 
+  /// On x86-64 stores are already ordered, so this compiles to a plain store; 
+  /// the ordering is required on weakly ordered targets such as ARM64.
+  /// </summary>
+  /// <param name="parentNode"></param>
+  private static void PublishNewEdge(GNode parentNode)
+  {
+    Volatile.Write(ref parentNode.NodeRef.NumEdgesExpanded, (byte)(parentNode.NodeRef.NumEdgesExpanded + 1));
   }
 
 
