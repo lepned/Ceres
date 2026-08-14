@@ -106,7 +106,15 @@ namespace Ceres.Chess.LC0.WeightsProtobuf
     public LC0ProtobufNetWeightsMinMaxStats Stats => new LC0ProtobufNetWeightsMinMaxStats(Net.Weights);
 
 
-    static ConcurrentDictionary<string, LC0ProtobufNet> cachedNets = new();
+    /// <summary>
+    /// Cache of parsed nets, avoiding repeated deserialization when several components
+    /// reference the same file (typical during evaluator initialization).
+    /// Values are held weakly: a parsed net (possibly over 100MB, largely on the LOH)
+    /// stays cached only while some caller still strongly references it; afterwards the GC
+    /// is free to reclaim it at the next collection of its generation, and any later
+    /// request simply re-parses the file.
+    /// </summary>
+    static ConcurrentDictionary<string, WeakReference<LC0ProtobufNet>> cachedNets = new();
 
     /// <summary>
     /// Try to avoid concurrent loading of same nets.
@@ -129,18 +137,15 @@ namespace Ceres.Chess.LC0.WeightsProtobuf
         Thread.Sleep(50);
       }
 
-      // TODO: consider having a bounded size of the cache to avoid excess memory use.
       try
       {
         loadingNets.TryAdd(fn, fn);
-        if (!cachedNets.TryGetValue(fn, out net))
+        if (!cachedNets.TryGetValue(fn, out WeakReference<LC0ProtobufNet> weakNet)
+         || !weakNet.TryGetTarget(out net))
         {
-          net = cachedNets[fn] = new LC0ProtobufNet(fn);
+          net = new LC0ProtobufNet(fn);
+          cachedNets[fn] = new WeakReference<LC0ProtobufNet>(net);
         }
-      }
-      catch (Exception ex)
-      {
-        throw ex;
       }
       finally
       {
@@ -164,7 +169,7 @@ namespace Ceres.Chess.LC0.WeightsProtobuf
       FileName = fn;
 
       // Read data from file, decompressing if necessary.
-      byte[] data = FileUtils.IsZippedFile(fn) ? CompressionUtils.GetDecompressedBytes(fn) 
+      byte[] data = FileUtils.IsZippedFile(fn) ? CompressionUtils.GetDecompressedBytes(fn)
                                                : File.ReadAllBytes(fn);
 
       Net = SerializationUtils.ProtoDeserialize<Net>(data);
@@ -174,7 +179,7 @@ namespace Ceres.Chess.LC0.WeightsProtobuf
         throw new Exception($"Failure reading/parsing net {fn}");
       }
 
-      if (Net.Format.NetworkFormat != null && 
+      if (Net.Format.NetworkFormat != null &&
           Net.Format.NetworkFormat.Input != NetworkFormat.InputFormat.InputClassical112Plane)
       {
         throw new Exception($"Only network format InputClassical112Plane is supported, not {Net.Format.NetworkFormat.Input} in {fn}.");
@@ -216,12 +221,12 @@ namespace Ceres.Chess.LC0.WeightsProtobuf
         Console.WriteLine("  Network format: cannot be determined (not saved in this version of the protobuf)");
 
       Console.WriteLine();
-      Console.WriteLine($"LC0Params      { Net.TrainingParams.Lc0Params}");
-      Console.WriteLine($"Learning rate  { Net.TrainingParams.LearningRate,10:F6}");
-      Console.WriteLine($"Steps          { Net.TrainingParams.TrainingSteps, 10:N0}");
-      Console.WriteLine($"MSE            { Net.TrainingParams.MseLoss, 10:F5}");
-      Console.WriteLine($"Policy Loss    { Net.TrainingParams.PolicyLoss, 10:F2}");
-      Console.WriteLine($"Accuracy       { Net.TrainingParams.Accuracy,  10:F2}%");
+      Console.WriteLine($"LC0Params      {Net.TrainingParams.Lc0Params}");
+      Console.WriteLine($"Learning rate  {Net.TrainingParams.LearningRate,10:F6}");
+      Console.WriteLine($"Steps          {Net.TrainingParams.TrainingSteps,10:N0}");
+      Console.WriteLine($"MSE            {Net.TrainingParams.MseLoss,10:F5}");
+      Console.WriteLine($"Policy Loss    {Net.TrainingParams.PolicyLoss,10:F2}");
+      Console.WriteLine($"Accuracy       {Net.TrainingParams.Accuracy,10:F2}%");
     }
 
   }
