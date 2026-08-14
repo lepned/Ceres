@@ -65,6 +65,7 @@ namespace Ceres.Chess.Data.Nets
 
         {"BT3", ONNXNet16LC0("BT3-768x15x24h-swa-2790000.pb.gz_fp16#16")},
         {"BT3_FP16_TRT", ONNXNet16LC0("BT3-768x15x24h-swa-2790000.pb.gz_fp16#16", true)},
+        {"BT3_NATIVE", SimpleLC0Net("BT3-768x15x24h-swa-2790000.pb.gz")},
         {"BT3_160k", ONNXNet32LC0("BT3-768x15x24h-swa-onnx-160000-baseline.pb.gz")},
         {"BT3_480k_TRT", ONNXNet16LC0("BT3-768x15x24h-swa-480000.pb.gz_fp16#16", true)},
         {"BT3_810k", ONNXNet32LC0("BT3-768x15x24h-swa-onnx-810000-baseline.pb.gz")},
