@@ -18,6 +18,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 
 using Ceres.Base.Benchmarking;
@@ -68,10 +69,16 @@ namespace Ceres.Chess.NNEvaluators
       public IPositionEvaluationBatch Result;
       public ManualResetEventSlim CompletionSignal;
 
+      /// <summary>
+      /// Failure (if any) from the worker thread, to be rethrown on the calling thread.
+      /// </summary>
+      public ExceptionDispatchInfo Exception;
+
       public void Reset()
       {
         SubBatch = null;
         Result = null;
+        Exception = null;
         RetrieveSupplementalResults = false;
         CompletionSignal.Reset();
       }
@@ -255,9 +262,14 @@ namespace Ceres.Chess.NNEvaluators
           }
           catch (Exception ex)
           {
-            // Store exception in result or handle appropriately
+            // Hand the failure to the caller instead of letting it leave this thread. Rethrowing
+            // here would end the consuming loop and kill this worker permanently: an
+            // OperationCanceledException would be swallowed by the outer catch below, after which
+            // every later sub-batch queued to this evaluator waits forever on a completion signal
+            // that nobody will set; anything else escapes the thread delegate entirely and takes
+            // the process down. Either way the caller would have seen only a null Result.
             Console.Error.WriteLine($"Error in evaluator {evaluatorIndex}: {ex}");
-            throw;
+            workItem.Exception = ExceptionDispatchInfo.Capture(ex);
           }
           finally
           {
@@ -333,15 +345,25 @@ namespace Ceres.Chess.NNEvaluators
       }
 
       // Wait for all work items to complete.
+      ExceptionDispatchInfo firstFailure = null;
       for (int i = 0; i < evaluatorsAllocated; i++)
       {
         int evaluatorIndex = evaluatorIndicesBuffer[i];
         EvaluatorWorkItem workItem = workItemPool[evaluatorIndex];
         workItem.CompletionSignal.Wait();
         resultsBuffer[i] = workItem.Result;
+        firstFailure ??= workItem.Exception;
       }
 
       EvaluatorAllocator.Deallocate(allocations);
+
+      if (firstFailure != null)
+      {
+        // Every sub-batch has been waited for above (so no worker is still running against
+        // buffers about to be reused) and the allocator has been released, so it is now safe to
+        // surface the original failure, with its original stack trace, on this thread.
+        firstFailure.Throw();
+      }
 
       /// More efficient mode which is just a merged view over multiple batches 
       /// (without copying data)
@@ -349,7 +371,9 @@ namespace Ceres.Chess.NNEvaluators
 
       if (USE_MERGED_BATCH_VIEW)
       {
-        return new PositionsEvaluationBatchMerged(resultsBuffer, subBatchSizesBuffer);
+        // Only the first evaluatorsAllocated entries were refreshed above; the rest of these
+        // reused buffers still hold the prior (possibly wider) call's batches and sizes.
+        return new PositionsEvaluationBatchMerged(resultsBuffer, subBatchSizesBuffer, evaluatorsAllocated);
       }
       else
       {

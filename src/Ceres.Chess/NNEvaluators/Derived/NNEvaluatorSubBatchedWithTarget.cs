@@ -75,7 +75,7 @@ namespace Ceres.Chess.NNEvaluators
     public NNEvaluatorSubBatchedWithTarget(NNEvaluator evaluator, int maxSubBatchSize, int optimalSubBatchSize,
                                            List<(int batchSize, int[] partitionBatchSizes)> optimalBatchSizePartitions)
     {
-//      Console.WriteLine($"NNEvaluatorSubBatchedWithTarget {maxSubBatchSize}");
+      //      Console.WriteLine($"NNEvaluatorSubBatchedWithTarget {maxSubBatchSize}");
 
       Debug.Assert(evaluator is not NNEvaluatorSubBatchedWithTarget);
 
@@ -155,8 +155,8 @@ namespace Ceres.Chess.NNEvaluators
         else if (left < (MaxSubBatchSize - 16) && left > (MaxSubBatchSize * 80) / 100)
         {
           // Make sure the 3 batch sizes are somewhat equal in size.
-          subBatchSizes.Add(left/2);
-          left -= left/2;
+          subBatchSizes.Add(left / 2);
+          left -= left / 2;
         }
         else
         {
@@ -167,7 +167,7 @@ namespace Ceres.Chess.NNEvaluators
 
 
 
-      
+
     }
 
     void BuildSizesWithPredefinedSizes(int numPos, List<int> subBatchSizes)
@@ -218,7 +218,7 @@ namespace Ceres.Chess.NNEvaluators
     {
       if (subBatches == null)
       {
-         subBatches = new List<PositionEvaluationBatch>();
+        subBatches = new List<PositionEvaluationBatch>();
       }
 
       if (index < subBatches.Count)
@@ -258,7 +258,7 @@ namespace Ceres.Chess.NNEvaluators
         List<int> subBatchSizes = new();
         BuildSizes(positions.NumPos, subBatchSizes);
 
-//        Dump(positions.NumPos, subBatchSizes);
+        //        Dump(positions.NumPos, subBatchSizes);
 
         Task evaluateTask = null;
 
@@ -345,7 +345,7 @@ namespace Ceres.Chess.NNEvaluators
           (Evaluator as NNEvaluatorCUDA).Evaluator.AsyncMode = false;
         }
 
-        return new PositionsEvaluationBatchMerged(results, subBatchSizes.ToArray());
+        return new PositionsEvaluationBatchMerged(results, subBatchSizes.ToArray(), results.Length);
       }
 
     }
