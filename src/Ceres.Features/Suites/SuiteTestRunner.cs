@@ -444,17 +444,16 @@ namespace Ceres.Features.Suites
       Init(numDevicesPerWorker);
 
       // Install Ctrl-C handler to allow ad hoc clean termination (with stats).
+      // Scoped registration: unsubscribed on every exit path so the run is not kept
+      // reachable forever via the static Console.CancelKeyPress event.
       bool stopRequested = false;
-      if (enableCancelVialCtrlC)
-      {
-        ConsoleCancelEventHandler ctrlCHandler = new ConsoleCancelEventHandler((object sender, ConsoleCancelEventArgs args) =>
+      using ConsoleCancelHandlerScope ctrlCScope = !enableCancelVialCtrlC ? null
+        : new ConsoleCancelHandlerScope((object sender, ConsoleCancelEventArgs args) =>
         {
           Console.WriteLine("Suite pending shutdown....");
           stopRequested = true;
           args.Cancel = true;
         });
-        Console.CancelKeyPress += ctrlCHandler;
-      }
 
       int timerFiredCount = 0;
 
@@ -794,17 +793,16 @@ namespace Ceres.Features.Suites
       InitMultiEngine(numDevicesPerWorker);
 
       // Install Ctrl-C handler to allow ad hoc clean termination (with stats so far).
+      // Scoped registration: unsubscribed on every exit path so the run is not kept
+      // reachable forever via the static Console.CancelKeyPress event.
       bool stopRequested = false;
-      if (enableCancelViaCtrlC)
-      {
-        ConsoleCancelEventHandler ctrlCHandler = new ConsoleCancelEventHandler((object sender, ConsoleCancelEventArgs args) =>
+      using ConsoleCancelHandlerScope ctrlCScope = !enableCancelViaCtrlC ? null
+        : new ConsoleCancelHandlerScope((object sender, ConsoleCancelEventArgs args) =>
         {
           Console.WriteLine("Suite pending shutdown....");
           stopRequested = true;
           args.Cancel = true;
         });
-        Console.CancelKeyPress += ctrlCHandler;
-      }
 
       List<EPDEntry> epds = LoadAndSliceEPDsMulti();
       numPositionsInRun = epds.Count;

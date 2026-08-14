@@ -370,20 +370,18 @@ namespace Ceres.Features.Tournaments
 
       VerifyEnginesCompatible();
 
-      if (enableCancelVialCtrlC)
-      {
-        // Install Ctrl-C handler to allow ad hoc clean termination of tournament (with stats).
-        ConsoleCancelEventHandler ctrlCHandler = new ConsoleCancelEventHandler((object sender,
-          ConsoleCancelEventArgs args) =>
+      // Install Ctrl-C handler to allow ad hoc clean termination of tournament (with stats).
+      // Scoped registration: unsubscribed on every exit path from this method, so a completed
+      // tournament is not kept reachable forever via the static Console.CancelKeyPress event.
+      using ConsoleCancelHandlerScope ctrlCScope = !enableCancelVialCtrlC ? null
+        : new ConsoleCancelHandlerScope((object sender, ConsoleCancelEventArgs args) =>
         {
           Console.WriteLine("Tournament pending shutdown....");
           Def.parentDef.ShouldShutDown = true;
           // Release any threads parked by a Ctrl-P pause so they observe the shutdown and drain.
           Def.parentDef.PauseController?.Resume();
           shutdownComplete.WaitOne();
-        }); ;
-        Console.CancelKeyPress += ctrlCHandler;
-      }
+        });
 
       QueueManager = queueManager;
       TournamentResultStats parentTest = new();
