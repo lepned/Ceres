@@ -1085,8 +1085,8 @@ public unsafe partial class Graph : IDisposable
     // Edges expected to be expanded strictly in index order: creating edge k relies on edge k-1's
     // block index being set.  An out-of-order expansion (a "hole" left by selection) would
     // otherwise read a garbage block index below and corrupt memory.
-    if (!parentNode.IsGraphRoot 
-      && indexOfChildInParent != parentNode.NumEdgesExpanded 
+    if (!parentNode.IsGraphRoot
+      && indexOfChildInParent != parentNode.NumEdgesExpanded
       && !haveWarnedEdgeOutOfOrder)
     {
       ConsoleUtils.WriteLineColored(ConsoleColor.Yellow, $"Out-of-order edge expansion: indexOfChildInParent={indexOfChildInParent} "
@@ -1293,13 +1293,13 @@ public unsafe partial class Graph : IDisposable
     Span<GEdgeHeaderStruct> childEdgeHeaders = node.EdgeHeadersSpan;
 
 
-    Span<double> n = stats.N.Span;
-    Span<double> nInFlightAdjusted = stats.NInFlightAdjusted.Span;
-    Span<double> p = stats.P.Span;
-    Span<double> w = stats.W.Span;
-    Span<double> uv = stats.UV.Span;
+    Span<float> n = stats.N.Span;
+    Span<float> nInFlightAdjusted = stats.NInFlightAdjusted.Span;
+    Span<float> p = stats.P.Span;
+    Span<float> w = stats.W.Span;
+    Span<float> uv = stats.UV.Span;
 #if ACTION_ENABLED
-    Span<double> a = stats.A.Span;
+    Span<float> a = stats.A.Span;
 #endif
 
     int numEdgesExpanded = node.NumEdgesExpanded;
@@ -1338,12 +1338,14 @@ public unsafe partial class Graph : IDisposable
         p[i] = refEdge.P;
         n[i] = refEdge.N;
 #if ACTION_ENABLED
-        a[i] = (double)childEdgeHeaders[i].ActionV; // Read from header (survives expansion; edge struct has no storage)
+        a[i] = (float)childEdgeHeaders[i].ActionV; // Read from header (survives expansion; edge struct has no storage)
 #endif
         // Extract value uncertainty with fill-in if missing
-        uv[i] = (double)refEdge.UncertaintyV;
+        uv[i] = (float)refEdge.UncertaintyV;
 
-        w[i] = refEdge.N == 0 ? 0 : (refEdge.Q * refEdge.N);
+        // W is accumulated in double and narrowed once: Q is double and N can be large, so forming
+        // the product in float first would lose more than the final rounding does.
+        w[i] = refEdge.N == 0 ? 0 : (float)(refEdge.Q * refEdge.N);
 
         if (isIteratorIDZero)
         {
@@ -1362,7 +1364,7 @@ public unsafe partial class Graph : IDisposable
         p[i] = (childEdgeHeaders[i].P);
         n[i] = 0;
 #if ACTION_ENABLED
-        a[i] = (double)childEdgeHeaders[i].ActionV;
+        a[i] = (float)childEdgeHeaders[i].ActionV;
 #endif
         uv[i] = 0;
         w[i] = 0;
@@ -1372,7 +1374,7 @@ public unsafe partial class Graph : IDisposable
 
       stats.SumNumInFlightAll += sumVisitedThisChild;
 
-      double nI = n[i]; // Now n[i] is already an int, no need for conversion
+      double nI = n[i]; // widened back to double for the summary accumulators below
       if (nI + sumVisitedThisChild > 0)
       {
         stats.SumPVisited += p[i];

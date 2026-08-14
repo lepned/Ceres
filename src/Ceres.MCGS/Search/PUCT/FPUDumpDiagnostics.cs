@@ -67,7 +67,7 @@ internal static class FPUDumpDiagnostics
   /// FPU_DIFF_THRESHOLD.
   /// </summary>
   public static void DumpFPURPO(GNode node,
-                                ReadOnlySpan<double> pSpan, ReadOnlySpan<double> nSpan, ReadOnlySpan<double> wSpan,
+                                ReadOnlySpan<float> pSpan, ReadOnlySpan<float> nSpan, ReadOnlySpan<float> wSpan,
                                 ReadOnlySpan<double> qOut,
                                 int numToProcess, int numExpanded,
                                 double lambda, RPORegularization regularization, RPOAnchor anchor,
