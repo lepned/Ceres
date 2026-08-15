@@ -698,10 +698,32 @@ public record ParamsSearch
 
 
   /// <summary>
+  /// Default amount of time subtracted from time allotments (see MoveOverheadSeconds).
+  /// </summary>
+  public const float MOVE_OVERHEAD_SECONDS_DEFAULT = 0.5f;
+
+  /// <summary>
+  /// Default amount of time subtracted from time allotments (see MoveOverheadSeconds)
+  /// when the game is played under a short time control.
+  /// </summary>
+  public const float MOVE_OVERHEAD_SECONDS_SHORT_TIME_CONTROL = 0.25f;
+
+  /// <summary>
+  /// Starting time control value (seconds) below which a game is considered to be played
+  /// under a short time control for purposes of choosing the default move overhead.
+  /// </summary>
+  public const float MOVE_OVERHEAD_SHORT_TIME_CONTROL_THRESHOLD_SECONDS = 15f;
+
+  /// <summary>
   /// Amount of time subtracted from time allotments to
   /// compensate for lag or various unpredictable latencies.
+  ///
+  /// If left at the default value, the overhead actually applied is reduced to
+  /// MOVE_OVERHEAD_SECONDS_SHORT_TIME_CONTROL for games played under a time-based search limit
+  /// whose starting value is below MOVE_OVERHEAD_SHORT_TIME_CONTROL_THRESHOLD_SECONDS.
+  /// A value explicitly set (e.g. via the UCI MoveOverheadMs option) is always used as-is.
   /// </summary>
-  public float MoveOverheadSeconds = 0.25f;
+  public float MoveOverheadSeconds = MOVE_OVERHEAD_SECONDS_DEFAULT;
 
 
   /// <summary>

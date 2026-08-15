@@ -345,6 +345,14 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   bool isFirstMoveOfGame = true;
 
   /// <summary>
+  /// Starting time control of the current game (seconds), captured from the first time-based search
+  /// limit seen since the last ResetGame, or null if none yet seen (or the limit is not time-based).
+  /// Used to resolve the move overhead in effect for the game (see MCGSSearch), which must be based
+  /// on the starting time control rather than the remaining clock (which shrinks as the game plays out).
+  /// </summary>
+  float? gameStartingTimeLimitSeconds;
+
+  /// <summary>
   /// Resets all state between games.
   /// </summary>
   /// <param name="gameID">optional game descriptive string</param>
@@ -355,6 +363,7 @@ public class GameEngineCeresMCGSInProcess : GameEngine
     Search = null;
 
     isFirstMoveOfGame = true;
+    gameStartingTimeLimitSeconds = null;
     CurrentGameID = gameID;
 
     miniLog?.WriteNewGameSeparator(gameID);
@@ -434,6 +443,14 @@ public class GameEngineCeresMCGSInProcess : GameEngine
     {
       MaxTreeVisits = searchLimit.MaxTreeVisits ?? MCGSParamsFixed.MAX_VISITS,
     };
+
+    // Capture the starting time control of this game (the first time-based limit seen since ResetGame).
+    // For a per-game clock this is the full time control, since no time has yet been consumed;
+    // for a per-move limit it is that per-move allotment.
+    if (gameStartingTimeLimitSeconds is null && searchLimit.IsTimeLimit && searchLimit.Value > 0)
+    {
+      gameStartingTimeLimitSeconds = searchLimit.Value;
+    }
 
     // Set up callback passthrough if provided
     MCGSManager.MCGSProgressCallback callbackMCGS = null;
@@ -823,7 +840,8 @@ public class GameEngineCeresMCGSInProcess : GameEngine
                   curPositionAndMoves, searchLimit, verbose, lastSearchStartTime,
                   gameMoveHistory, callback, null, isFirstMoveOfGame,
                   MoveImmediateIfOnlyOneMove, forcedMove: forcedMove,
-                  fixedSearchLimit: FixedSearchLimit);
+                  fixedSearchLimit: FixedSearchLimit,
+                  gameStartingTimeLimitSeconds: gameStartingTimeLimitSeconds);
     return Search;
   }
 

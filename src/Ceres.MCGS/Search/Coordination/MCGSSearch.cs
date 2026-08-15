@@ -123,6 +123,8 @@ public partial class MCGSSearch
   /// <param name="progressCallback"></param>
   /// <param name="isFirstMoveOfGame"></param>
   /// <param name="fixedSearchLimit"></param>
+  /// <param name="gameStartingTimeLimitSeconds">starting time control of the current game (seconds),
+  /// or null if unknown/not time-based; used only to resolve the default move overhead</param>
   public void Search(NNEvaluatorSet nnEvaluators,
                      Graph graphToPossiblyReuse,
                      WorkerPool<ExtendPathsWorkerInfo>[] selectWorkerPools,
@@ -139,7 +141,8 @@ public partial class MCGSSearch
                      bool isFirstMoveOfGame = false,
                      bool moveImmediateIfOnlyOneMove = false,
                      MGMove forcedMove = default,
-                     SearchLimit fixedSearchLimit = null)
+                     SearchLimit fixedSearchLimit = null,
+                     float? gameStartingTimeLimitSeconds = null)
   {
     if (searchLimit == null)
     {
@@ -224,6 +227,10 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
                                                         out GraphRootToSearchRootNodeInfo searchRootNodeInfo,
                                                         out List<GraphRootToSearchRootNodeInfo> searchRootPathFromGraphRoot);
 
+    // Resolve the move overhead in effect for this game (a fixed value for the whole game,
+    // determined by the starting time control rather than the dwindling remaining clock).
+    float moveOverheadSeconds = EffectiveMoveOverheadSeconds(paramsSearch, gameStartingTimeLimitSeconds);
+
     SearchLimit searchLimitToUse;
     ManagerGameLimitInputs gameLimitsInputs = null;
     ManagerGameLimitOutputs gameLimitsOutputs = null;
@@ -241,7 +248,7 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
       gameLimitsInputs = new(priorMoves.FinalPosition,
                            paramsSearch, gameMoveHistory,
                            targetType, searchRootNodeN, (float)searchRootNodeQ,
-                           ClockAfterMoveOverheadReserve(searchLimit, paramsSearch), searchLimit.ValueIncrement,
+                           ClockAfterMoveOverheadReserve(searchLimit, moveOverheadSeconds), searchLimit.ValueIncrement,
                            searchLimit.MaxTreeNodes, searchLimit.MaxTreeVisits,
                            float.NaN, float.NaN,
                            maxMovesToGo: searchLimit.MaxMovesToGo,
@@ -256,7 +263,7 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
     // budget, since the move is expected back within that budget. For a per-game clock the reserve
     // was instead taken once from the remaining time fed to the allocation above (a standing buffer
     // of about MoveOverheadSeconds maintained on the clock, costing each move only overhead/movesToGo).
-    searchLimitToUse = AdjustedPerMoveSearchLimit(searchLimitToUse, paramsSearch,
+    searchLimitToUse = AdjustedPerMoveSearchLimit(searchLimitToUse, moveOverheadSeconds,
                                                   applyMoveOverhead: !searchLimit.IsPerGameLimit);
 
 
@@ -335,7 +342,7 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
       ManagerGameLimitInputs coldInputs = new(priorMoves.FinalPosition,
                            paramsSearch, gameMoveHistory,
                            coldTargetType, 0, 0f,
-                           ClockAfterMoveOverheadReserve(searchLimit, paramsSearch), searchLimit.ValueIncrement,
+                           ClockAfterMoveOverheadReserve(searchLimit, moveOverheadSeconds), searchLimit.ValueIncrement,
                            searchLimit.MaxTreeNodes, searchLimit.MaxTreeVisits,
                            float.NaN, float.NaN,
                            maxMovesToGo: searchLimit.MaxMovesToGo,
@@ -352,7 +359,7 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
         + $"(was sized for warm root N={gameLimitsInputs.RootN:N0}).");
       }
 
-      searchLimitToUse = AdjustedPerMoveSearchLimit(coldOutputs.LimitTarget, paramsSearch,
+      searchLimitToUse = AdjustedPerMoveSearchLimit(coldOutputs.LimitTarget, moveOverheadSeconds,
                                                     applyMoveOverhead: false);
       Manager.OverrideSearchLimit(searchLimitToUse, coldInputs, coldOutputs);
     }
@@ -504,10 +511,46 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
 
 
   /// <summary>
+  /// Returns the move overhead (seconds) in effect for a game, given the configured value and the
+  /// starting time control of the game.
+  ///
+  /// The configured value (ParamsSearch.MoveOverheadSeconds) is used as-is unless it is still at its
+  /// default, in which case a game played under a short time control (a time-based search limit with
+  /// a starting value below MOVE_OVERHEAD_SHORT_TIME_CONTROL_THRESHOLD_SECONDS) instead receives the
+  /// smaller MOVE_OVERHEAD_SECONDS_SHORT_TIME_CONTROL, since the full default reserve would consume
+  /// an excessive fraction of such a game's time. An explicitly configured overhead (e.g. set by a
+  /// GUI via UCI MoveOverheadMs) is never overridden.
+  ///
+  /// The test is against the starting time control of the game (not the remaining clock), so the
+  /// overhead in effect is constant across all moves of a game.
+  /// </summary>
+  /// <param name="paramsSearch"></param>
+  /// <param name="gameStartingTimeLimitSeconds">starting value of the game's time-based search limit,
+  /// or null if unknown or the limit is not time-based</param>
+  /// <returns></returns>
+  static float EffectiveMoveOverheadSeconds(ParamsSearch paramsSearch, float? gameStartingTimeLimitSeconds)
+  {
+    bool isConfiguredValueDefault = paramsSearch.MoveOverheadSeconds == ParamsSearch.MOVE_OVERHEAD_SECONDS_DEFAULT;
+    bool isShortTimeControl = gameStartingTimeLimitSeconds is float startingSeconds
+                           && startingSeconds > 0
+                           && startingSeconds < ParamsSearch.MOVE_OVERHEAD_SHORT_TIME_CONTROL_THRESHOLD_SECONDS;
+
+    // If we have a starting time limit, carve out very small fraction as extra padding
+    // (insurance against long GC pauses possible with long games).
+    const float FRAC_START_TIME_PADDING = 0.002f;
+    const float MAX_EXTRA_PADDING_SECONDS = 10f;  
+    float extraPaddingSeconds = gameStartingTimeLimitSeconds is float ? ((float)gameStartingTimeLimitSeconds * FRAC_START_TIME_PADDING) : 0;
+    extraPaddingSeconds = Math.Min(10, MAX_EXTRA_PADDING_SECONDS);
+    return isConfiguredValueDefault && isShortTimeControl ? ParamsSearch.MOVE_OVERHEAD_SECONDS_SHORT_TIME_CONTROL
+                                                          : (paramsSearch.MoveOverheadSeconds + extraPaddingSeconds);
+  }
+
+
+  /// <summary>
   /// Returns the specified per-move search limit adjusted for actual execution:
   ///
-  ///   - if applyMoveOverhead, the configured move overhead (ParamsSearch.MoveOverheadSeconds,
-  ///     settable via the UCI MoveOverheadMs option) is held back from a time limit, so that the
+  ///   - if applyMoveOverhead, the move overhead in effect (see EffectiveMoveOverheadSeconds)
+  ///     is held back from a time limit, so that the
   ///     time spent emitting the move and any GUI/network latency do not push the move past its
   ///     allotted time. The reserve is capped at half of the allotted time so that a short search
   ///     (e.g. a "go movetime 100" analysis probe, where the overhead exceeds the whole budget) is
@@ -522,11 +565,11 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
   ///     (see MCGSManager.CalcSearchStopStatus).
   /// </summary>
   /// <param name="limit">The per-move limit about to be searched.</param>
-  /// <param name="paramsSearch"></param>
+  /// <param name="moveOverheadSeconds">The move overhead in effect (see EffectiveMoveOverheadSeconds).</param>
   /// <param name="applyMoveOverhead">If the move overhead should be held back from this limit
   /// (false when the limit came from a per-game clock which was already reserved against).</param>
   /// <returns></returns>
-  static SearchLimit AdjustedPerMoveSearchLimit(SearchLimit limit, ParamsSearch paramsSearch,
+  static SearchLimit AdjustedPerMoveSearchLimit(SearchLimit limit, float moveOverheadSeconds,
                                                 bool applyMoveOverhead)
   {
     if (limit.MaxTreeNodes is null && CeresUserSettingsManager.Settings.MaxTreeNodes is not null)
@@ -534,7 +577,7 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
       limit = limit with { MaxTreeNodes = CeresUserSettingsManager.Settings.MaxTreeNodes };
     }
 
-    if (!applyMoveOverhead || !limit.IsTimeLimit || paramsSearch.MoveOverheadSeconds <= 0 || limit.Value <= 0)
+    if (!applyMoveOverhead || !limit.IsTimeLimit || moveOverheadSeconds <= 0 || limit.Value <= 0)
     {
       return limit;
     }
@@ -542,31 +585,31 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
     const float MIN_SEARCH_SECONDS = 0.01f;
     const float MAX_FRACTION_RESERVED = 0.5f;
 
-    float overhead = Math.Min(paramsSearch.MoveOverheadSeconds, MAX_FRACTION_RESERVED * limit.Value);
+    float overhead = Math.Min(moveOverheadSeconds, MAX_FRACTION_RESERVED * limit.Value);
     return limit with { Value = Math.Max(MIN_SEARCH_SECONDS, limit.Value - overhead) };
   }
 
 
   /// <summary>
-  /// Returns the remaining game clock time of the specified per-game limit less the configured
-  /// move overhead (ParamsSearch.MoveOverheadSeconds, settable via the UCI MoveOverheadMs option).
+  /// Returns the remaining game clock time of the specified per-game limit less the
+  /// move overhead in effect (see EffectiveMoveOverheadSeconds).
   ///
   /// Reserving once from the clock (rather than from every per-move allocation) maintains a
-  /// standing buffer of about MoveOverheadSeconds against move emission and GUI/network latency.
+  /// standing buffer of about the move overhead against move emission and GUI/network latency.
   /// </summary>
   /// <param name="searchLimit">A per-game limit whose Value is the remaining clock time.</param>
-  /// <param name="paramsSearch"></param>
+  /// <param name="moveOverheadSeconds">The move overhead in effect (see EffectiveMoveOverheadSeconds).</param>
   /// <returns></returns>
-  static float ClockAfterMoveOverheadReserve(SearchLimit searchLimit, ParamsSearch paramsSearch)
+  static float ClockAfterMoveOverheadReserve(SearchLimit searchLimit, float moveOverheadSeconds)
   {
-    if (!searchLimit.IsTimeLimit || paramsSearch.MoveOverheadSeconds <= 0 || searchLimit.Value <= 0)
+    if (!searchLimit.IsTimeLimit || moveOverheadSeconds <= 0 || searchLimit.Value <= 0)
     {
       return searchLimit.Value;
     }
 
     const float MAX_FRACTION_RESERVED = 0.5f;
 
-    float reserve = Math.Min(paramsSearch.MoveOverheadSeconds, MAX_FRACTION_RESERVED * searchLimit.Value);
+    float reserve = Math.Min(moveOverheadSeconds, MAX_FRACTION_RESERVED * searchLimit.Value);
     return searchLimit.Value - reserve;
   }
 }
