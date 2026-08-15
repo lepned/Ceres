@@ -1251,6 +1251,16 @@ public class MCGSSelect
     public bool wasIrreversibleMove;
     public bool positionDuplicate;
     public bool isDrawByRepetitionInCoalesceMode;
+
+    /// <summary>
+    /// (PositionEquivalence mode only) The path-carried rule-50 clock reached 100 at this child,
+    /// so THIS path terminates here as a draw. Like isDrawByRepetitionInCoalesceMode this is a
+    /// property of the path, not the board, and must never be cached on the (position-keyed)
+    /// edge or node. Kept separate from that flag because it must NOT preempt board-level
+    /// terminal outcomes (a mating move takes precedence over the 50-move rule): consumers
+    /// honor it only after the checkmate/terminal checks have not fired.
+    /// </summary>
+    public bool isRule50DrawInCoalesceMode;
   }
 
 
@@ -1300,6 +1310,7 @@ public class MCGSSelect
     // Update repetition count in position (including considering prehistory)
     info.positionDuplicate = path.HashFoundInHistoryOrPrehistory(info.childPositionHash64);
     info.isDrawByRepetitionInCoalesceMode = info.positionDuplicate && path.PathMode == PathMode.PositionEquivalence;
+    info.isRule50DrawInCoalesceMode = info.childPos.Rule50Count >= 100 && path.PathMode == PathMode.PositionEquivalence;
     info.childPos.RepetitionCount = (byte)(info.positionDuplicate ? 1 : 0);
 
     return info;
@@ -1356,8 +1367,12 @@ public class MCGSSelect
                               childPosInfo.wasIrreversibleMove, childVisitCounts, childIndex, false,
                               childPosInfo.moveMG);
     }
-    else if (childPosInfo.isDrawByRepetitionInCoalesceMode)
+    else if (childPosInfo.isDrawByRepetitionInCoalesceMode || childPosInfo.isRule50DrawInCoalesceMode)
     {
+      // N.B. the rule-50 case is deliberately checked only after the terminal edge/node checks
+      // above (a board-level mate takes precedence over the 50-move rule). Both kinds are
+      // path-local draws: the draw is recorded against this path's visit only, never on the
+      // position-keyed edge or node.
       TerminatePathAndAddToSet(path, pathsSet, MCGSPathTerminationReason.DrawByRepetitionInCoalesceMode,
                               numVisitsRemaining, numVisitsThisChild, childPosInfo.childPositionHash96,
                               childPosInfo.wasIrreversibleMove, childVisitCounts, childIndex, true,
@@ -1438,11 +1453,23 @@ public class MCGSSelect
 
     // Determine if game result can be immediately determined (various mate and draw conditions).
     const bool possiblyUseTablebase = true;
-    (GameResult result, float v, float d, bool wasDrawByRepetition) resultInfo =
+    (GameResult result, float v, float d, bool wasDrawByRepetition, bool wasDrawByRule50) resultInfo =
       path.CalcPathTerminationFromUnexpandedLeaf(minRepetitionCountForDraw, in childPosInfo.childPos, childMoves, possiblyUseTablebase);
 
+    // Rule-50 draws are history-sensitive in exactly the way repetition draws are: the clock
+    // is a property of the path that reached this board, not of the board itself. In coalesce
+    // mode a terminal draw edge minted from one (deep) path whose clock reached 100 would be
+    // permanently wrong for every other path through this board-coalesced node - and, being
+    // position-keyed, would survive graph reuse into later searches where the actual game
+    // clock is lower (where the false Q=0 "draw" can then be selected as the best move).
+    // Route such draws through the same path-local draw handling used for repetitions.
+    if (resultInfo.wasDrawByRule50 && path.PathMode == PathMode.PositionEquivalence)
+    {
+      childPosInfo.isDrawByRepetitionInCoalesceMode = true;
+    }
+
     // In coalesce mode we must not create terminal draw edges for repetitions
-    // because other visits via other paths may not be draws.
+    // (or rule-50 draws, converted above) because other visits via other paths may not be draws.
     if (resultInfo.result != GameResult.Unknown && !childPosInfo.isDrawByRepetitionInCoalesceMode)
     {
       DoTerminalUnexpandedChild(path, pathsSet, parentNode, childIndex,
@@ -1470,7 +1497,7 @@ public class MCGSSelect
                                             ref ChildPositionInfo childPosInfo, MGMoveList childMoves,
                                             Span<short> childVisitCounts, int numVisitsThisChild,
                                             int numVisitsRemaining,
-                                            (GameResult result, float v, float d, bool wasDrawByRepetition) resultInfo)
+                                            (GameResult result, float v, float d, bool wasDrawByRepetition, bool wasDrawByRule50) resultInfo)
   {
     Debug.Assert(!float.IsNaN(resultInfo.v) && !float.IsNaN(resultInfo.d));
 
@@ -1483,10 +1510,11 @@ public class MCGSSelect
 
     bool propagateAsDraw = resultInfo.v == 0;
     // Repetition and 50-move-rule draws are history-sensitive (valid only for histories like
-    // the current one); record the kind on the edge. The result tuple alone cannot distinguish
-    // the rule50 case from stalemate, so classify here where the child position is in hand.
-    bool historySensitiveDraw = resultInfo.wasDrawByRepetition
-                             || (resultInfo.result == GameResult.Draw && childPosInfo.childPos.Rule50Count >= 100);
+    // the current one); record the kind on the edge. N.B. in PositionEquivalence mode neither
+    // kind can reach here (both are diverted to the path-local coalesce draw handling by
+    // ProcessUnexpandedChild), so history-sensitive terminal edges arise only in
+    // PositionAndHistoryEquivalence mode, where node identity includes the history.
+    bool historySensitiveDraw = resultInfo.wasDrawByRepetition || resultInfo.wasDrawByRule50;
     GEdge newEdge = path.Graph.AddNewTerminalEdge(parentNode, childIndex, resultInfo.v, resultInfo.d,
                                                    numVisitsThisChild, propagateAsDraw, historySensitiveDraw);
     newVisit.ParentChildEdge = newEdge;

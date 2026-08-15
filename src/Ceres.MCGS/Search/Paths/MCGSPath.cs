@@ -990,10 +990,14 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
   }
 
   /// <summary>
-  /// Determines the termination state of a path based 
+  /// Determines the termination state of a path based
   /// on the position and move list of an unexpanded leaf node.
+  /// The two history-sensitive draw kinds (repetition and 50-move rule) are reported
+  /// separately from history-free results: both are properties of the PATH that reached
+  /// the position (its history / its rule-50 clock), not of the board itself, so callers
+  /// in PositionEquivalence mode must not cache them on position-keyed graph objects.
   /// </summary>
-  internal (GameResult result, float v, float d, bool drawByRepetition)
+  internal (GameResult result, float v, float d, bool drawByRepetition, bool drawByRule50)
     CalcPathTerminationFromUnexpandedLeaf(int minRepetitionCountForDraw,
                                          in MGPosition childPos,
                                          MGMoveList childMoves,
@@ -1003,25 +1007,25 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
     {
       if (MGMoveGen.IsInCheck(in childPos, childPos.BlackToMove))// TODO: is there a flag set already by the GenerateMoves above?
       {
-        return (GameResult.Checkmate, -1, 0, false);
+        return (GameResult.Checkmate, -1, 0, false, false);
       }
       else
       {
         // No moves available, game is a draw by stalemate
-        return (GameResult.Draw, 0, 1, false);
+        return (GameResult.Draw, 0, 1, false, false);
       }
     }
     else if (childPos.CheckDrawBasedOnMaterial == Position.PositionDrawStatus.DrawByInsufficientMaterial)
     {
-      return (GameResult.Draw, 0, 1, false);
+      return (GameResult.Draw, 0, 1, false, false);
     }
     else if (childPos.Rule50Count >= 100)
     {
-      return (GameResult.Draw, 0, 1, false);
+      return (GameResult.Draw, 0, 1, false, true);
     }
     else if (childPos.RepetitionCount >= minRepetitionCountForDraw)
     {
-      return (GameResult.Draw, 0, 1, true);
+      return (GameResult.Draw, 0, 1, true, false);
     }
     else if (possiblyUseTablebase && childPos.PieceCount <= Engine.Manager.evaluatorTB?.MaxCardinality)
     {
@@ -1029,17 +1033,17 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
       bool foundInTB = Engine.Manager.evaluatorTB.Lookup(this, childPos.ToPosition, ref terminationInfo);
       if (foundInTB)
       {
-        return (terminationInfo.GameResult, terminationInfo.V, terminationInfo.DrawP, false);
+        return (terminationInfo.GameResult, terminationInfo.V, terminationInfo.DrawP, false, false);
       }
     }
     else if (possiblyUseTablebase && TryGetTablebasePly1Termination(in childPos, childMoves, out float tbV, out float tbD))
     {
       // Ply-1 tablebase extension: position has one more piece than tablebase covers,
       // but a capture move exists that leads to a tablebase-proven win.
-      return (GameResult.Checkmate, tbV, tbD, false);
+      return (GameResult.Checkmate, tbV, tbD, false, false);
     }
 
-    return (GameResult.Unknown, float.NaN, float.NaN, false);
+    return (GameResult.Unknown, float.NaN, float.NaN, false, false);
   }
 
 

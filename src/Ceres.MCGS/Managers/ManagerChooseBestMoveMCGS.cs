@@ -27,6 +27,7 @@ using Ceres.MCGS.Graphs.GEdges;
 using Ceres.MCGS.Graphs.GNodes;
 using Ceres.MCGS.Search.Coordination;
 using Ceres.MCGS.Search.Params;
+using Ceres.MCGS.Search.Paths;
 using Ceres.MCGS.Search.RPO;
 
 #endregion
@@ -323,13 +324,45 @@ public class ManagerChooseBestMoveMCGS
     bool MoveAtIndexAllowed(int childIndex) => Node.ChildEdgeAtIndex(childIndex).N > 0
                                             && Manager.TerminationManager.MoveAtIndexAllowed(childIndex);
 
+    // Defensive guard (PositionEquivalence mode): disqualify child edges carrying a STALE
+    // history-sensitive terminal draw verdict - a TerminalEdgeDrawn edge minted for a
+    // repetition/50-move draw (NDrawByRepetition sentinel) whose draw claim is not supported
+    // by the actual current game context. Such verdicts can be inherited through
+    // position-keyed graph reuse from a path/search where the draw was genuine; trusting
+    // their Q=0 here can convert the decision into a catastrophic blunder (the claimed
+    // "draw" may actually lose by force). Skipped when no other visited candidate would
+    // remain (then normal selection proceeds unchanged).
+    bool haveStaleTerminalDraws = false;
+    if (Node.IsSearchRoot
+     && Manager.ParamsSearch.PathTranspositionMode == PathMode.PositionEquivalence)
+    {
+      bool anyValidCandidate = false;
+      foreach (GEdge edge in Node.ChildEdgesExpanded)
+      {
+        bool stale = IsStaleHistorySensitiveTerminalDraw(position, edge);
+        haveStaleTerminalDraws |= stale;
+        anyValidCandidate |= !stale && edge.N > 0;
+      }
+
+      haveStaleTerminalDraws &= anyValidCandidate;
+      if (haveStaleTerminalDraws && IsActualMoveSelection)
+      {
+        ConsoleUtils.WriteLineColored(ConsoleColor.Red,
+          "WARNING: excluding move(s) claiming a terminal draw (repetition/rule-50) not supported by "
+        + "the actual game history from best move selection at root " + position.ToPosition.FEN);
+      }
+    }
+
+    bool EdgeAllowed(GEdge edge) => MoveAtIndexAllowed(edge.ParentNode.IndexOfChildInChildEdges(edge.ChildNodeIndex))
+                                 && (!haveStaleTerminalDraws || !IsStaleHistorySensitiveTerminalDraw(position, edge));
+
     // Get nodes sorted by N and Q (with most attractive move into beginning of array)
     // Note that the sort on N is augmented with an additional term based on Q so that tied N leads to lower Q preferred.
     // Also note that if a child is not allowed (filtered out by SearchMoves) then the move goes at the end).
-    GEdge[] childrenSortedN = Node.EdgesSorted(edge => MoveAtIndexAllowed(edge.ParentNode.IndexOfChildInChildEdges(edge.ChildNodeIndex))
+    GEdge[] childrenSortedN = Node.EdgesSorted(edge => EdgeAllowed(edge)
                                 ? (-edge.N + (float)edge.Q * 0.1f)
                                 : 0);
-    GEdge[] edgesSortedQ = Node.EdgesSorted(edge => MoveAtIndexAllowed(edge.ParentNode.IndexOfChildInChildEdges(edge.ChildNodeIndex))
+    GEdge[] edgesSortedQ = Node.EdgesSorted(edge => EdgeAllowed(edge)
                              ? (float)edge.Q : float.MaxValue);
 
     GEdge priorBest = edgesSortedQ[0];
@@ -417,6 +450,44 @@ public class ManagerChooseBestMoveMCGS
     {
       throw new Exception("Internal error, unknown BestMoveMode");
     }
+  }
+
+
+  /// <summary>
+  /// Returns true if the edge carries a history-sensitive terminal draw verdict (a
+  /// TerminalEdgeDrawn edge minted for a repetition or 50-move-rule draw, marked by the
+  /// NDrawByRepetition sentinel) that is NOT supported by the actual current game context:
+  /// the position after the move neither reaches a 100-ply rule-50 clock nor repeats a
+  /// position from the game history / graph-root-to-search-root spine. Such stale verdicts
+  /// can be inherited through position-keyed graph reuse from a path where the draw was
+  /// genuine (see the guard in DoCalcBestMove).
+  /// </summary>
+  private bool IsStaleHistorySensitiveTerminalDraw(MGPosition position, GEdge edge)
+  {
+    if (edge.Type != GEdgeStruct.EdgeType.TerminalEdgeDrawn || edge.NDrawByRepetition == 0)
+    {
+      return false;
+    }
+
+    MGPosition posAfterMove = position;
+    posAfterMove.MakeMove(edge.MoveMGFromPos(in position));
+
+    // Genuine 50-move-rule draw in the current context?
+    if (posAfterMove.Rule50Count >= 100)
+    {
+      return false;
+    }
+
+    // Genuine repetition draw (position after the move already present in the
+    // game history or the graph-root-to-search-root spine)?
+    bool haveSeenRepetition = false;
+    if (MCGSPath.HashFoundInGraphRootPathOrPrehistory(Node.Graph, Manager.Engine.SearchRootPathFromGraphRoot,
+                                                      MGPositionHashing.Hash64(in posAfterMove), ref haveSeenRepetition))
+    {
+      return false;
+    }
+
+    return true;
   }
 
 
