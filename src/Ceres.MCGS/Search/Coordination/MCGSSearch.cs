@@ -241,7 +241,7 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
       gameLimitsInputs = new(priorMoves.FinalPosition,
                            paramsSearch, gameMoveHistory,
                            targetType, searchRootNodeN, (float)searchRootNodeQ,
-                           searchLimit.Value, searchLimit.ValueIncrement,
+                           ClockAfterMoveOverheadReserve(searchLimit, paramsSearch), searchLimit.ValueIncrement,
                            searchLimit.MaxTreeNodes, searchLimit.MaxTreeVisits,
                            float.NaN, float.NaN,
                            maxMovesToGo: searchLimit.MaxMovesToGo,
@@ -252,11 +252,12 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
     }
 
     // Hold back the configured move overhead (UCI MoveOverheadMs) from the time actually searched.
-    // Applied here, to the PER-MOVE limit, rather than to the incoming limit: the reserve compensates
-    // for fixed per-move latency (move emission, GUI/network lag), so subtracting it from a per-game
-    // clock before the allocation above would spread it across all remaining moves and reserve
-    // essentially nothing for any one of them.
-    searchLimitToUse = AdjustedPerMoveSearchLimit(searchLimitToUse, paramsSearch);
+    // For a true per-move limit (e.g. "go movetime") the overhead is reserved from this move's
+    // budget, since the move is expected back within that budget. For a per-game clock the reserve
+    // was instead taken once from the remaining time fed to the allocation above (a standing buffer
+    // of about MoveOverheadSeconds maintained on the clock, costing each move only overhead/movesToGo).
+    searchLimitToUse = AdjustedPerMoveSearchLimit(searchLimitToUse, paramsSearch,
+                                                  applyMoveOverhead: !searchLimit.IsPerGameLimit);
 
 
     List<MGMove> searchMovesTablebaseRestricted = null;
@@ -334,7 +335,7 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
       ManagerGameLimitInputs coldInputs = new(priorMoves.FinalPosition,
                            paramsSearch, gameMoveHistory,
                            coldTargetType, 0, 0f,
-                           searchLimit.Value, searchLimit.ValueIncrement,
+                           ClockAfterMoveOverheadReserve(searchLimit, paramsSearch), searchLimit.ValueIncrement,
                            searchLimit.MaxTreeNodes, searchLimit.MaxTreeVisits,
                            float.NaN, float.NaN,
                            maxMovesToGo: searchLimit.MaxMovesToGo,
@@ -351,7 +352,8 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
         + $"(was sized for warm root N={gameLimitsInputs.RootN:N0}).");
       }
 
-      searchLimitToUse = AdjustedPerMoveSearchLimit(coldOutputs.LimitTarget, paramsSearch);
+      searchLimitToUse = AdjustedPerMoveSearchLimit(coldOutputs.LimitTarget, paramsSearch,
+                                                    applyMoveOverhead: false);
       Manager.OverrideSearchLimit(searchLimitToUse, coldInputs, coldOutputs);
     }
 
@@ -504,12 +506,14 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
   /// <summary>
   /// Returns the specified per-move search limit adjusted for actual execution:
   ///
-  ///   - the configured move overhead (ParamsSearch.MoveOverheadSeconds, settable via the UCI
-  ///     MoveOverheadMs option) is held back from a time limit, so that the time spent emitting
-  ///     the move and any GUI/network latency do not push the move past its allotted time.
-  ///     The reserve is capped at half of the allotted time so that a short search (e.g. a
-  ///     "go movetime 100" analysis probe, where the overhead exceeds the whole budget) is
+  ///   - if applyMoveOverhead, the configured move overhead (ParamsSearch.MoveOverheadSeconds,
+  ///     settable via the UCI MoveOverheadMs option) is held back from a time limit, so that the
+  ///     time spent emitting the move and any GUI/network latency do not push the move past its
+  ///     allotted time. The reserve is capped at half of the allotted time so that a short search
+  ///     (e.g. a "go movetime 100" analysis probe, where the overhead exceeds the whole budget) is
   ///     shortened proportionally rather than collapsed to nothing.
+  ///     This applies only to true per-move limits; a limit allocated from a per-game clock has the
+  ///     overhead reserved once on the clock instead (see ClockAfterMoveOverheadReserve).
   ///
   ///   - any MaxTreeNodes configured in Ceres.json is installed if the limit does not already
   ///     carry an explicit value (the UCI layer applies this setting itself; this covers the
@@ -519,15 +523,18 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
   /// </summary>
   /// <param name="limit">The per-move limit about to be searched.</param>
   /// <param name="paramsSearch"></param>
+  /// <param name="applyMoveOverhead">If the move overhead should be held back from this limit
+  /// (false when the limit came from a per-game clock which was already reserved against).</param>
   /// <returns></returns>
-  static SearchLimit AdjustedPerMoveSearchLimit(SearchLimit limit, ParamsSearch paramsSearch)
+  static SearchLimit AdjustedPerMoveSearchLimit(SearchLimit limit, ParamsSearch paramsSearch,
+                                                bool applyMoveOverhead)
   {
     if (limit.MaxTreeNodes is null && CeresUserSettingsManager.Settings.MaxTreeNodes is not null)
     {
       limit = limit with { MaxTreeNodes = CeresUserSettingsManager.Settings.MaxTreeNodes };
     }
 
-    if (!limit.IsTimeLimit || paramsSearch.MoveOverheadSeconds <= 0 || limit.Value <= 0)
+    if (!applyMoveOverhead || !limit.IsTimeLimit || paramsSearch.MoveOverheadSeconds <= 0 || limit.Value <= 0)
     {
       return limit;
     }
@@ -537,5 +544,29 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
 
     float overhead = Math.Min(paramsSearch.MoveOverheadSeconds, MAX_FRACTION_RESERVED * limit.Value);
     return limit with { Value = Math.Max(MIN_SEARCH_SECONDS, limit.Value - overhead) };
+  }
+
+
+  /// <summary>
+  /// Returns the remaining game clock time of the specified per-game limit less the configured
+  /// move overhead (ParamsSearch.MoveOverheadSeconds, settable via the UCI MoveOverheadMs option).
+  ///
+  /// Reserving once from the clock (rather than from every per-move allocation) maintains a
+  /// standing buffer of about MoveOverheadSeconds against move emission and GUI/network latency.
+  /// </summary>
+  /// <param name="searchLimit">A per-game limit whose Value is the remaining clock time.</param>
+  /// <param name="paramsSearch"></param>
+  /// <returns></returns>
+  static float ClockAfterMoveOverheadReserve(SearchLimit searchLimit, ParamsSearch paramsSearch)
+  {
+    if (!searchLimit.IsTimeLimit || paramsSearch.MoveOverheadSeconds <= 0 || searchLimit.Value <= 0)
+    {
+      return searchLimit.Value;
+    }
+
+    const float MAX_FRACTION_RESERVED = 0.5f;
+
+    float reserve = Math.Min(paramsSearch.MoveOverheadSeconds, MAX_FRACTION_RESERVED * searchLimit.Value);
+    return searchLimit.Value - reserve;
   }
 }
