@@ -24,19 +24,21 @@ namespace Ceres.MCGS.Graphs.GParents;
 /// <summary>
 /// Store of segments containing parent details for nodes with multiple parents.
 /// Now implemented on top of MemoryBufferOSBlocked to manage segments.
-/// Each allocated segment spans a block of memory of fixed size,
-/// determined by GParentDetailsStruct.MAX_ENTRIES_PER_SEGMENT.
+/// Each buffer ELEMENT is one complete segment: GParentsDetailsStruct is itself a fixed-size
+/// struct of MAX_ENTRIES_PER_SEGMENT entries. Therefore the blocking factor is 1 (one item
+/// per allocation), and segment indices are item indices.
 /// This version uses incremental allocation and an overallocation factor to reduce OS calls.
 /// </summary>
 internal class GParentsDetailStore : MemoryBufferOSBlocked<GParentsDetailsStruct>
 {
   /// <summary>
-  /// The block (segment) size is defined as the maximum number of entries per segment.
-  /// </summary>
-  public const int SEGMENT_BLOCK_SIZE = GParentsDetailsStruct.MAX_ENTRIES_PER_SEGMENT;
+  /// Number of items (segments) per allocation block. Must be 1: the element type is already a
+  /// whole segment, and SegmentRef addresses segments by ITEM index.
+  public const int SEGMENT_BLOCK_SIZE = 1;
 
   /// <summary>
-  /// Extra segments allocated beyond the expected maximum (optional, here set to zero).
+  /// Extra segments reserved beyond the expected maximum (also used by the base class as the
+  /// incremental-commit padding granularity; at 32 bytes/segment this is ~5 MB).
   /// </summary>
   const int SEGMENTS_EXTRA = 160 * 1024;
 
@@ -80,7 +82,8 @@ internal class GParentsDetailStore : MemoryBufferOSBlocked<GParentsDetailsStruct
   /// </summary>
   internal int AllocateSegment()
   {
-    // Allocate one segment (i.e. one block of SEGMENT_BLOCK_SIZE items)
+    // Allocate one segment (one item; with the blocking factor of 1 the returned block index
+    // is identical to the item index used by SegmentRef).
     return (int)AllocateEntriesStartBlock(1);
   }
 
