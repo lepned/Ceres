@@ -468,7 +468,7 @@ namespace Ceres.Features.Tournaments
 
       UpdateStatsAndOutputSummaryFromGameResult(pgnFileName, engine2White, openingIndex, gameSequenceNum, thisResult);
 
-      if (Def.MiniLogFiles != MiniLogFilesMode.Never && CeresUserSettingsManager.Settings.EnableMiniLog)
+      if (Def.MiniLogFiles != MiniLogFilesMode.Never)
       {
         WriteMiniLogFooterIfApplicable(Run.Engine1, true, engine2White, thisResult);
         WriteMiniLogFooterIfApplicable(Run.Engine2, false, engine2White, thisResult);

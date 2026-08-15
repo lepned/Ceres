@@ -135,7 +135,7 @@ namespace Ceres.Features.Tournaments
     /// Controls whether each participating in-process Ceres MCGS engine writes a per-tournament
     /// diagnostic "minilog" text file (header, one line per move, per-game result footers).
     /// The file shares the PGN base name with a ".{engineID}.minilog.txt" suffix (with a companion
-    /// ".{engineID}.minilog.html" rendering). Globally gated by CeresUserSettings.EnableMiniLog.
+    /// ".{engineID}.minilog.html" rendering).
     /// Defaults to IfLongSearchLimits (write only for engines whose limit implies a long game).
     /// </summary>
     public MiniLogFilesMode MiniLogFiles = MiniLogFilesMode.IfLongSearchLimits;
