@@ -259,6 +259,14 @@ namespace Ceres.Features.Tournaments
     public int ProcessGroupIndex = 0;
 
     /// <summary>
+    /// Number of concurrent game threads running this tournament (1 if not parallel).
+    /// Assigned by TournamentManager onto each per-thread clone before that thread starts.
+    /// Used to decide whether a per-engine minilog must stage whole games before appending, since
+    /// all concurrent threads share one minilog file per engine (as they share one PGN file).
+    /// </summary>
+    public int NumConcurrentGameThreads = 1;
+
+    /// <summary>
     /// Creation time of tournament (use as a unique ID for generating PGN)
     /// </summary>
     public readonly DateTime StartTime;

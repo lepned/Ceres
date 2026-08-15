@@ -430,6 +430,11 @@ namespace Ceres.Features.Tournaments
       {
         TournamentDef tournamentDefClone = Def.Clone();
 
+        // Record the effective concurrency (not the NumConcurrent field, which ignores the
+        // distributed-worker override above) so each game thread knows whether its engines share
+        // their minilog files with the engines of other threads.
+        tournamentDefClone.NumConcurrentGameThreads = numConcurrent;
+
         // Make sure the threads will use either different or pooled evaluators
         if (NumConcurrent > 1)
         {

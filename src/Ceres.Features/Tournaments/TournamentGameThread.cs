@@ -153,12 +153,14 @@ namespace Ceres.Features.Tournaments
       lock (writePGNLock) File.AppendAllText(pgnFileName, "");
 
       // If enabled, initialize each in-process Ceres MCGS engine's per-tournament diagnostic minilog.
-      // The PGN base name is identical across concurrent threads (and the PGN itself is shared via a
-      // lock), so disambiguate the per-engine minilogs by ThreadIndex when more than one thread runs.
+      // The PGN base name is identical across concurrent threads, and so is each minilog name: every
+      // thread's instance of a given engine attaches to one shared, refcounted file, so a tournament
+      // yields a single aggregated minilog per engine just as it yields a single aggregated PGN.
+      // Under concurrency those writers stage whole games and append them atomically (see MCGSMiniLog).
       if (Def.MiniLogFiles != MiniLogFilesMode.Never)
       {
         string pgnBaseNoExt = pgnFileName.EndsWith(".pgn") ? pgnFileName.Substring(0, pgnFileName.Length - 4) : pgnFileName;
-        string threadSuffix = ThreadIndex > 0 ? ".t" + ThreadIndex : "";
+        int numConcurrent = Math.Max(1, Def.NumConcurrentGameThreads);
         for (int i = 0; i < Run.Engines.Length; i++)
         {
           // For IfLongSearchLimits, only engines whose assigned limit implies a long game are logged.
@@ -166,11 +168,26 @@ namespace Ceres.Features.Tournaments
                                  || SearchLimitImpliesLongGame(Def.Engines[i].SearchLimit);
           if (enableForEngine && Run.Engines[i] is GameEngineCeresMCGSInProcess mcgsEngine)
           {
-            string miniLogFileName = pgnBaseNoExt + "." + Run.Engines[i].ID + threadSuffix + ".minilog.txt";
+            // Engine IDs are normally distinct, but AddEngine/AddEngines do not enforce that;
+            // append the engine index if needed so two engines never merge into one file.
+            bool idIsAmbiguous = false;
+            for (int j = 0; j < Run.Engines.Length; j++)
+            {
+              idIsAmbiguous |= j != i && Run.Engines[j].ID == Run.Engines[i].ID;
+            }
+
+            string engineSuffix = Run.Engines[i].ID + (idIsAmbiguous ? "." + i : "");
+            string miniLogFileName = pgnBaseNoExt + "." + engineSuffix + ".minilog.txt";
             string miniLogHtmlFileName = MCGSMiniLog.HtmlFileNameFor(miniLogFileName);
-            mcgsEngine.InitMiniLog(miniLogFileName, Def.Engines[i].SearchLimit);
-            Def.Logger.WriteLine($"{Run.Engines[i].ID} Minilog will be incrementally written to file: {miniLogFileName}"
-                               + $" (with HTML rendering: {miniLogHtmlFileName})");
+            mcgsEngine.InitMiniLog(miniLogFileName, Def.Engines[i].SearchLimit, numConcurrent);
+
+            // Announce once per file, not once per concurrency slot.
+            if (mcgsEngine.MiniLogIsPrimaryWriter)
+            {
+              Def.Logger.WriteLine($"{Run.Engines[i].ID} Minilog will be incrementally written to file: {miniLogFileName}"
+                                 + $" (with HTML rendering: {miniLogHtmlFileName})"
+                                 + (numConcurrent > 1 ? $", aggregating games from {numConcurrent} concurrent threads" : ""));
+            }
           }
         }
       }
@@ -268,13 +285,24 @@ namespace Ceres.Features.Tournaments
       finally
       {
         Def.parentDef.PauseController?.DeregisterActive();
-      }
 
-      // Dispose of all engines.
-      foreach (GameEngine engine in Run.Engines)
-      {
-        engine.Dispose();
-        Run.Engine2CheckEngine?.Dispose();
+        // Dispose of all engines. This must happen even if the game loop threw, otherwise this
+        // thread's minilog writers are never released: the shared file would keep a non-zero
+        // refcount and so never be closed or given its final HTML rendering, and any staged
+        // in-flight game would be lost rather than written out as incomplete.
+        // Guarded so that a failure here cannot mask an exception propagating from the game loop.
+        try
+        {
+          foreach (GameEngine engine in Run.Engines)
+          {
+            engine.Dispose();
+          }
+          Run.Engine2CheckEngine?.Dispose();
+        }
+        catch (Exception excDispose)
+        {
+          ConsoleUtils.WriteLineColored(ConsoleColor.Yellow, "Error disposing engines: " + excDispose.Message);
+        }
       }
     }
 

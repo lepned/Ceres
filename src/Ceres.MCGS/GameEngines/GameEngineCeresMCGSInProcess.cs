@@ -920,14 +920,21 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   /// enabler used by the tournament: calling it activates logging regardless of EmitMiniLog.
   /// Intended to be called once, before the first search. A null file name is ignored.
   /// </summary>
-  public void InitMiniLog(string fileName, SearchLimit assignedSearchLimit)
+  /// <param name="fileName">full path of the minilog file to write</param>
+  /// <param name="assignedSearchLimit">search limit assigned to this engine (recorded in the header)</param>
+  /// <param name="expectedConcurrentWriters">
+  /// number of concurrent game threads whose engine instances share this file (1 = exclusive).
+  /// Greater than one causes whole games to be staged and appended atomically, so that games played
+  /// concurrently do not interleave within the single aggregated file.
+  /// </param>
+  public void InitMiniLog(string fileName, SearchLimit assignedSearchLimit, int expectedConcurrentWriters = 1)
   {
     if (fileName == null || miniLog != null)
     {
       return;
     }
 
-    miniLog = new MCGSMiniLog(fileName);
+    miniLog = MCGSMiniLog.Acquire(fileName, expectedConcurrentWriters);
     miniLog.WriteHeader(ID, EvaluatorDef, assignedSearchLimit, SearchParams, SelectParams);
 
     // Tournament path enables logging here (regardless of EmitMiniLog); make sure the limit manager
@@ -953,6 +960,13 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   /// True if a diagnostic minilog is currently being written by this engine.
   /// </summary>
   public bool IsMiniLogActive => miniLog != null;
+
+
+  /// <summary>
+  /// True if this engine created its minilog file, rather than attaching to a file already opened
+  /// by the corresponding engine of another concurrent game thread.
+  /// </summary>
+  public bool MiniLogIsPrimaryWriter => miniLog?.IsPrimaryWriter ?? false;
 
 
   /// <summary>
