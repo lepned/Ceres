@@ -51,6 +51,13 @@ public static class GraphReuseManager
   public const int TRIVIALLY_SMALL_ROOT_N = 1_000_000;
 
   /// <summary>
+  /// One-time flag for the warning issued when a store is too small for the upcoming search but is
+  /// already at its maximum permitted size (so promotion cannot help and the search will instead be
+  /// bounded by the node capacity stop).
+  /// </summary>
+  static bool haveWarnedStoreAtMaxCapacity;
+
+  /// <summary>
   /// Heuristic extraction speed (reachable nodes copied per second) used to estimate extraction cost:
   /// estimated seconds to extract = reachableNodeCount / EXTRACT_NODES_PER_SEC.
   /// Calibrated from observed parallel-extraction throughput (~1M nodes/sec).
@@ -81,6 +88,14 @@ public static class GraphReuseManager
     /// <summary>Copy the subgraph reachable from the search root into a fresh, smaller graph.</summary>
     Extract,
 
+    /// <summary>
+    /// Copy the subgraph reachable from the search root into a fresh graph with LARGER stores,
+    /// because the current (small-tier) stores cannot accommodate the upcoming search.
+    /// Same mechanism as Extract (all evaluations reachable from the search root are preserved);
+    /// only the target store size differs.
+    /// </summary>
+    Promote,
+
     /// <summary>Discard the graph; the next search starts from scratch.</summary>
     Abandon
   }
@@ -104,9 +119,9 @@ public static class GraphReuseManager
 
   static long numReuse;
   static long numExtract;
+  static long numPromote;
   static long numAbandonPolicy;
   static long numAbandonExtractFailed;
-  static long numAbandonStoreTooSmall;
   static long numNotContinuable;
 
   /// <summary>Graphs carried forward unchanged.</summary>
@@ -115,14 +130,15 @@ public static class GraphReuseManager
   /// <summary>Graphs replaced by a smaller extracted copy of the reachable subgraph.</summary>
   public static long NumExtract => Volatile.Read(ref numExtract);
 
+  /// <summary>Graphs copied into LARGER stores because the original (small-tier) stores were too
+  /// small for the upcoming search (all reachable evaluations preserved; nothing discarded).</summary>
+  public static long NumPromote => Volatile.Read(ref numPromote);
+
   /// <summary>Graphs discarded by the memory/utilization policy (see DecideAction).</summary>
   public static long NumAbandonPolicy => Volatile.Read(ref numAbandonPolicy);
 
-  /// <summary>Graphs discarded because a decided extraction did not complete.</summary>
+  /// <summary>Graphs discarded because a decided extraction (or promotion) did not complete.</summary>
   public static long NumAbandonExtractFailed => Volatile.Read(ref numAbandonExtractFailed);
-
-  /// <summary>Graphs discarded because their stores were too small for the upcoming search.</summary>
-  public static long NumAbandonStoreTooSmall => Volatile.Read(ref numAbandonStoreTooSmall);
 
   /// <summary>
   /// Graphs dropped before any reuse decision because they did not continue the current position
@@ -131,14 +147,7 @@ public static class GraphReuseManager
   public static long NumNotContinuable => Volatile.Read(ref numNotContinuable);
 
   /// <summary>Total graphs discarded, by any route.</summary>
-  public static long NumAbandonTotal => NumAbandonPolicy + NumAbandonExtractFailed + NumAbandonStoreTooSmall;
-
-
-  /// <summary>
-  /// Records a graph discarded by the caller (MCGSSearch) because its stores, fixed at creation,
-  /// are too small to accommodate the upcoming search.
-  /// </summary>
-  public static void RecordAbandonStoreTooSmall() => Interlocked.Increment(ref numAbandonStoreTooSmall);
+  public static long NumAbandonTotal => NumAbandonPolicy + NumAbandonExtractFailed;
 
 
   /// <summary>
@@ -149,9 +158,9 @@ public static class GraphReuseManager
   {
     Volatile.Write(ref numReuse, 0);
     Volatile.Write(ref numExtract, 0);
+    Volatile.Write(ref numPromote, 0);
     Volatile.Write(ref numAbandonPolicy, 0);
     Volatile.Write(ref numAbandonExtractFailed, 0);
-    Volatile.Write(ref numAbandonStoreTooSmall, 0);
     Volatile.Write(ref numNotContinuable, 0);
   }
 
@@ -160,8 +169,8 @@ public static class GraphReuseManager
   /// Returns a one-line summary of the cumulative outcome counts.
   /// </summary>
   public static string StatsSummary()
-    => $"[reuse={NumReuse:N0} extract={NumExtract:N0} abandon={NumAbandonTotal:N0}"
-     + $"(policy={NumAbandonPolicy:N0},extractFailed={NumAbandonExtractFailed:N0},storeTooSmall={NumAbandonStoreTooSmall:N0})"
+    => $"[reuse={NumReuse:N0} extract={NumExtract:N0} promote={NumPromote:N0} abandon={NumAbandonTotal:N0}"
+     + $"(policy={NumAbandonPolicy:N0},extractFailed={NumAbandonExtractFailed:N0})"
      + $" notContinuable={NumNotContinuable:N0}]";
 
   #endregion
@@ -250,10 +259,10 @@ public static class GraphReuseManager
 
 
   /// <summary>
-  /// Decides what to do with a reusable graph (reuse / extract / abandon) and carries out the
-  /// decision (disposing the old graph when it is replaced or abandoned). Returns the graph to use
-  /// for the upcoming search: the original graph (reuse), a freshly-extracted smaller graph, or
-  /// null (abandon, or no graph to process).
+  /// Decides what to do with a reusable graph (reuse / extract / promote / abandon) and carries out
+  /// the decision (disposing the old graph when it is replaced or abandoned). Returns the graph to
+  /// use for the upcoming search: the original graph (reuse), a freshly-extracted graph (extract:
+  /// smaller stores' content; promote: larger stores), or null (abandon, or no graph to process).
   /// </summary>
   /// <param name="graph">The reusable graph (its search root is already set), or null.</param>
   /// <param name="searchRootNodeInfo">Info about the search root node.</param>
@@ -261,19 +270,26 @@ public static class GraphReuseManager
   /// <param name="paramsSearch">Search parameters (for the memory budget).</param>
   /// <param name="searchLimit">Current search limit (for the time budget).</param>
   /// <param name="priorMoves">Position+history for the new search root.</param>
+  /// <param name="minStoreNodesNeeded">Estimated node capacity (with headroom) the upcoming search
+  /// requires of the store; 0 to skip the capacity check.</param>
+  /// <param name="promoteTargetMaxNodes">Store size (nodes) to promote to if the store's capacity
+  /// is below <paramref name="minStoreNodesNeeded"/> (normally the full-tier size).</param>
   public static Graph PrepareGraphToUse(Graph graph,
                                         GraphRootToSearchRootNodeInfo searchRootNodeInfo,
                                         ref List<GraphRootToSearchRootNodeInfo> searchRootPathFromGraphRoot,
                                         ParamsSearch paramsSearch,
                                         SearchLimit searchLimit,
-                                        PositionWithHistory priorMoves)
+                                        PositionWithHistory priorMoves,
+                                        long minStoreNodesNeeded = 0,
+                                        int promoteTargetMaxNodes = 0)
   {
     if (graph == null)
     {
       return null;
     }
 
-    ReuseDecision decision = DecideAction(graph, searchRootNodeInfo, paramsSearch, searchLimit);
+    ReuseDecision decision = DecideAction(graph, searchRootNodeInfo, paramsSearch, searchLimit,
+                                          minStoreNodesNeeded, promoteTargetMaxNodes);
     string reason = decision.Reason;
 
     if (decision.Action == GraphReuseAction.Reuse)
@@ -284,17 +300,31 @@ public static class GraphReuseManager
     }
 
     bool extractionFellThrough = false;
-    if (decision.Action == GraphReuseAction.Extract)
+    if (decision.Action == GraphReuseAction.Extract
+     || decision.Action == GraphReuseAction.Promote)
     {
+      bool isPromotion = decision.Action == GraphReuseAction.Promote;
+
       // Reuse the reachable set the decision already enumerated — single BFS, no re-enumeration.
+      // A promotion targets larger stores (the whole point); an ordinary extract keeps the same size.
       GraphExtractor.ExtractResult ex = GraphExtractor.ExtractFromReachable(
-        graph, searchRootNodeInfo.ChildNode.Index, priorMoves, decision.Reachable, decision.ReachabilityCheckSeconds);
+        graph, searchRootNodeInfo.ChildNode.Index, priorMoves, decision.Reachable, decision.ReachabilityCheckSeconds,
+        maxNodesTargetStore: isPromotion ? promoteTargetMaxNodes : -1);
       if (ex.Succeeded)
       {
-        Interlocked.Increment(ref numExtract);
-        LogExtraction(ex, searchRootNodeInfo.ChildNode.N, reason, graph.Store.NodesStore.MaxNodes);
+        if (isPromotion)
+        {
+          Interlocked.Increment(ref numPromote);
+        }
+        else
+        {
+          Interlocked.Increment(ref numExtract);
+        }
+        LogExtraction(ex, searchRootNodeInfo.ChildNode.N, reason,
+                      graph.Store.NodesStore.MaxNodes,
+                      isPromotion ? promoteTargetMaxNodes : -1);
 
-        // Switch over to the new (smaller) graph and dispose the old one. Returning a different
+        // Switch over to the new graph and dispose the old one. Returning a different
         // Graph object is contract-compatible with the caller (it installs whatever is returned);
         // the search root is now the graph root, so clear the path.
         graph.Dispose();
@@ -302,9 +332,11 @@ public static class GraphReuseManager
         return ex.NewGraph;
       }
 
-      // Extraction unexpectedly failed: fall through to abandonment rather than carry an over-budget graph.
+      // Extraction unexpectedly failed: fall through to abandonment rather than carry an over-budget
+      // (or too-small) graph. For the too-small case the caller (MCGSSearch) then creates a fresh
+      // graph sized for the current limits, so capacity is restored either way.
       extractionFellThrough = true;
-      reason = "extraction did not complete; " + reason;
+      reason = (isPromotion ? "promotion (enlarging copy) did not complete; " : "extraction did not complete; ") + reason;
     }
 
     // Abandon (decided, or extraction fell through).
@@ -345,6 +377,8 @@ public static class GraphReuseManager
   /// and copy cost.
   ///
   /// Policy:
+  ///   - store too small for the upcoming search (minStoreNodesNeeded)      -> promote (copy into a
+  ///         larger store), or reuse + capacity-stop when already at maximum size
   ///   - trivially small graph                                              -> reuse
   ///   - memory used &lt; 35%                                               -> reuse
   ///   - memory used &gt; 70% (high): extract if it frees enough (reachableFraction &le;
@@ -358,8 +392,46 @@ public static class GraphReuseManager
     Graph graph,
     GraphRootToSearchRootNodeInfo searchRootNodeInfo,
     ParamsSearch paramsSearch,
-    SearchLimit searchLimit)
+    SearchLimit searchLimit,
+    long minStoreNodesNeeded,
+    int promoteTargetMaxNodes)
   {
+    // Store capacity check FIRST (before the trivially-small / low-memory short-circuits): the
+    // stores are fixed at creation and cannot grow, so if the upcoming search needs more capacity
+    // than the store can ever provide, the graph must be PROMOTED (copied into a larger store,
+    // preserving all reachable evaluations) regardless of how small or memory-cheap it is.
+    // The test is against actual remaining capacity, not the (much larger) size a new graph would
+    // be given, so an increase in search limit does not needlessly copy a graph that still fits.
+    if (minStoreNodesNeeded > 0 && graph.Store.MaxNodes < minStoreNodesNeeded)
+    {
+      if (promoteTargetMaxNodes > graph.Store.MaxNodes)
+      {
+        // Enumerate the full reachable set (un-aborted: the promotion is mandatory, and only
+        // small-tier stores can reach here, so the BFS is cheap). Reused by the copy itself.
+        Stopwatch swPromote = Stopwatch.StartNew();
+        GraphExtractor.ReachableSet reachablePromote =
+          GraphExtractor.EnumerateReachable(graph, searchRootNodeInfo.ChildNode.Index, int.MaxValue);
+        return new ReuseDecision(GraphReuseAction.Promote,
+          $"store capacity {graph.Store.MaxNodes:N0} nodes < ~{minStoreNodesNeeded:N0} needed; "
+        + $"promoting to {promoteTargetMaxNodes:N0}",
+          swPromote.Elapsed.TotalSeconds, reachablePromote.Count, reachablePromote);
+      }
+
+      // Store already at its maximum permitted size: promotion cannot help. Reuse the graph and let
+      // the graceful capacity stop bound the search (MCGSManager.CalcSearchStopStatus /
+      // MaxGraphAllocatedNodesExceeded). Abandoning would be strictly worse: the replacement store
+      // would be subject to the same caps, losing all evaluations each move for nothing.
+      if (!haveWarnedStoreAtMaxCapacity)
+      {
+        haveWarnedStoreAtMaxCapacity = true;
+        ConsoleUtils.WriteLineColored(ConsoleColor.Yellow,
+          $"Graph store at maximum permitted capacity ({graph.Store.MaxNodes:N0} nodes) but search "
+        + $"needs ~{minStoreNodesNeeded:N0}; searches will be bounded by the node capacity stop "
+        + $"(warning issued once).");
+      }
+      return new ReuseDecision(GraphReuseAction.Reuse, null, 0.0, -1, default);
+    }
+
     // Trivially small graph: always reuse (no BFS).
     if (graph.GraphRootNode.N < TRIVIALLY_SMALL_ROOT_N)
     {
@@ -468,18 +540,27 @@ public static class GraphReuseManager
 
 
   /// <summary>
-  /// Logs (unconditionally, in yellow) a one-line summary of a graph EXTRACT decision and its stats.
-  /// When GraphExtractor.LOG_EXTRACT_PHASE_TIMINGS is enabled, also logs a per-phase timing breakdown.
+  /// Logs (unconditionally, in yellow) a one-line summary of a graph EXTRACT or PROMOTE decision
+  /// and its stats. When GraphExtractor.LOG_EXTRACT_PHASE_TIMINGS is enabled, also logs a per-phase
+  /// timing breakdown.
   /// </summary>
-  /// <param name="storeMaxNodes">Node store capacity (unchanged by extraction), so the log shows
-  /// how much headroom the extraction actually recovered.</param>
-  private static void LogExtraction(GraphExtractor.ExtractResult ex, int searchRootN, string reason, int storeMaxNodes)
+  /// <param name="storeMaxNodes">Old node store capacity, so the log shows how much headroom the
+  /// extraction actually recovered.</param>
+  /// <param name="promotedStoreMaxNodes">For a promotion, the NEW (larger) store capacity; -1 for
+  /// an ordinary extraction (capacity unchanged).</param>
+  private static void LogExtraction(GraphExtractor.ExtractResult ex, int searchRootN, string reason,
+                                    int storeMaxNodes, int promotedStoreMaxNodes = -1)
   {
+    bool isPromotion = promotedStoreMaxNodes > 0;
     ConsoleUtils.WriteLineColored(ConsoleColor.Yellow,
-      $"Graph EXTRACT: {reason}; searchRootN={searchRootN:N0}, "
+      $"Graph {(isPromotion ? "PROMOTE" : "EXTRACT")}: {reason}; searchRootN={searchRootN:N0}, "
     + $"{ex.NodesBefore:N0} -> {ex.NodesAfter:N0} nodes ({ex.RetentionFraction:P1}), {ex.ElapsedSeconds * 1000:F0}ms, "
-    + $"store cap {storeMaxNodes:N0} ({FractionString(ex.NodesBefore, storeMaxNodes)} -> "
-    + $"{FractionString(ex.NodesAfter, storeMaxNodes)} full) {StatsSummary()}");
+    + (isPromotion
+        ? $"store cap {storeMaxNodes:N0} -> {promotedStoreMaxNodes:N0} "
+        + $"({FractionString(ex.NodesAfter, promotedStoreMaxNodes)} full) "
+        : $"store cap {storeMaxNodes:N0} ({FractionString(ex.NodesBefore, storeMaxNodes)} -> "
+        + $"{FractionString(ex.NodesAfter, storeMaxNodes)} full) ")
+    + StatsSummary());
 
     if (GraphExtractor.LOG_EXTRACT_PHASE_TIMINGS)
     {

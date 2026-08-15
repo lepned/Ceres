@@ -35,7 +35,7 @@ public static class MCGSParamsFixed
   /// <summary>
   /// If graph rewriting operations should be logged to console.
   /// </summary>
-  public const bool GRAPH_REWRITE_DUMP_REUSE_DIAGNOSTICS = true;
+  public const bool GRAPH_REWRITE_DUMP_REUSE_DIAGNOSTICS = false;
 
   public const bool DUMP_EARLY_SMOOTHING_BOOST = false;
 
@@ -86,6 +86,18 @@ public static class MCGSParamsFixed
   public const double DICTIONARY_SIZE_HINT_REUSE_ACCUM_FACTOR = 30.0;
 
   #endregion
+
+  /// <summary>
+  /// Ceiling for the "small tier" of graph store reservation. 
+  /// A node-based search limit whose whole-game store estimate is at or below
+  /// this value gets a store reserved at just that estimate (~33 GB of virtual address
+  /// space at this ceiling, typically far less), so that many concurrent engines stay cheap. 
+  /// All other searches reserve the full tier: reservation is reserve-only/commit-on-demand, so its only
+  /// real cost is virtual address space (~1 KB/node of a ~128 TB budget). Should a small-tier store
+  /// later prove too small, it is PROMOTED (copied into a full-tier store) rather than abandoned. 
+  /// Time-based limits never take the small tier, so a promotion copy can never burn clock time.
+  /// </summary>
+  public const long SMALL_TIER_MAX_STORE_NODES = 32_000_000;
 
   public const bool DEBUG_MODE = false;
   public const bool LOGGING_ENABLED = false; // performance degradation high when in Debug mode

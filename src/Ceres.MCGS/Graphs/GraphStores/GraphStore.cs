@@ -217,6 +217,25 @@ public partial class GraphStore : IDisposable
   public static int TotalNumDisposed;
   public static int TotalNumAllocated;
 
+  /// <summary>
+  /// Approximate total virtual address space (bytes) currently RESERVED by all live GraphStore
+  /// instances in this process. Reservation is reserve-only/commit-on-demand (cheap), but address
+  /// space is finite (~128 TB per user process on both Linux and Windows.
+  /// </summary>
+  public static long TotalReservedVirtualBytes;
+
+  /// <summary>
+  /// Threshold of total reserved virtual address space above which a (one-line, per-store)
+  /// warning is issued at store construction. Set well below the ~128 TB per-process budget,
+  /// leaving room for transient doubling during graph extraction and for non-store usage.
+  /// </summary>
+  const long RESERVED_VA_WARN_BYTES = 48L * 1024 * 1024 * 1024 * 1024;
+
+  /// <summary>
+  /// This store's contribution to TotalReservedVirtualBytes (subtracted back on Dispose).
+  /// </summary>
+  readonly long reservedVirtualBytes;
+
   public readonly int InstanceID;
 
 
@@ -324,6 +343,24 @@ public partial class GraphStore : IDisposable
       AllStateVectors = new Half[MaxNodes][];
     }
 
+    // Account (approximately) for the virtual address space reserved by the sub-stores above
+    // (element counts as computed above times element sizes; small fixed buffers ignored).
+    reservedVirtualBytes =
+        (long)GNodeStruct.MCGSNodeStructSizeBytes * maxNodes
+      + Unsafe.SizeOf<GEdgeHeaderStruct>() * reservedEdgeHeaders
+      + Unsafe.SizeOf<GEdgeStruct>() * reservedVisitEdges
+      + Unsafe.SizeOf<GParentsDetailsStruct>() * ((parentsMultiplier * maxParents) / (GParentsDetailsStruct.MAX_ENTRIES_PER_SEGMENT - 1))
+      + Unsafe.SizeOf<NodeIndexSet>() * reservedNodeIndexSets;
+    long totalReserved = Interlocked.Add(ref TotalReservedVirtualBytes, reservedVirtualBytes);
+    if (totalReserved > RESERVED_VA_WARN_BYTES)
+    {
+      const double BYTES_PER_TB = 1024.0 * 1024 * 1024 * 1024;
+      Console.WriteLine($"WARNING: total graph store virtual address reservation now "
+                      + $"{totalReserved / BYTES_PER_TB:F1} TB across {TotalNumAllocated - TotalNumDisposed} live stores "
+                      + $"(per-process limit ~128 TB; reservation failure is fatal). "
+                      + $"Consider a smaller ParamsSearch.MaxNodes for high-concurrency scenarios.");
+    }
+
     CeresEnvironment.LogInfo("NodeStore", "Init", $"MCGSNodeStore created with max {maxNodes} nodes, max {reservedEdgeHeaders} children");
 
     GNodeStruct.ValidateMCGSNodeStruct();
@@ -344,6 +381,7 @@ public partial class GraphStore : IDisposable
       if (disposing)
       {
         Interlocked.Increment(ref TotalNumDisposed);
+        Interlocked.Add(ref TotalReservedVirtualBytes, -reservedVirtualBytes);
 
         // Release nodes and children.
         NodesStore.Deallocate();

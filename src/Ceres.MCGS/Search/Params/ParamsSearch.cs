@@ -409,9 +409,11 @@ public record ParamsSearch
   public bool EnablePathDependentCPUCTScaling = false;
 
   /// <summary>
-  /// Maximum number of nodes allowed in the search graph.
-  /// Some internal efficiencies may result if a smaller value 
-  /// than the large default is specified.
+  /// Maximum number of nodes allowed in the search graph. Caps the graph store reservation:
+  /// both the "full tier" size reserved for time-based (or large node-based) search limits and the
+  /// target size when a small store is promoted (see MCGSSearch.GraphStoreSizeNodes and
+  /// GraphReuseManager). Reservation is reserve-only/commit-on-demand, so its cost is virtual
+  /// address space (~1 KB per node); the default reserves ~1.2 TB of a ~128 TB per-process budget.
   /// </summary>
   public int MaxNodes = 1_100_000_000; // pending testing expand to at least: 2_001_000_000;
 
