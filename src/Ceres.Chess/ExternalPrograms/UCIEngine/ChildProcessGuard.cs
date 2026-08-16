@@ -14,10 +14,8 @@
 #region Using directives
 
 using System;
-using System.Collections.Generic;
 using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.Runtime.InteropServices;
 
 #endregion
 
@@ -30,7 +28,10 @@ namespace Ceres.Chess.External.CEngine
   ///
   /// This is "Layer 1" cleanup: it relies on managed shutdown hooks and therefore covers
   /// the common termination paths -- normal exit, Environment.Exit, an unhandled exception,
-  /// Ctrl-C, and POSIX SIGINT/SIGTERM/SIGQUIT (the latter run graceful shutdown on .NET).
+  /// Ctrl-C/Ctrl-Break (POSIX SIGINT/SIGQUIT map to these on .NET), and SIGTERM (which runs
+  /// graceful shutdown, raising ProcessExit). Cleanup on Ctrl-C runs only after any other
+  /// registered CancelKeyPress handler, so a component performing an orchestrated graceful
+  /// shutdown (which may block in its handler until drained) is not undercut by an early kill.
   ///
   /// It does NOT cover an unstoppable kill of the parent (SIGKILL / "kill -9", or some
   /// debugger/IDE hard-stops), because in those cases no managed code runs at all. Guarding
@@ -51,34 +52,45 @@ namespace Ceres.Chess.External.CEngine
     static readonly ConcurrentDictionary<int, Process> tracked = new();
 
     /// <summary>
-    /// Holds the POSIX signal registrations so they are not garbage collected (disposal of a
-    /// PosixSignalRegistration unregisters its handler).
+    /// The Ctrl-C/Ctrl-Break cleanup handler (kept in a field so Track can re-register it,
+    /// see MoveCancelHandlerToEndOfChain).
     /// </summary>
-    static readonly List<IDisposable> signalRegistrations = new();
+    static readonly ConsoleCancelEventHandler cancelKeyHandler = (_, _) => KillAll();
 
     static ChildProcessGuard()
     {
-      // Graceful CLR shutdown (normal return / Environment.Exit), and -- on .NET -- SIGTERM.
+      // Graceful CLR shutdown (normal return / Environment.Exit), and -- on .NET -- SIGTERM
+      // and un-canceled Ctrl-C. This is the only hook needed for actual process termination.
       AppDomain.CurrentDomain.ProcessExit += (_, _) => KillAll();
 
       // Unhandled exception bringing the process down. On modern .NET this cannot prevent
       // termination; we just use it to clean up the children first.
       AppDomain.CurrentDomain.UnhandledException += (_, _) => KillAll();
 
-      // Ctrl-C / Ctrl-Break in a console (cross-platform). Do not set e.Cancel, so the
-      // process still terminates after the children are killed.
-      Console.CancelKeyPress += (_, _) => KillAll();
+      // Ctrl-C / Ctrl-Break in a console (cross-platform; on Unix this also covers SIGINT and
+      // SIGQUIT, which .NET maps to CancelKeyPress). We do not set e.Cancel, so if no other
+      // handler elects to keep the process alive it still terminates after the children are
+      // killed. Components orchestrating a graceful shutdown (e.g. TournamentManager) register
+      // handlers which block until their shutdown completes; because this handler is kept LAST
+      // in the invocation chain (see MoveCancelHandlerToEndOfChain) it runs only after such an
+      // orchestrated drain has finished, rather than killing the engines out from under it.
+      //
+      // Deliberately NOT registered: PosixSignalRegistration handlers for SIGINT/SIGQUIT.
+      // Those fire independently of (and before) the CancelKeyPress chain, which killed the
+      // engines immediately upon Ctrl-C even while a graceful tournament shutdown was pending.
+      Console.CancelKeyPress += cancelKeyHandler;
+    }
 
-      // POSIX signals (Linux/macOS). SIGTERM already triggers graceful shutdown on .NET, but
-      // registering explicitly is harmless and also covers SIGINT/SIGQUIT. We do not set
-      // Cancel, so default termination still proceeds.
-      if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-      {
-        foreach (PosixSignal sig in new[] { PosixSignal.SIGINT, PosixSignal.SIGTERM, PosixSignal.SIGQUIT })
-        {
-          signalRegistrations.Add(PosixSignalRegistration.Create(sig, _ => KillAll()));
-        }
-      }
+    /// <summary>
+    /// Re-registers the Ctrl-C cleanup handler so it sits after any handler subscribed since the
+    /// last Track call (multicast handlers run in subscription order). This keeps the kill-on-
+    /// Ctrl-C as the last resort, after any graceful-shutdown handler has been given the chance
+    /// to run (or block) first.
+    /// </summary>
+    static void MoveCancelHandlerToEndOfChain()
+    {
+      Console.CancelKeyPress -= cancelKeyHandler;
+      Console.CancelKeyPress += cancelKeyHandler;
     }
 
     /// <summary>
@@ -94,6 +106,8 @@ namespace Ceres.Chess.External.CEngine
       }
 
       tracked[process.Id] = process;
+
+      MoveCancelHandlerToEndOfChain();
 
       // Auto-remove from the registry if the engine exits on its own.
       try
