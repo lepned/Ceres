@@ -1370,8 +1370,13 @@ namespace Ceres.Features.Tournaments
         if (engine2ToMove)
         {
           // Opponent (engine1) remaining clock as of the start of this move (time-limited play only).
+          // The increment is credited to the side to move at the top of its own ply (see
+          // WithIncrementApplied above), so the mover's own clock already includes the increment for
+          // the move it is about to make. movesEngine1 counts only COMPLETED opponent moves, so
+          // credit one more increment here to put both clocks on the same basis; otherwise the two
+          // would differ by exactly one increment purely as an artifact of when each is sampled.
           float? oppRemaining1 = searchLimitEngine1.Type == SearchLimitType.SecondsForAllMoves
-                               ? RemainingTime(searchLimitEngine1, movesEngine1, timeEngine1Tot) : (float?)null;
+                               ? RemainingTime(searchLimitEngine1, movesEngine1 + 1, timeEngine1Tot) : (float?)null;
           info = DoMove(engine2, engineCheckAgainstEngine2,
                         gameMoveHistory, searchLimitWithIncrementsEngine2, scoresEngine2,
                         ref nodesEngine2Tot, ref visitsEngine2Tot, ref timeEngine2Tot, ref evalsEngine2Tot,
@@ -1393,8 +1398,10 @@ namespace Ceres.Features.Tournaments
         else
         {
           // Opponent (engine2) remaining clock as of the start of this move (time-limited play only).
+          // See the note on oppRemaining1: one further increment is credited so that OppTimeRem and
+          // TimeRem in the minilog are sampled on the same basis.
           float? oppRemaining2 = searchLimitEngine2.Type == SearchLimitType.SecondsForAllMoves
-                               ? RemainingTime(searchLimitEngine2, movesEngine2, timeEngine2Tot) : (float?)null;
+                               ? RemainingTime(searchLimitEngine2, movesEngine2 + 1, timeEngine2Tot) : (float?)null;
           info = DoMove(engine1, null,
                         gameMoveHistory, searchLimitWithIncrementsEngine1, scoresEngine1,
                         ref nodesEngine1Tot, ref visitsEngine1Tot, ref timeEngine1Tot, ref evalsEngine1Tot,
