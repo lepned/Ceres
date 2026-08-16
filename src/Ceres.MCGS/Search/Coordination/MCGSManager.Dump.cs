@@ -296,6 +296,10 @@ public partial class MCGSManager
       double busyFrac = (!double.IsNaN(backendBusy) && searchSecs > 0) ? backendBusy / searchSecs : double.NaN;
       writer.WriteLine($"Backend Busy Time           {backendBusy,14:F2}");
       writer.WriteLine($"Backend Busy Fraction       {busyFrac,14:F3}");
+      if (backendTracker?.EverUsed ?? false)
+      {
+        writer.WriteLine($"Backend Busy Detail         {backendTracker.DetailString}");
+      }
       PhaseCoordinator coord = Engine.Coordinator;
       writer.WriteLine($"Phase Timing                {coord.PhaseTimingSummary()}");
       writer.WriteLine($"Backup Out-Of-Order         {coord.BackupOutOfOrderFraction,14:F4}  ({coord.BackupOutOfOrderCount:N0} of {coord.BackupTotalCount:N0} backups; inorderEnforced={coord.EnforceInOrderBackup})");

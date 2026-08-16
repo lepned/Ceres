@@ -1661,14 +1661,37 @@ public class NNEvaluatorTensorRT : NNEvaluator
 
     // Bracket the pool dispatch (the full GPU round-trip: H2D copy + inference +
     // D2H copy + stream sync) as "backend time" for utilization measurement.
-    // NOTE: for LC0-format nets the plane->Half conversion runs inside
-    // ProcessWithHandlerDirect (via FillInputLC0) and is therefore included here;
-    // TPG/Ceres nets convert outside this region (see above) so are unaffected.
     BackendTimeTracker tracker = this.BackendTimeTracker;
+
+    // Exclusive device execution: when the NNEvaluatorSet installed a shared gate
+    // (see NNEvaluator.DeviceExclusiveExecutionLock), the two evaluators' dispatches
+    // execute on the shared device one at a time, back-to-back (work-conserving FIFO),
+    // rather than concurrently on independent streams. Any wait here occurs while the
+    // device is busy with the companion evaluator's batch. To keep CPU work out of the
+    // exclusively-held region, the LC0 plane->Half conversion is performed BEFORE
+    // acquiring the gate (into the managed scratch buffer, then dispatched via the
+    // standard path — the same combination ProcessWithHandlerDirect's own multi-sub-batch
+    // fallback uses); TPG/Ceres nets already convert above, outside this region.
+    object deviceGate = DeviceExclusiveExecutionLock;
+    bool lc0PreconvertedForGate = NetType == ONNXNetExecutor.NetTypeEnum.LC0 && deviceGate != null;
+    if (lc0PreconvertedForGate)
+    {
+      FillInputLC0(new Memory<Half>(inputHalfBuffer, 0, numPos * inputElementsPerPosition));
+    }
+
+    if (deviceGate != null)
+    {
+      Monitor.Enter(deviceGate);
+    }
     tracker?.EnterBackend();
     try
     {
-      if (NetType == ONNXNetExecutor.NetTypeEnum.LC0)
+      if (lc0PreconvertedForGate)
+      {
+        // LC0 with exclusive gate: input already converted above, outside the gate.
+        pool.ProcessWithHandler(inputHalfBuffer, numPos, handler);
+      }
+      else if (NetType == ONNXNetExecutor.NetTypeEnum.LC0)
       {
         // LC0: convert the 112-plane input directly into the pinned input buffer via
         // FillInputLC0 (no managed staging buffer + redundant copy). handlerBatch was set above.
@@ -1689,6 +1712,10 @@ public class NNEvaluatorTensorRT : NNEvaluator
     finally
     {
       tracker?.ExitBackend();
+      if (deviceGate != null)
+      {
+        Monitor.Exit(deviceGate);
+      }
     }
 
     // Apply value head blending into separate buffers if FractionValueHead2 is specified
