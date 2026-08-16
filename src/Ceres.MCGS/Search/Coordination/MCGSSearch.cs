@@ -582,7 +582,8 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
     const float FRAC_START_TIME_PADDING = 0.002f;
     const float MAX_EXTRA_PADDING_SECONDS = 10f;  
     float extraPaddingSeconds = gameStartingTimeLimitSeconds is float ? ((float)gameStartingTimeLimitSeconds * FRAC_START_TIME_PADDING) : 0;
-    extraPaddingSeconds = Math.Min(10, MAX_EXTRA_PADDING_SECONDS);
+    extraPaddingSeconds = Math.Min(extraPaddingSeconds, MAX_EXTRA_PADDING_SECONDS);
+
     return isConfiguredValueDefault && isShortTimeControl ? ParamsSearch.MOVE_OVERHEAD_SECONDS_SHORT_TIME_CONTROL
                                                           : (paramsSearch.MoveOverheadSeconds + extraPaddingSeconds);
   }
