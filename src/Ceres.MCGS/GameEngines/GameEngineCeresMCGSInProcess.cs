@@ -190,6 +190,24 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   MCGSMiniLog miniLog;
 
   /// <summary>
+  /// Number of move lines written to the minilog for the game currently in progress.
+  /// </summary>
+  int miniLogMovesThisGame;
+
+  /// <summary>
+  /// Whether a result footer has already been written for the game currently in progress.
+  /// The tournament supplies a full footer of its own (MiniLogWriteGameResult); this flag stops
+  /// the synthetic standalone footer from duplicating it.
+  /// </summary>
+  bool miniLogFooterWritten;
+
+  /// <summary>
+  /// Whether the "=== NEW GAME ===" separator for the game in progress still needs to be written.
+  /// The separator is emitted lazily, immediately before that game's first content, rather than at ResetGame.
+  /// </summary>
+  bool miniLogSeparatorPending = true;
+
+  /// <summary>
   /// Time remaining on the tournament clock (in seconds) at the start of the current move, or
   /// null when not playing in a timed tournament. Set by the tournament before each search and
   /// logged as "TimeRem" on the move line.
@@ -364,9 +382,14 @@ public class GameEngineCeresMCGSInProcess : GameEngine
 
     isFirstMoveOfGame = true;
     gameStartingTimeLimitSeconds = null;
+
+    MiniLogFinishOpenGame();
+
     CurrentGameID = gameID;
 
-    miniLog?.WriteNewGameSeparator(gameID);
+    miniLogSeparatorPending = true;
+    miniLogMovesThisGame = 0;
+    miniLogFooterWritten = false;
   }
 
 
@@ -425,8 +448,8 @@ public class GameEngineCeresMCGSInProcess : GameEngine
     }
 
     // Validate that the search limit is compatible with FixedSearchLimit (if specified).
-    if (FixedSearchLimit != null 
-        && FixedSearchLimit.IsNodesLimit 
+    if (FixedSearchLimit != null
+        && FixedSearchLimit.IsNodesLimit
         && searchLimit.IsNodesLimit
         && searchLimit.Value > FixedSearchLimit.Value)
     {
@@ -593,8 +616,10 @@ public class GameEngineCeresMCGSInProcess : GameEngine
       {
         // Emit the limits-manager allocation reasoning (if captured) immediately before the move
         // line it governs, so it sits next to that move header (mirrors the inline blunder block).
+        MiniLogEnsureGameStarted();
         miniLog.AppendLimitsSection(result.Search.Manager.LastGameLimitOutputs?.DiagnosticText);
         miniLog.WriteMoveLine(BuildMiniLogMoveLine(result, bestMoveInfo));
+        miniLogMovesThisGame++;
       }
       catch (Exception exc)
       {
@@ -894,6 +919,8 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   {
     try
     {
+      // The final game of a run is never followed by a ResetGame, so terminate it here.
+      MiniLogFinishOpenGame();
       miniLog?.Close();
     }
     catch (Exception)
@@ -952,7 +979,63 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   /// </summary>
   public void MiniLogWriteGameResult(string footerText)
   {
-    miniLog?.AppendGameResultFooter(footerText);
+    if (miniLog == null)
+    {
+      return;
+    }
+
+    // A game that logged no moves has no separator yet; emit it so the footer cannot be
+    // misattributed to the preceding game's section by the (positional) HTML renderer.
+    MiniLogEnsureGameStarted();
+
+    miniLog.AppendGameResultFooter(footerText);
+    miniLogFooterWritten = true;
+  }
+
+
+  /// <summary>
+  /// Writes the pending "=== NEW GAME ===" separator for the game in progress, if not yet written.
+  /// Called immediately before emitting any content belonging to that game.
+  /// </summary>
+  void MiniLogEnsureGameStarted()
+  {
+    if (miniLog != null && miniLogSeparatorPending)
+    {
+      miniLog.WriteNewGameSeparator(CurrentGameID);
+      miniLogSeparatorPending = false;
+    }
+  }
+
+
+  /// <summary>
+  /// Writes a minimal result footer for the game in progress if nothing else has, so that every
+  /// game section in the log is terminated the same way regardless of how the engine is driven.
+  /// The engine itself never learns the game outcome (the tournament does, and supplies a full
+  /// footer via MiniLogWriteGameResult), so the synthetic footer records Result=Unknown.
+  /// Called when a game ends: at the next ResetGame, and at disposal for the final game.
+  /// No-op if a footer was already written, or if the game logged no moves.
+  /// </summary>
+  void MiniLogFinishOpenGame()
+  {
+    if (miniLog == null || miniLogFooterWritten || miniLogMovesThisGame == 0)
+    {
+      return;
+    }
+
+    try
+    {
+      miniLog.AppendGameResultFooter(
+          "=== GAME RESULT ===" + System.Environment.NewLine
+        + $"ThisEngine={ID} Result=Unknown Reason=NoResultRecorded" + System.Environment.NewLine
+        + $"GameID={CurrentGameID ?? "(unnamed)"}" + System.Environment.NewLine
+        + $"MovesLogged={miniLogMovesThisGame}" + System.Environment.NewLine
+        + "=== END GAME RESULT ===");
+      miniLogFooterWritten = true;
+    }
+    catch (Exception exc)
+    {
+      ConsoleUtils.WriteLineColored(ConsoleColor.Yellow, "Minilog write failed: " + exc.Message);
+    }
   }
 
 
@@ -981,7 +1064,13 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   /// </summary>
   public void MiniLogAppendBlunder(string blunderText)
   {
-    miniLog?.AppendBlunderSection(blunderText);
+    if (miniLog == null)
+    {
+      return;
+    }
+
+    MiniLogEnsureGameStarted();
+    miniLog.AppendBlunderSection(blunderText);
   }
 
 
