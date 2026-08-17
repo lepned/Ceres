@@ -698,6 +698,7 @@ namespace Ceres.Features.Tournaments
     {
       public GameEngine BlundererEngine;    // engine that played the suspect move
       public int BlunderPlyNum;             // ply number of the suspect move
+      public string BlunderMoveLabel;       // suspect move in conventional notation (e.g. "15...hxg5")
       public float BlunderMoveScoreQ;       // blunderer's own evaluation (Q) of the suspect move
       public float ReferenceImprovementQ;   // reference engine's evaluation swing (Q) across the suspect move
       public string Header;                 // pre-built (self-locating) header text
@@ -728,9 +729,11 @@ namespace Ceres.Features.Tournaments
             && pendingBlunder.BlundererEngine is GameEngineCeresMCGSInProcess blundererMCGS
             && blundererMCGS.IsMiniLogActive)
         {
+          // Note this is corroboration of the deterioration only, not independent evidence that the
+          // move caused it: an engine whose root Q lagged its own tree will "confirm" as it converges.
           string confirmLine =
-              $"Blunderer confirmation: {pendingBlunder.BlundererEngine.ID} own evaluation fell {blundererDrop:F3} Q on its next "
-            + $"move (Q {pendingBlunder.BlunderMoveScoreQ:F3} -> Q {confirmMove.ScoreQ:F3}), confirming the blunder.";
+              $"  Confirm: self Q {pendingBlunder.BlunderMoveScoreQ:F3} -> {confirmMove.ScoreQ:F3} "
+            + $"({-blundererDrop:F3}) on its next move";
 
           // Instead of writing a separate blunder file, append the blunder diagnostics as a section in
           // the blundering engine's own diagnostic minilog (right after its current move's output).
@@ -739,8 +742,9 @@ namespace Ceres.Features.Tournaments
                                            + pendingBlunder.DumpBody);
 
           ConsoleUtils.WriteLineColored(ConsoleColor.Red,
-              $"BLUNDER: engine {pendingBlunder.BlundererEngine.ID} position worse by {pendingBlunder.ReferenceImprovementQ:F3} Q "
-            + $"(self-confirmed {blundererDrop:F3} Q), details appended to {blundererMCGS.MiniLogFileName}");
+              $"BLUNDER: {pendingBlunder.BlundererEngine.ID} {pendingBlunder.BlunderMoveLabel} worse by "
+            + $"{pendingBlunder.ReferenceImprovementQ:F3} Q (self-confirmed {blundererDrop:F3} Q), "
+            + $"details appended to {blundererMCGS.MiniLogFileName}");
         }
         pendingBlunder = null;   // candidate resolved (whether confirmed or rejected)
       }
@@ -768,6 +772,12 @@ namespace Ceres.Features.Tournaments
         return;
       }
 
+      // Root move statistics of the blundering engine's suspect search (null if not supported).
+      // These are what distinguish a genuine error (a better move was available and rejected) from
+      // the common false positive in which every move loses and the reference engine's swing merely
+      // reflects its own belated discovery of a win it already had.
+      GameEngineRootMoveSummary rootInfo = opponentEngine.TryGetLastSearchRootMoveSummary();
+
       // Buffer the dump now, while the opponent's most recent completed search is still the suspect move.
       StringWriter dump = new StringWriter();
       if (!opponentEngine.TryDumpLastSearchDiagnostics(dump, "UCI"))
@@ -777,34 +787,75 @@ namespace Ceres.Features.Tournaments
 
       // Build a self-locating header from the AUTHORITATIVE game coordinates (the tournament board),
       // not the engine's internal search-graph counters (which can disagree under transposition / tree
-      // reuse - e.g. a move counter several plies off). 'disagreement' is how much more optimistic the
-      // blunderer is about its own position than the reference engine; a large value is a strong
-      // "engine did not see the loss" bug signal.
-      float refViewOfBlunderer = -cur.ScoreCentipawns;                 // reference eval, in the blunderer's perspective
-      float disagreement = opp.ScoreCentipawns - refViewOfBlunderer;   // blunderer optimism over reference
-
+      // reuse - e.g. a move counter several plies off).
       string header =
-          $"Engine {movingEngine.ID} detected {improvement:F3} Q improvement since its previous move, "
-        + $"diagnostic dump of opponent engine {opponentEngine.ID} follows (move actually played was {opponentBlunderMoveStr})." + Environment.NewLine
-        + $"  Game        : {gameSequenceNum + 1} (Round {roundNumber}; {movingEngine.ID} vs {opponentEngine.ID})" + Environment.NewLine
-        + $"  Blunderer   : {opponentEngine.ID} ({opp.Side}), played {opponentBlunderMoveStr} at ply {opp.PlyNum}" + Environment.NewLine
-        + $"  FEN (before): {opp.Position.FEN}" + Environment.NewLine
-        + $"  Reference {movingEngine.ID} eval: {prev.ScoreCentipawns:F0}cp (Q {prev.ScoreQ:F3}) before -> "
-        + $"{cur.ScoreCentipawns:F0}cp (Q {cur.ScoreQ:F3}) after   [swing {improvement:F3} Q]" + Environment.NewLine
-        + $"  Blunderer self-eval of the move : {opp.ScoreCentipawns:F0}cp (Q {opp.ScoreQ:F3})" + Environment.NewLine
-        + $"  Disagreement (blunderer optimism vs reference): {disagreement:F0}cp   (large => likely engine vision bug)" + Environment.NewLine
-        + $"  Nodes (N): reference prev {prev.FinalN:N0}, reference cur {cur.FinalN:N0}, blunder move {opp.FinalN:N0}";
+          $"{opponentEngine.ID} ({opp.Side}) {MoveLabel(in opp.Position, opponentBlunderMoveStr)}"
+        + $"  [game {gameSequenceNum + 1}, round {roundNumber}, vs {movingEngine.ID}]" + Environment.NewLine
+        + $"  FEN   : {opp.Position.FEN}" + Environment.NewLine
+        + $"  Swing : ref Q {prev.ScoreQ:F3}->{cur.ScoreQ:F3} (+{improvement:F3}, {prev.ScoreCentipawns:F0}->{cur.ScoreCentipawns:F0}cp)"
+        + $"  self Q {opp.ScoreQ:F3}   [evals are 1-2 plies apart; part of the swing may be the reference's own late discovery]" + Environment.NewLine
+        + $"  Nodes : ref prev {prev.FinalN:N0}, ref cur {cur.FinalN:N0}, blunder move {opp.FinalN:N0}";
+
+      if (rootInfo != null)
+      {
+        header += Environment.NewLine
+        + $"  Root  : played {rootInfo.PlayedMoveSAN} Q {rootInfo.PlayedMoveQ:F3} N {rootInfo.PlayedMoveN:N0} P {100 * rootInfo.PlayedMoveP:F1}%";
+
+        if (rootInfo.HaveBestAlternative)
+        {
+          bool nearTie = Math.Abs(rootInfo.QGapToBestAlternative) < 0.01f;
+          header += $" | best alt {rootInfo.BestAlternativeSAN} Q {rootInfo.BestAlternativeQ:F3} "
+                  + $"N {rootInfo.BestAlternativeN:N0} P {100 * rootInfo.BestAlternativeP:F1}%"
+                  + $" | gap {rootInfo.QGapToBestAlternative:F3}{(nearTie ? " NEAR-TIE" : "")}" + Environment.NewLine;
+        }
+
+        if (rootInfo.HaveBestReply)
+        {
+          header += Environment.NewLine
+                  + $"  Backup: played Q {rootInfo.PlayedMoveQ:F3} vs its own best reply {rootInfo.BestReplySAN} {rootInfo.BestReplyQ:F3}"
+                  + $" => {rootInfo.BackupOptimism:F3} optimism"
+                  + (rootInfo.BackupOptimism > 0.10f ? "  (refutation is in the tree but not propagated to the root)" : "");
+        }
+
+        bool policyOverridden = rootInfo.TopPolicyMoveSAN != null && rootInfo.TopPolicyMoveSAN != rootInfo.PlayedMoveSAN;
+        header += Environment.NewLine
+                + $"  Search: rootN {rootInfo.RootN:N0}  stop {rootInfo.StopStatus}"
+                + (policyOverridden ? $"  (top-policy move {rootInfo.TopPolicyMoveSAN} was not played)" : "");
+      }
 
       pendingBlunder = new BlunderCandidate
       {
         BlundererEngine = opponentEngine,
         BlunderPlyNum = opp.PlyNum,
+        BlunderMoveLabel = MoveLabel(in opp.Position, opponentBlunderMoveStr),
         BlunderMoveScoreQ = opp.ScoreQ,
         ReferenceImprovementQ = improvement,
         Header = header,
         DumpBody = dump.ToString()
       };
     }
+
+    /// <summary>
+    /// Returns a move label in the conventional form (e.g. "15.Bxf7" or "15...hxg5"), using the
+    /// absolute move number of the position rather than the tournament's book-relative ply index
+    /// (the two do not agree when a game starts from an opening book position).
+    /// Falls back to the raw coordinate string if the move cannot be interpreted.
+    /// </summary>
+    private static string MoveLabel(in Position pos, string uciMoveStr)
+    {
+      // Matches the fullmove number emitted in the FEN (the counter is incremented every ply).
+      string prefix = $"{pos.MiscInfo.MoveNum / 2}{(pos.IsWhite ? "." : "...")}";
+
+      try
+      {
+        return prefix + Move.FromUCI(in pos, uciMoveStr).ToSAN(in pos);
+      }
+      catch (Exception)
+      {
+        return prefix + uciMoveStr;
+      }
+    }
+
 
     /// <summary>
     /// Replaces any character that is not a letter, digit, '-' or '_' with '_' so an engine ID

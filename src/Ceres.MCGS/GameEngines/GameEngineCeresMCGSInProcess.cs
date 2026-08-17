@@ -745,6 +745,132 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   }
 
 
+  /// <summary>
+  /// Minimum fraction of a node's visits which a child must have received before its Q is
+  /// considered reliable enough to appear in the root move summary (with an absolute floor below).
+  /// </summary>
+  const float ROOT_SUMMARY_MIN_CHILD_FRAC_N = 0.005f;
+
+  /// <summary>
+  /// Absolute minimum visits required of a child appearing in the root move summary.
+  /// </summary>
+  const int ROOT_SUMMARY_MIN_CHILD_N = 32;
+
+
+  /// <summary>
+  /// Returns a compact summary of the root move statistics of the most recently completed search.
+  ///
+  /// Sign conventions: the Q on an edge is stated from the perspective of the side to move at the
+  /// child node. Root children are therefore negated to reach our perspective, whereas the replies
+  /// one level further down are already stated from our perspective and are used as-is.
+  /// </summary>
+  public override GameEngineRootMoveSummary TryGetLastSearchRootMoveSummary()
+  {
+    try
+    {
+      GameEngineSearchResultCeresMCGS result = LastSearchResult;
+      MCGSManager manager = result?.Search?.Manager;
+      if (manager == null)
+      {
+        return null;
+      }
+
+      GNode root = manager.Engine.SearchRootNode;
+      if (root.IsNull || root.NumEdgesExpanded == 0)
+      {
+        return null;
+      }
+
+      // Use the authoritative search root position, not GNode.CalcPosition(): under
+      // position-equivalence coalescing a node may describe an earlier occurrence of the same
+      // placement. For the same reason moves are decoded with MoveMGFromPos rather than the
+      // MoveMG property (which internally calls ParentNode.CalcPosition()).
+      MGPosition rootPosMG = manager.Engine.SearchRootPosMG;
+      Position rootPos = rootPosMG.ToPosition;
+      GEdge playedEdge = root.EdgeForMove(result.BestMoveInfo.BestMove);
+      if (playedEdge.IsNull)
+      {
+        return null;
+      }
+
+      GameEngineRootMoveSummary summary = new()
+      {
+        RootN = root.N,
+        StopStatus = manager.StopStatus.ToString(),
+        PlayedMoveSAN = SANOfEdge(playedEdge, in rootPosMG),
+        PlayedMoveQ = (float)-playedEdge.Q,
+        PlayedMoveN = playedEdge.N,
+        PlayedMoveP = (float)playedEdge.P,
+      };
+
+      // Best alternative root move (best Q among the sufficiently visited moves not played)
+      // and the move most favored by policy.
+      int minRootChildN = MinChildN(root.N);
+      float bestAlternativeQ = float.MinValue;
+      float topPolicy = float.MinValue;
+      for (int i = 0; i < root.NumEdgesExpanded; i++)
+      {
+        GEdge edge = root.ChildEdgeAtIndex(i);
+        if (edge.IsNull)
+        {
+          continue;
+        }
+
+        if ((float)edge.P > topPolicy)
+        {
+          topPolicy = (float)edge.P;
+          summary.TopPolicyMoveSAN = SANOfEdge(edge, in rootPosMG);
+        }
+
+        float qOurs = (float)-edge.Q;
+        if (edge != playedEdge && edge.N >= minRootChildN && qOurs > bestAlternativeQ)
+        {
+          bestAlternativeQ = qOurs;
+          summary.HaveBestAlternative = true;
+          summary.BestAlternativeSAN = SANOfEdge(edge, in rootPosMG);
+          summary.BestAlternativeQ = qOurs;
+          summary.BestAlternativeN = edge.N;
+          summary.BestAlternativeP = (float)edge.P;
+        }
+      }
+
+      // Opponent's best reply to the move played. A reply's Q is already stated from our
+      // perspective, and the opponent picks the reply minimizing it.
+      GNode playedNode = playedEdge.ChildNode;
+      if (!playedNode.IsNull && playedNode.NumEdgesExpanded > 0)
+      {
+        MGPosition playedPos = rootPosMG;
+        playedPos.MakeMove(playedEdge.MoveMGFromPos(in rootPosMG));
+        int minReplyN = MinChildN(playedNode.N);
+        float bestReplyQ = float.MaxValue;
+        for (int i = 0; i < playedNode.NumEdgesExpanded; i++)
+        {
+          GEdge replyEdge = playedNode.ChildEdgeAtIndex(i);
+          if (!replyEdge.IsNull && replyEdge.N >= minReplyN && (float)replyEdge.Q < bestReplyQ)
+          {
+            bestReplyQ = (float)replyEdge.Q;
+            summary.HaveBestReply = true;
+            summary.BestReplySAN = SANOfEdge(replyEdge, in playedPos);
+            summary.BestReplyQ = bestReplyQ;
+          }
+        }
+      }
+
+      return summary;
+    }
+    catch (Exception)
+    {
+      // Purely diagnostic; never allow a failure here to disturb play.
+      return null;
+    }
+
+    static int MinChildN(int parentN) => Math.Max(ROOT_SUMMARY_MIN_CHILD_N, (int)(ROOT_SUMMARY_MIN_CHILD_FRAC_N * parentN));
+
+    static string SANOfEdge(GEdge edge, in MGPosition posMG)
+      => MGMoveConverter.ToMove(edge.MoveMGFromPos(in posMG)).ToSAN(posMG.ToPosition);
+  }
+
+
   bool haveEstablishedOpponentGraphReuse = false;
 
   private void PossiblyInitializeForOpponentGraphReuse()
