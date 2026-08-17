@@ -158,6 +158,102 @@ namespace Ceres.Chess.External.CEngine
       }
     }
 
+    /// <summary>
+    /// Splits a command line argument string into individual arguments,
+    /// using the same rules as ProcessStartInfo.Arguments (quotes delimit arguments
+    /// and are removed, backslashes escape quotes, doubled quotes within a quoted
+    /// region yield a literal quote).
+    /// </summary>
+    static List<string> SplitArguments(string arguments)
+    {
+      List<string> args = new();
+      if (string.IsNullOrWhiteSpace(arguments))
+      {
+        return args;
+      }
+
+      System.Text.StringBuilder current = new();
+      bool inQuotes = false;
+      bool haveArg = false;
+
+      for (int i = 0; i < arguments.Length; i++)
+      {
+        char c = arguments[i];
+
+        if (c == '\\')
+        {
+          // Count the run of consecutive backslashes.
+          int numBackslash = 0;
+          while (i < arguments.Length && arguments[i] == '\\')
+          {
+            numBackslash++;
+            i++;
+          }
+
+          if (i < arguments.Length && arguments[i] == '"')
+          {
+            // Each pair of backslashes is one literal backslash,
+            // an odd one out escapes the following quote.
+            current.Append('\\', numBackslash / 2);
+            if (numBackslash % 2 != 0)
+            {
+              current.Append('"');
+            }
+            else
+            {
+              i--; // leave the quote to be processed on the next iteration
+            }
+          }
+          else
+          {
+            // Backslashes not followed by a quote are literal.
+            current.Append('\\', numBackslash);
+            i--;
+          }
+          haveArg = true;
+          continue;
+        }
+
+        if (c == '"')
+        {
+          if (inQuotes && i < arguments.Length - 1 && arguments[i + 1] == '"')
+          {
+            // Doubled quote within a quoted region is a literal quote.
+            current.Append('"');
+            i++;
+          }
+          else
+          {
+            inQuotes = !inQuotes;
+          }
+          haveArg = true;
+          continue;
+        }
+
+        if ((c == ' ' || c == '\t') && !inQuotes)
+        {
+          if (haveArg)
+          {
+            args.Add(current.ToString());
+            current.Clear();
+            haveArg = false;
+          }
+          continue;
+        }
+
+        current.Append(c);
+        haveArg = true;
+      }
+
+      if (haveArg)
+      {
+        args.Add(current.ToString());
+      }
+
+      return args;
+    }
+
+
     public void StartEngine(bool checkExecutableExists = true)
     {
       if (EngineName == null)
@@ -199,9 +295,18 @@ namespace Ceres.Chess.External.CEngine
         // disposition survives exec, making the engine immune to terminal Ctrl-C.
         // Deliberately NOT setsid: staying in the same session leaves Linux autogroup
         // (per-session) CPU scheduling identical to launching the engine directly.
+        // The executable and its arguments are passed as separate positional parameters ($0, $@)
+        // rather than interpolated into the script text, so that characters which are special to
+        // the shell (parentheses, semicolons, quotes, etc.) appearing within arguments
+        // (e.g. LC0 backend options such as "(backend=onnx-trt,gpu=0)") are not interpreted.
         EngineProcess.StartInfo.FileName = "/bin/bash";
         EngineProcess.StartInfo.ArgumentList.Add("-c");
-        EngineProcess.StartInfo.ArgumentList.Add($"trap '' INT QUIT; exec \"{EXEPath}\" {Args}");
+        EngineProcess.StartInfo.ArgumentList.Add("trap '' INT QUIT; exec \"$0\" \"$@\"");
+        EngineProcess.StartInfo.ArgumentList.Add(EXEPath);
+        foreach (string arg in SplitArguments(Args))
+        {
+          EngineProcess.StartInfo.ArgumentList.Add(arg);
+        }
       }
 
       // Possibly set provided environment variables
