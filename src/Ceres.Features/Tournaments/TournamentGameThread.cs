@@ -778,6 +778,30 @@ namespace Ceres.Features.Tournaments
       // reflects its own belated discovery of a win it already had.
       GameEngineRootMoveSummary rootInfo = opponentEngine.TryGetLastSearchRootMoveSummary();
 
+      // Value to the blunderer of the position actually reached, versus the value of the best
+      // alternative it had at the root, and how much search that alternative actually received.
+      float outcomeQ = -cur.ScoreQ;                    // reference eval after the move, in the blunderer's perspective
+      float alternativeUpside = float.NaN;
+      float alternativeFractionN = 0;
+      if (rootInfo != null && rootInfo.HaveBestAlternative)
+      {
+        alternativeUpside = rootInfo.BestAlternativeQ - outcomeQ;
+        alternativeFractionN = rootInfo.RootN > 0 ? (float)rootInfo.BestAlternativeN / rootInfo.RootN : 0;
+
+        // Two independent reasons a candidate is not a demonstrable blunder:
+        //   (1) nothing better than the outcome was available, so the move cost little or nothing;
+        //   (2) the best alternative was barely searched, so its evaluation is noise and cannot
+        //       establish that a better move existed (the usual case after futility pruning).
+        bool noUpside = Def.BlunderDumpMinAlternativeUpsideQ > 0
+                     && alternativeUpside < Def.BlunderDumpMinAlternativeUpsideQ;
+        bool unsupported = Def.BlunderDumpMinAlternativeFractionN > 0
+                        && alternativeFractionN < Def.BlunderDumpMinAlternativeFractionN;
+        if (noUpside || unsupported)
+        {
+          return;
+        }
+      }
+
       // Buffer the dump now, while the opponent's most recent completed search is still the suspect move.
       StringWriter dump = new StringWriter();
       if (!opponentEngine.TryDumpLastSearchDiagnostics(dump, "UCI"))
@@ -805,8 +829,10 @@ namespace Ceres.Features.Tournaments
         {
           bool nearTie = Math.Abs(rootInfo.QGapToBestAlternative) < 0.01f;
           header += $" | best alt {rootInfo.BestAlternativeSAN} Q {rootInfo.BestAlternativeQ:F3} "
-                  + $"N {rootInfo.BestAlternativeN:N0} P {100 * rootInfo.BestAlternativeP:F1}%"
-                  + $" | gap {rootInfo.QGapToBestAlternative:F3}{(nearTie ? " NEAR-TIE" : "")}" + Environment.NewLine;
+                  + $"N {rootInfo.BestAlternativeN:N0} ({100 * alternativeFractionN:F1}% of root) P {100 * rootInfo.BestAlternativeP:F1}%"
+                  + $" | gap {rootInfo.QGapToBestAlternative:F3}{(nearTie ? " NEAR-TIE" : "")}" + Environment.NewLine
+                  + $"  Upside: best alternative was {alternativeUpside:F3} Q better than the outcome "
+                  + $"(Q {rootInfo.BestAlternativeQ:F3} vs {outcomeQ:F3})";
         }
 
         if (rootInfo.HaveBestReply)

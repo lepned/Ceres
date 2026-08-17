@@ -131,10 +131,9 @@ public partial class MCGSManager
           GEdge[] childrenSortedQ = searchRootNode.EdgesSorted(node => (float)node.Q);
 
           GEdge bestMoveEdge = searchRootNode.EdgeForMove(bestMove);
-          GNode bestMoveNode = bestMoveEdge.ChildNode;
 
-          bool isTopN = childrenSortedN[0].N == bestMoveNode.N; // could be ties
-          bool isTopQ = childrenSortedQ[0].MoveMG == bestMove;
+          bool isTopN = childrenSortedN[0].N == bestMoveEdge.N; // could be ties
+          bool isTopQ = childrenSortedQ[0] == bestMoveEdge;
           if (isTopN && isTopQ)
           {
             bestMoveInfoStr = "(TopN and TopQ)";
