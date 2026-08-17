@@ -59,10 +59,12 @@ public sealed class MCGSMiniLog : IDisposable
   /// </summary>
   public const string BODY_LEGEND =
     "LEGEND (per move line): FEN, RootN, StoreN, NNEvals, TimeRem, OppTimeRem, LimInit, Elapsed, "
-    + "BudgetFrac%, NPS, EPS, BackendBusy, Depth, SelDepth | candidate moves as (SAN, visit%, Q) "
+    + "BudgetFrac%, NPS, EPS, BackendBusy, Depth, SelDepth, Stop | candidate moves as (SAN, visit%, Q) "
     + "sorted by visits descending, '*' prefixes the played move, Q from side-to-move perspective. "
     + "Sel (present only when the played move was not the most-visited move) names the selection "
     + "mechanism: best-Q / minimax / irreversible / drp-avoid. "
+    + "Stop names the reason the search ended (e.g. TimeLimitReached, FutilityPrunedAllMoves, "
+    + "OnlyOneLegalMove, TablebaseImmediateMove). "
     + "TimeRem / OppTimeRem are the engine's own and the opponent's remaining game clock (seconds), "
     + "populated only for SecondsForAllMoves play within a Ceres tournament (else n/a). "
     + "LimInit is the per-move allocated budget (seconds for time limits, nodes for node limits); "
@@ -347,6 +349,24 @@ public sealed class MCGSMiniLog : IDisposable
     Emit("=== BLUNDER ===" + NL
        + blunderText + NL
        + "=== END BLUNDER ===" + NL, false);
+  }
+
+
+  /// <summary>
+  /// Appends a (preformatted) per-game time-usage summary block, delimited by markers so
+  /// post-processors can locate it. Emitted at the end of a game, immediately before the game
+  /// result footer (which is the call that completes/flushes the staged game).
+  /// </summary>
+  public void AppendTimeUsageSection(string timeUsageText)
+  {
+    if (string.IsNullOrEmpty(timeUsageText))
+    {
+      return;
+    }
+
+    Emit("=== TIME USAGE ===" + NL
+       + timeUsageText + NL
+       + "=== END TIME USAGE ===" + NL, false);
   }
 
 

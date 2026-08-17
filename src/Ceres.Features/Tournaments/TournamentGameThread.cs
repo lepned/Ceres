@@ -15,6 +15,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -564,8 +565,72 @@ namespace Ceres.Features.Tournaments
       sb.AppendLine($"TotalEvaluationsEngine1={info.TotalEvaluationsEngine1} TotalEvaluationsEngine2={info.TotalEvaluationsEngine2}");
       sb.AppendLine($"ForfeitsEngine1={info.NumForfeitsEngine1} (small={info.NumSmallForfeitsEngine1}, big={info.NumBigForfeitsEngine1}, maxExcess={info.MaxForfeitExcessSecondsEngine1:F2}s) "
                   + $"ForfeitsEngine2={info.NumForfeitsEngine2} (small={info.NumSmallForfeitsEngine2}, big={info.NumBigForfeitsEngine2}, maxExcess={info.MaxForfeitExcessSecondsEngine2:F2}s)");
+      AppendMiniLogTimeUsageFooter(sb, info);
       sb.Append("=== END GAME RESULT ===");
       return sb.ToString();
+    }
+
+
+    /// <summary>
+    /// Appends per-engine time-usage summary lines (mean seconds per move, mean spend per move in
+    /// each quarter of the game, and fraction of the available clock consumed) to the minilog game
+    /// result footer, enabling per-game comparison of the two engines' time-usage profiles.
+    /// Only emitted for per-game time limits (SecondsForAllMoves) with recorded move history.
+    /// </summary>
+    private static void AppendMiniLogTimeUsageFooter(StringBuilder sb, TournamentGameInfo info)
+    {
+      if (info.SearchLimitWhite?.Type != SearchLimitType.SecondsForAllMoves
+       || info.GameMoveHistory == null || info.GameMoveHistory.Count == 0)
+      {
+        return;
+      }
+
+      CultureInfo ci = CultureInfo.InvariantCulture;
+      SideType engine1Side = info.Engine2IsWhite ? SideType.Black : SideType.White;
+
+      static List<float> OwnMoveTimes(TournamentGameInfo info, SideType side)
+      {
+        List<float> times = new();
+        foreach (GameMoveStat stat in info.GameMoveHistory)
+        {
+          if (stat.Side == side && !float.IsNaN(stat.TimeElapsed))
+          {
+            times.Add(stat.TimeElapsed);
+          }
+        }
+        return times;
+      }
+
+      static string MeanSecPerMove(List<float> times, CultureInfo ci)
+        => times.Count == 0 ? "n/a" : times.Average().ToString("F2", ci);
+
+      // Mean seconds per move within each index quarter of the engine's own move sequence
+      // (formatted a/b/c/d with no spaces so footer Key=Value parsing stays intact).
+      static string SpendByQuarter(List<float> times, CultureInfo ci)
+      {
+        string[] parts = new string[4];
+        for (int q = 0; q < 4; q++)
+        {
+          int start = q * times.Count / 4;
+          int end = (q + 1) * times.Count / 4;
+          parts[q] = end > start ? times.Skip(start).Take(end - start).Average().ToString("F1", ci) : "-";
+        }
+        return string.Join("/", parts);
+      }
+
+      static string UsedFrac(float totalTime, float remainingTime, CultureInfo ci)
+      {
+        float available = totalTime + remainingTime;
+        return available > 0 ? (totalTime / available).ToString("F3", ci) : "n/a";
+      }
+
+      List<float> times1 = OwnMoveTimes(info, engine1Side);
+      List<float> times2 = OwnMoveTimes(info, engine1Side == SideType.White ? SideType.Black : SideType.White);
+
+      sb.AppendLine($"MeanSecPerMoveEngine1={MeanSecPerMove(times1, ci)} MeanSecPerMoveEngine2={MeanSecPerMove(times2, ci)}");
+      sb.AppendLine($"SpendByQuarterEngine1={SpendByQuarter(times1, ci)} SpendByQuarterEngine2={SpendByQuarter(times2, ci)}");
+      sb.AppendLine($"TimeUsedFracEngine1={UsedFrac(info.TotalTimeEngine1, info.RemainingTimeEngine1, ci)} "
+                  + $"TimeUsedFracEngine2={UsedFrac(info.TotalTimeEngine2, info.RemainingTimeEngine2, ci)}");
     }
 
 

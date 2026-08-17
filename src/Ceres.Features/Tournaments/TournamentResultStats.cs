@@ -17,6 +17,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using Ceres.Chess;
 using Ceres.Chess.GameEngines;
 using Ceres.Chess.Textual.PgnFileTools;
 using Chess.Ceres.PlayEvaluation;
@@ -88,6 +89,7 @@ namespace Ceres.Features.Tournaments
       writer.WriteLine("Pentanomial analysis (paired-game statistics):");
       DumpPentanomialSummary(def);
       writer.WriteLine();
+      DumpTimeUsageSummary(writer);
 
       Console.WriteLine();
       if (def.ForceReferenceEngineDeterministic)
@@ -96,6 +98,110 @@ namespace Ceres.Features.Tournaments
         writer.WriteLine($"Number of reference engine moves overridden to force deterministic: {totalForced:N0}");
       }
     }
+
+    /// <summary>
+    /// Per-engine accumulator behind DumpTimeUsageSummary: final-clock statistics plus the
+    /// distribution of thinking time across the (index) quarters of each game's own moves,
+    /// which reveals front- vs back-loading of clock usage.
+    /// </summary>
+    sealed class EngineTimeUsage
+    {
+      public readonly List<float> FinalRemainings = new();
+      public readonly List<float> UsedFracs = new();
+      public readonly double[] QuarterTimeSums = new double[4];
+      public readonly int[] QuarterMoveCounts = new int[4];
+      public double FirstHalfTimeSum;
+      public double SecondHalfTimeSum;
+    }
+
+
+    /// <summary>
+    /// Dumps per-engine aggregate clock-usage statistics across all games played under a
+    /// per-game time limit: mean/median final clock remaining, mean fraction of the available
+    /// clock consumed, mean seconds per move within each quarter of the game's own moves, and
+    /// the fraction of total thinking time spent in the first half of those moves.
+    /// No output when the tournament had no such timed games.
+    /// </summary>
+    void DumpTimeUsageSummary(TextWriter writer)
+    {
+      Dictionary<string, EngineTimeUsage> byEngine = new();
+      foreach (TournamentGameInfo info in GameInfos)
+      {
+        if (info.SearchLimitWhite?.Type != SearchLimitType.SecondsForAllMoves)
+        {
+          continue;
+        }
+
+        void Add(string id, float total, float remaining, SideType side)
+        {
+          float available = total + remaining;
+          if (!(available > 0))
+          {
+            return;
+          }
+          if (!byEngine.TryGetValue(id, out EngineTimeUsage usage))
+          {
+            byEngine[id] = usage = new();
+          }
+          usage.FinalRemainings.Add(remaining);
+          usage.UsedFracs.Add(total / available);
+
+          if (info.GameMoveHistory != null)
+          {
+            List<float> ownTimes = info.GameMoveHistory
+                                       .Where(stat => stat.Side == side && !float.IsNaN(stat.TimeElapsed))
+                                       .Select(stat => stat.TimeElapsed).ToList();
+            int numMoves = ownTimes.Count;
+            for (int q = 0; q < 4; q++)
+            {
+              int start = q * numMoves / 4;
+              int end = (q + 1) * numMoves / 4;
+              for (int i = start; i < end; i++)
+              {
+                usage.QuarterTimeSums[q] += ownTimes[i];
+              }
+              usage.QuarterMoveCounts[q] += end - start;
+            }
+            int half = numMoves / 2;
+            for (int i = 0; i < numMoves; i++)
+            {
+              if (i < half) usage.FirstHalfTimeSum += ownTimes[i];
+              else usage.SecondHalfTimeSum += ownTimes[i];
+            }
+          }
+        }
+
+        SideType engine1Side = info.Engine2IsWhite ? SideType.Black : SideType.White;
+        SideType engine2Side = info.Engine2IsWhite ? SideType.White : SideType.Black;
+        Add(info.Engine2IsWhite ? info.PlayerBlack : info.PlayerWhite, info.TotalTimeEngine1, info.RemainingTimeEngine1, engine1Side);
+        Add(info.Engine2IsWhite ? info.PlayerWhite : info.PlayerBlack, info.TotalTimeEngine2, info.RemainingTimeEngine2, engine2Side);
+      }
+
+      if (byEngine.Count == 0)
+      {
+        return;
+      }
+
+      writer.WriteLine("Time usage summary (timed games; quarters are index quarters of each game's own moves):");
+      foreach ((string id, EngineTimeUsage usage) in byEngine)
+      {
+        List<float> sortedRem = usage.FinalRemainings.OrderBy(v => v).ToList();
+        float medianRem = sortedRem[sortedRem.Count / 2];
+        float meanRem = usage.FinalRemainings.Average();
+        float meanUsedFrac = usage.UsedFracs.Average();
+
+        string byQuarter = string.Join("/", Enumerable.Range(0, 4).Select(
+            q => usage.QuarterMoveCounts[q] > 0 ? (usage.QuarterTimeSums[q] / usage.QuarterMoveCounts[q]).ToString("F2") : "-"));
+        double totalHalves = usage.FirstHalfTimeSum + usage.SecondHalfTimeSum;
+        string fracFirstHalf = totalHalves > 0 ? (usage.FirstHalfTimeSum / totalHalves).ToString("F3") : "-";
+
+        writer.WriteLine($"  {id,-25} meanFinalRemaining={meanRem,6:F1}s  medianFinalRemaining={medianRem,6:F1}s  "
+                       + $"meanUsedFrac={meanUsedFrac:F3}  secPerMoveByQuarter={byQuarter}  "
+                       + $"fracTimeInFirstHalfMoves={fracFirstHalf}  (n={usage.FinalRemainings.Count})");
+      }
+      writer.WriteLine();
+    }
+
 
     /// <summary>
     /// Dumps full engine summary table to console.

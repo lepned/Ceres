@@ -607,6 +607,15 @@ public record ParamsSearch
   [CeresOption(Name = "time-management-aggressiveness", Desc = "Aggressiveness with which limited search resource (time or nodes) is consumed.", Default = "1.0")]
   public float GameLimitUsageAggressiveness = 1.0f;
 
+  /// <summary>
+  /// Optional name of an alternate limits manager to use for this engine
+  /// (currently only "TEST", the trajectory-controller testbed), taking precedence over
+  /// the process-wide Ceres.json "LimitsManagerName" setting. Null or empty defers to that
+  /// setting, or to the default manager if neither is specified. Being per-engine, this
+  /// allows two engines in one tournament to A/B different limits managers.
+  /// </summary>
+  public string LimitsManagerName = null;
+
 
   /// <summary>
   /// If moves are possibly made more quickly if a large graph 

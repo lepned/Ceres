@@ -72,6 +72,7 @@ public static class MCGSMiniLogHtmlFormatter
     ("Backend", "BackendBusy"),
     ("Depth", "Depth"),
     ("SelD", "SelDepth"),
+    ("Stop", "Stop"),
   };
 
   // Scalar columns whose displayed value is reformatted with thousands separators.
@@ -177,8 +178,8 @@ public static class MCGSMiniLogHtmlFormatter
 
   static void WriteGameSection(StringBuilder sb, int gameNumber, string gameID, List<string> body)
   {
-    // Parse the game body in order into rows (move lines and inline blunder / limits blocks) plus
-    // the footer. Row Kind is one of "move", "blunder", "limits".
+    // Parse the game body in order into rows (move lines and inline blunder / limits / time-usage
+    // blocks) plus the footer. Row Kind is one of "move", "blunder", "limits", "timeusage".
     List<(string Kind, string Text)> rows = new List<(string Kind, string Text)>();
     List<string> footerLines = new List<string>();
     int moveCount = 0;
@@ -186,6 +187,7 @@ public static class MCGSMiniLogHtmlFormatter
     bool inFooter = false;
     bool inBlunder = false;
     bool inLimits = false;
+    bool inTimeUsage = false;
     List<string> blockLines = null;
     foreach (string l in body)
     {
@@ -229,6 +231,21 @@ public static class MCGSMiniLogHtmlFormatter
         continue;
       }
 
+      if (inTimeUsage)
+      {
+        if (l.StartsWith("=== END TIME USAGE ==="))
+        {
+          rows.Add(("timeusage", string.Join("\n", blockLines)));
+          inTimeUsage = false;
+          blockLines = null;
+        }
+        else
+        {
+          blockLines.Add(l);
+        }
+        continue;
+      }
+
       if (l.StartsWith("=== GAME RESULT ==="))
       {
         inFooter = true;
@@ -242,6 +259,11 @@ public static class MCGSMiniLogHtmlFormatter
       else if (l.StartsWith("=== LIMITS ==="))
       {
         inLimits = true;
+        blockLines = new List<string>();
+      }
+      else if (l.StartsWith("=== TIME USAGE ==="))
+      {
+        inTimeUsage = true;
         blockLines = new List<string>();
       }
       else if (l.StartsWith("FEN="))
@@ -334,6 +356,17 @@ public static class MCGSMiniLogHtmlFormatter
         sb.Append("<tr class=\"limitsrow\"><td colspan=\"" + totalCols + "\">");
         sb.Append("<details><summary class=\"limitssummary\">LIMITS allocation (click to expand)</summary>");
         sb.Append("<pre class=\"limits\">" + Esc(text) + "</pre></details>");
+        sb.AppendLine("</td></tr>");
+        continue;
+      }
+
+      if (kind == "timeusage")
+      {
+        // Per-game time-usage summary (emitted just before the game result footer): a short
+        // fixed-font block spanning the full table width, expanded by default.
+        sb.Append("<tr class=\"timeusagerow\"><td colspan=\"" + totalCols + "\">");
+        sb.Append("<details open><summary class=\"timeusagesummary\">TIME USAGE summary</summary>");
+        sb.Append("<pre class=\"timeusage\">" + Esc(text) + "</pre></details>");
         sb.AppendLine("</td></tr>");
         continue;
       }
@@ -707,6 +740,10 @@ public static class MCGSMiniLogHtmlFormatter
   .limitssummary { color: var(--accent); font-weight: 700; cursor: pointer; }
   pre.limits { background: #0c141d; border-color: #244055; font-family: Consolas, ui-monospace, monospace;
                font-size: 12px; margin: 6px 0 2px 0; }
+  tr.timeusagerow td { background: #10201a; }
+  .timeusagesummary { color: var(--win); font-weight: 700; cursor: pointer; }
+  pre.timeusage { background: #0c1712; border-color: #245540; font-family: Consolas, ui-monospace, monospace;
+                  font-size: 12px; margin: 6px 0 2px 0; }
 </style>";
   }
 }
