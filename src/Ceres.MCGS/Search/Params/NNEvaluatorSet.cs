@@ -60,6 +60,27 @@ public partial class NNEvaluatorSet : IDisposable
   /// </summary>
   public readonly BackendTimeTracker BackendTimeTracker = new();
 
+  /// <summary>
+  /// If the set's evaluators are given a shared DeviceExclusiveExecutionLock so their
+  /// device dispatches execute one at a time, back-to-back (work-conserving exclusive
+  /// FIFO) instead of concurrently on independent streams. Concurrent submission lets
+  /// the device fair-share the two evaluations so they finish together, after which
+  /// both iterators do CPU work together and the device idles once per batch-pair
+  /// ("clumping"); exclusive execution separates completions by a full batch duration
+  /// so each iterator's CPU phases hide under the other's evaluation.
+  /// </summary>
+  public static bool EnableDeviceExclusiveExecution = true;
+
+  /// <summary>
+  /// Gate serializing device execution across Evaluator0 and the overlapped Evaluator1
+  /// (which share the same device(s) by construction: both are built from EvaluatorDef,
+  /// Evaluator1 sharing Evaluator0's engine weights). Installed on both evaluators when
+  /// EnableDeviceExclusiveExecution; see NNEvaluator.DeviceExclusiveExecutionLock.
+  /// Harmless (never contended) when only Evaluator0 exists (e.g. DualEvaluators false).
+  /// EvaluatorSecondary is intentionally excluded (as with BackendTimeTracker).
+  /// </summary>
+  public readonly object DeviceExclusiveExecutionLock = new();
+
   #region Internal data
 
   [NonSerialized]
@@ -189,6 +210,10 @@ public partial class NNEvaluatorSet : IDisposable
           {
             evaluator0 = NNEvaluatorFactory.BuildEvaluator(EvaluatorDef, null);
             evaluator0.BackendTimeTracker = BackendTimeTracker;
+            if (EnableDeviceExclusiveExecution)
+            {
+              evaluator0.DeviceExclusiveExecutionLock = DeviceExclusiveExecutionLock;
+            }
           }
         }
       }
@@ -221,6 +246,10 @@ public partial class NNEvaluatorSet : IDisposable
             Debug.Assert(Evaluator0 != null);
             evaluator1 = NNEvaluatorFactory.BuildEvaluator(EvaluatorDef, Evaluator0);
             evaluator1.BackendTimeTracker = BackendTimeTracker;
+            if (EnableDeviceExclusiveExecution)
+            {
+              evaluator1.DeviceExclusiveExecutionLock = DeviceExclusiveExecutionLock;
+            }
           }
         }
       }

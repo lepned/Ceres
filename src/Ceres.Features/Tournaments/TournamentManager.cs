@@ -370,20 +370,18 @@ namespace Ceres.Features.Tournaments
 
       VerifyEnginesCompatible();
 
-      if (enableCancelVialCtrlC)
-      {
-        // Install Ctrl-C handler to allow ad hoc clean termination of tournament (with stats).
-        ConsoleCancelEventHandler ctrlCHandler = new ConsoleCancelEventHandler((object sender,
-          ConsoleCancelEventArgs args) =>
+      // Install Ctrl-C handler to allow ad hoc clean termination of tournament (with stats).
+      // Scoped registration: unsubscribed on every exit path from this method, so a completed
+      // tournament is not kept reachable forever via the static Console.CancelKeyPress event.
+      using ConsoleCancelHandlerScope ctrlCScope = !enableCancelVialCtrlC ? null
+        : new ConsoleCancelHandlerScope((object sender, ConsoleCancelEventArgs args) =>
         {
           Console.WriteLine("Tournament pending shutdown....");
           Def.parentDef.ShouldShutDown = true;
           // Release any threads parked by a Ctrl-P pause so they observe the shutdown and drain.
           Def.parentDef.PauseController?.Resume();
           shutdownComplete.WaitOne();
-        }); ;
-        Console.CancelKeyPress += ctrlCHandler;
-      }
+        });
 
       QueueManager = queueManager;
       TournamentResultStats parentTest = new();
@@ -431,6 +429,11 @@ namespace Ceres.Features.Tournaments
       for (int i = 0; i < numConcurrent; i++)
       {
         TournamentDef tournamentDefClone = Def.Clone();
+
+        // Record the effective concurrency (not the NumConcurrent field, which ignores the
+        // distributed-worker override above) so each game thread knows whether its engines share
+        // their minilog files with the engines of other threads.
+        tournamentDefClone.NumConcurrentGameThreads = numConcurrent;
 
         // Make sure the threads will use either different or pooled evaluators
         if (NumConcurrent > 1)

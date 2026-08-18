@@ -356,9 +356,16 @@ namespace Ceres.Chess.GameEngines
           throw new NotSupportedException($"Unsupported MoveType {searchLimit.Type}");
       }
 
-      float q = EncodedEvalLogistic.CentipawnToLogistic(gameInfo.ScoreCentipawns);
-      return new GameEngineSearchResult(gameInfo.BestMove, q, gameInfo.ScoreCentipawns, float.NaN, searchLimit, default, 0,
-                                       (int)gameInfo.Nodes, gameInfo.NPS, gameInfo.EPS, gameInfo.Depth);
+      // Prefer the engine's own win/draw/loss (available only if it was sent UCI_ShowWDL),
+      // which is exactly the win - loss quantity ScoreQ is defined to hold.
+      // Otherwise fall back to a logistic transformation of the centipawn score.
+      bool haveWDL = !float.IsNaN(gameInfo.WDL.W);
+      float q = haveWDL ? gameInfo.Q : EncodedEvalLogistic.CentipawnToLogistic(gameInfo.ScoreCentipawns);
+
+      GameEngineSearchResult result = new(gameInfo.BestMove, q, gameInfo.ScoreCentipawns, float.NaN, searchLimit, default, 0,
+                                          (int)gameInfo.Nodes, gameInfo.NPS, gameInfo.EPS, gameInfo.Depth);
+      result.WDL = gameInfo.WDL;
+      return result;
     }
 
 

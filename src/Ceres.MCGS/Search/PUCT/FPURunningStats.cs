@@ -191,8 +191,8 @@ internal static class FPURunningStats
   public static void Record(GNode node,
                             ParamsSearch paramsSearch,
                             ParamsSelect paramsSelect,
-                            double[] qWhenNoChildrenComposite,
-                            ReadOnlySpan<double> policy,
+                            float[] qWhenNoChildrenComposite,
+                            ReadOnlySpan<float> policy,
                             int numToProcess)
   {
     if (qWhenNoChildrenComposite == null || numToProcess < 2)

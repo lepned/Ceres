@@ -62,8 +62,6 @@ public sealed class MultiGPUEnginePool : IDisposable
   private readonly string cacheDir;
 
   // Pinned memory buffers for async transfers
-  private IntPtr pinnedInput;
-  private IntPtr pinnedOutput;
   private long pinnedInputBytes;
   private long pinnedOutputBytes;
   // Cached arrays per GPU to avoid per-batch allocations
@@ -199,6 +197,20 @@ public sealed class MultiGPUEnginePool : IDisposable
       }
     }
 
+    // Normalize each GPU's batch sizes exactly once, here at the boundary: sorted ascending with
+    // duplicates removed (SM alignment can snap two configured sizes onto the same multiple, see
+    // NNEvaluatorTensorRT.AdjustToSM). EnginePool builds one engine per distinct size, and Warmup
+    // below measures execution times walking these arrays in this order, so this normalization is
+    // what keeps engines, batch sizes and timings in agreement (EnginePool.SetExecutionTimes
+    // verifies the correspondence). Copies are made, so caller arrays are never mutated.
+    int[][] normalizedSizesPerGPU = new int[this.sizesPerGPU.Length][];
+    for (int i = 0; i < this.sizesPerGPU.Length; i++)
+    {
+      normalizedSizesPerGPU[i] = EnginePool.SortedDistinctSizes(this.sizesPerGPU[i], descending: false);
+    }
+    this.sizesPerGPU = normalizedSizesPerGPU;
+    sizesPerGPU = normalizedSizesPerGPU;  // parameter is also referenced directly by the load paths below
+
     // Load engines in parallel across GPUs when enabled, multi-GPU, and all device IDs are unique
     // (duplicate device IDs can occur for testing purposes and require sequential loading)
     bool hasDuplicateDevices = deviceIds.Length != deviceIds.Distinct().Count();
@@ -272,8 +284,7 @@ public sealed class MultiGPUEnginePool : IDisposable
     int maxBatch = GetMaxBatchSize();
     pinnedInputBytes = maxBatch * InputElementsPerPosition * sizeof(ushort);
     pinnedOutputBytes = maxBatch * OutputElementsPerPosition * sizeof(ushort);
-    pinnedInput = TensorRTNative.AllocPinned(pinnedInputBytes);
-    pinnedOutput = TensorRTNative.AllocPinned(pinnedOutputBytes);
+
     // Initialize cached arrays for each GPU
     int numPools = pools.Count;
     cachedHalfInputs = new Half[numPools][];
@@ -362,11 +373,9 @@ public sealed class MultiGPUEnginePool : IDisposable
         continue;  // Singleton (heterogeneous) group — nothing to share.
       }
 
-      // The cache filename's batch order matches EnginePool's internal descending sort, so sort a
-      // copy the same way before resolving the blob's cache filename.
-      int[] leaderSizes = (int[])sizesPerGPU[leaderIdx].Clone();
-      Array.Sort(leaderSizes);
-      Array.Reverse(leaderSizes);
+      // The cache filename's batch order matches EnginePool's internal descending ordering, so
+      // apply the same normalization to a copy before resolving the blob's cache filename.
+      int[] leaderSizes = EnginePool.SortedDistinctSizes(sizesPerGPU[leaderIdx], descending: true);
 
       bool haveBlob = trt.TryReadMultiProfileBlobFromCache(onnxPath, leaderSizes, options, cacheDir,
                                                            deviceIds[leaderIdx], out IntPtr blob, out long size);
@@ -720,13 +729,32 @@ public sealed class MultiGPUEnginePool : IDisposable
         string avgStr = string.Join(", ", executionTimesPerGPU[g].Select(t => t.ToString("F1")));
         Console.WriteLine($"DEVICE {deviceIDs[g]} averaged timings: [{avgStr}] ms");
       }
-      pools[g].ExecutionTimes = executionTimesPerGPU[g];
+      // Pass the sizes the timings were measured at along with the timings; the pool maps them
+      // onto its engines by batch size (it holds them in descending order) and throws on mismatch.
+      pools[g].SetExecutionTimes(sizesPerGPU[g], executionTimesPerGPU[g]);
     }
 
     // Run batch size optimization if enabled. Skipped for shared pools: their engine sizes are
     // fixed by the reference's already-built engines, and rebuilding would deserialize fresh
     // engines and defeat the sharing.
-    if (APPLY_BATCH_SIZE_OPTIMIZATION && mode == EnginePoolMode.Exact && !isSharedPool)
+    // The optimizer interpolates GPU 0's sizes against every GPU's timings, so it requires all
+    // GPUs to have the same number of batch sizes (which can differ across heterogeneous devices
+    // if SM alignment collapsed a different number of duplicates on each).
+    bool uniformSizeCounts = true;
+    for (int g = 1; g < numGPUs; g++)
+    {
+      if (sizesPerGPU[g].Length != sizesPerGPU[0].Length)
+      {
+        uniformSizeCounts = false;
+        break;
+      }
+    }
+
+    if (APPLY_BATCH_SIZE_OPTIMIZATION && mode == EnginePoolMode.Exact && !isSharedPool && !uniformSizeCounts)
+    {
+      Console.WriteLine("Batch size optimization skipped: GPUs have differing numbers of engine batch sizes.");
+    }
+    else if (APPLY_BATCH_SIZE_OPTIMIZATION && mode == EnginePoolMode.Exact && !isSharedPool)
     {
       int maxBatchSize = sizesPerGPU[0][^1] * numGPUs;
       BatchSizeOptimizer.OptimizationResult result = BatchSizeOptimizer.Optimize(sizesPerGPU[0], executionTimesPerGPU, numGPUs, 1024);
@@ -880,6 +908,96 @@ public sealed class MultiGPUEnginePool : IDisposable
   }
 
 
+  /// <summary>
+  /// Rotating counter used to spread single-GPU batches across equally fast GPUs.
+  /// </summary>
+  private int singleGPURotation;
+
+  /// <summary>
+  /// Chooses which pool executes a batch that ShouldUseSingleGPU has routed to one GPU.
+  ///
+  /// Prefers the GPU with the lowest estimated execution time for this batch size, which on a
+  /// heterogeneous system is not necessarily pool 0 (the previous unconditional choice), and
+  /// rotates among GPUs that are equally fast so consecutive small batches do not all land on
+  /// the same device.
+  ///
+  /// N.B. Rotation only raises utilization when batches can actually overlap, i.e. when several
+  ///      evaluators drive these engines concurrently (see the engine sharing path,
+  ///      CloneSharingEngine). One caller submitting batches through this API synchronously
+  ///      still keeps just one GPU busy at a time whichever GPU is picked; making sub-threshold
+  ///      batches genuinely parallel requires accepting concurrent requests (per-GPU queue plus
+  ///      per-GPU dispatch state), which this class is not structured for today: the multi-GPU
+  ///      path uses shared worker fields (workerByteInput/cachedStarts/...) that assume exactly
+  ///      one batch in flight.
+  /// </summary>
+  /// <param name="totalPositions">Positions in the batch to be executed.</param>
+  /// <param name="rotate">If true, advances the rotation (pass false for pure queries).</param>
+  private int SelectSingleGPUIndex(int totalPositions, bool rotate)
+  {
+    int numPools = pools.Count;
+
+    // Without cost tables (Range mode, or before warmup) there is no basis for choosing; the
+    // cost table is also the only thing that makes the choice sane on heterogeneous GPUs.
+    if (numPools == 1
+     || gpuCostTable == null
+     || totalPositions <= 0
+     || totalPositions > maxCostTableSize)
+    {
+      return 0;
+    }
+
+    float bestCost = float.MaxValue;
+    for (int g = 0; g < numPools; g++)
+    {
+      float cost = gpuCostTable[g][totalPositions];
+      if (cost < bestCost)
+      {
+        bestCost = cost;
+      }
+    }
+
+    // GPUs within a small tolerance of the best are treated as interchangeable.
+    const float EQUIVALENT_COST_TOLERANCE = 1.10f;
+    float threshold = bestCost * EQUIVALENT_COST_TOLERANCE;
+
+    int numCandidates = 0;
+    for (int g = 0; g < numPools; g++)
+    {
+      if (gpuCostTable[g][totalPositions] <= threshold)
+      {
+        numCandidates++;
+      }
+    }
+
+    if (numCandidates <= 1)
+    {
+      // A single fastest GPU: always use it (rotating onto a slower one would cost latency).
+      for (int g = 0; g < numPools; g++)
+      {
+        if (gpuCostTable[g][totalPositions] <= threshold)
+        {
+          return g;
+        }
+      }
+      return 0;
+    }
+
+    int rotation = rotate ? Interlocked.Increment(ref singleGPURotation) - 1
+                          : Volatile.Read(ref singleGPURotation);
+    int pick = (int)((uint)rotation % (uint)numCandidates);  // unsigned so counter wraparound stays in range
+
+    for (int g = 0; g < numPools; g++)
+    {
+      if (gpuCostTable[g][totalPositions] <= threshold && pick-- == 0)
+      {
+        return g;
+      }
+    }
+
+    return 0;
+  }
+
+
   private bool ShouldUseSingleGPU(int totalPositions)
   {
     if (pools.Count == 1)
@@ -966,7 +1084,8 @@ public sealed class MultiGPUEnginePool : IDisposable
 
     if (ShouldUseSingleGPU(totalPositions))
     {
-      return pools[0].PaddedBatchCapacity(totalPositions);
+      // Query only: do not advance the rotation (this is called to size batches, not to run them).
+      return pools[SelectSingleGPUIndex(totalPositions, rotate: false)].PaddedBatchCapacity(totalPositions);
     }
 
     // Mirror the distribution logic of the Process methods.
@@ -1005,7 +1124,7 @@ public sealed class MultiGPUEnginePool : IDisposable
 
     if (ShouldUseSingleGPU(totalPositions))
     {
-      pools[0].Process(input, output, totalPositions);
+      pools[SelectSingleGPUIndex(totalPositions, rotate: true)].Process(input, output, totalPositions);
       return;
     }
 
@@ -1066,7 +1185,7 @@ public sealed class MultiGPUEnginePool : IDisposable
 
     if (ShouldUseSingleGPU(totalPositions))
     {
-      pools[0].ProcessBytes(input, output, totalPositions);
+      pools[SelectSingleGPUIndex(totalPositions, rotate: true)].ProcessBytes(input, output, totalPositions);
       return;
     }
 
@@ -1129,7 +1248,7 @@ public sealed class MultiGPUEnginePool : IDisposable
 
     if (ShouldUseSingleGPU(totalPositions))
     {
-      pools[0].ProcessWithHandler(input, totalPositions, handler, globalPositionOffset: 0);
+      pools[SelectSingleGPUIndex(totalPositions, rotate: true)].ProcessWithHandler(input, totalPositions, handler, globalPositionOffset: 0);
       return;
     }
 
@@ -1195,7 +1314,7 @@ public sealed class MultiGPUEnginePool : IDisposable
 
     if (ShouldUseSingleGPU(totalPositions))
     {
-      pools[0].ProcessWithHandlerDirect(totalPositions, fillInput, handler, fallbackBuffer, globalPositionOffset: 0);
+      pools[SelectSingleGPUIndex(totalPositions, rotate: true)].ProcessWithHandlerDirect(totalPositions, fillInput, handler, fallbackBuffer, globalPositionOffset: 0);
       return;
     }
 
@@ -1216,7 +1335,7 @@ public sealed class MultiGPUEnginePool : IDisposable
 
     if (ShouldUseSingleGPU(totalPositions))
     {
-      pools[0].ProcessBytesWithHandler(input, totalPositions, handler, globalPositionOffset: 0);
+      pools[SelectSingleGPUIndex(totalPositions, rotate: true)].ProcessBytesWithHandler(input, totalPositions, handler, globalPositionOffset: 0);
       return;
     }
 
@@ -1690,15 +1809,6 @@ public sealed class MultiGPUEnginePool : IDisposable
       workerThreads[i].Join(1000);
       workerStartSignals[i].Dispose();
       workerDoneSignals[i].Dispose();
-    }
-
-    if (pinnedInput != IntPtr.Zero)
-    {
-      TensorRTNative.FreePinned(pinnedInput);
-    }
-    if (pinnedOutput != IntPtr.Zero)
-    {
-      TensorRTNative.FreePinned(pinnedOutput);
     }
 
     foreach (EnginePool pool in pools)

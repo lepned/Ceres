@@ -481,7 +481,6 @@ public partial class MCGSManager : IDisposable
     }
     manager.searchWasStarted = true;
 
-    manager.StartTimeThisSearch = DateTime.Now;
     manager.RootNWhenSearchStarted = manager.Engine.SearchRootNode.N;
     manager.NumEvalsThisSearch = 0;
 

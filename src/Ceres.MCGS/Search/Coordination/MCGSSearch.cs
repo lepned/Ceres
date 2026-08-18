@@ -123,6 +123,8 @@ public partial class MCGSSearch
   /// <param name="progressCallback"></param>
   /// <param name="isFirstMoveOfGame"></param>
   /// <param name="fixedSearchLimit"></param>
+  /// <param name="gameStartingTimeLimitSeconds">starting time control of the current game (seconds),
+  /// or null if unknown/not time-based; used only to resolve the default move overhead</param>
   public void Search(NNEvaluatorSet nnEvaluators,
                      Graph graphToPossiblyReuse,
                      WorkerPool<ExtendPathsWorkerInfo>[] selectWorkerPools,
@@ -139,7 +141,8 @@ public partial class MCGSSearch
                      bool isFirstMoveOfGame = false,
                      bool moveImmediateIfOnlyOneMove = false,
                      MGMove forcedMove = default,
-                     SearchLimit fixedSearchLimit = null)
+                     SearchLimit fixedSearchLimit = null,
+                     float? gameStartingTimeLimitSeconds = null)
   {
     if (searchLimit == null)
     {
@@ -180,31 +183,32 @@ This isn't currently easy in the MCGS engine.
 As a workaround, EvaluatorSygyzy will just return as if no hit.
 
 #endif
-    SearchLimit searchLimitAdjusted = AdjustedSearchLimit(searchLimit, paramsSearch);
 
 #if NOT
 // Have to disable this to avoid overflows
 // The problem is probably that the sizing here doesn't account for the fact
 // that the graph can grow thru reuse very large.
+// (Superseded by the live store sizing below; the move overhead reserve that used to be
+//  computed here is now applied to the per-move limit, see AdjustedPerMoveSearchLimit.)
 
     int maxNodes;
-    if (!searchLimitAdjusted.SearchCanBeExpanded && searchLimitAdjusted.IsNodesLimit)
+    if (!searchLimit.SearchCanBeExpanded && searchLimit.IsNodesLimit)
     {
-      maxNodes = (int)(searchLimitAdjusted.Value + searchLimitAdjusted.ValueIncrement + 5000);
+      maxNodes = (int)(searchLimit.Value + searchLimit.ValueIncrement + 5000);
     }
     else
     {
       // In this mode, we are just reserving virtual address space
       // from a very large pool (e.g. 256TB for Windows).
       // Therefore it is safe to reserve a very large block.
-      if (searchLimitAdjusted.MaxTreeNodes != null)
+      if (searchLimit.MaxTreeNodes != null)
       {
         // Reseve somewhat more storage than the maximum requested tree nodes
         // if the search can be expenaded because during tree rewrite
-        // a preparatory step (MaterializeNodesWithNonRetainedTranspositionRoots) 
+        // a preparatory step (MaterializeNodesWithNonRetainedTranspositionRoots)
         // will initially make the store larger (before it is subsequently compacted).
-        double NODES_BUFFER_MULTIPLIER = searchLimitAdjusted.SearchCanBeExpanded ? 1.2 : 1.0;
-        long maxNodesLong = (long)(NODES_BUFFER_MULTIPLIER * searchLimitAdjusted.MaxTreeNodes.Value) + 100_000;
+        double NODES_BUFFER_MULTIPLIER = searchLimit.SearchCanBeExpanded ? 1.2 : 1.0;
+        long maxNodesLong = (long)(NODES_BUFFER_MULTIPLIER * searchLimit.MaxTreeNodes.Value) + 100_000;
         maxNodes = (int)Math.Min(maxNodesLong, int.MaxValue - 100_000);
       }
       else
@@ -223,6 +227,10 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
                                                         out GraphRootToSearchRootNodeInfo searchRootNodeInfo,
                                                         out List<GraphRootToSearchRootNodeInfo> searchRootPathFromGraphRoot);
 
+    // Resolve the move overhead in effect for this game (a fixed value for the whole game,
+    // determined by the starting time control rather than the dwindling remaining clock).
+    float moveOverheadSeconds = EffectiveMoveOverheadSeconds(paramsSearch, gameStartingTimeLimitSeconds);
+
     SearchLimit searchLimitToUse;
     ManagerGameLimitInputs gameLimitsInputs = null;
     ManagerGameLimitOutputs gameLimitsOutputs = null;
@@ -240,7 +248,7 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
       gameLimitsInputs = new(priorMoves.FinalPosition,
                            paramsSearch, gameMoveHistory,
                            targetType, searchRootNodeN, (float)searchRootNodeQ,
-                           searchLimit.Value, searchLimit.ValueIncrement,
+                           ClockAfterMoveOverheadReserve(searchLimit, moveOverheadSeconds), searchLimit.ValueIncrement,
                            searchLimit.MaxTreeNodes, searchLimit.MaxTreeVisits,
                            float.NaN, float.NaN,
                            maxMovesToGo: searchLimit.MaxMovesToGo,
@@ -249,6 +257,14 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
       gameLimitsOutputs = limitManager.ComputeMoveAllocation(gameLimitsInputs);
       searchLimitToUse = gameLimitsOutputs.LimitTarget;
     }
+
+    // Hold back the configured move overhead (UCI MoveOverheadMs) from the time actually searched.
+    // For a true per-move limit (e.g. "go movetime") the overhead is reserved from this move's
+    // budget, since the move is expected back within that budget. For a per-game clock the reserve
+    // was instead taken once from the remaining time fed to the allocation above (a standing buffer
+    // of about MoveOverheadSeconds maintained on the clock, costing each move only overhead/movesToGo).
+    searchLimitToUse = AdjustedPerMoveSearchLimit(searchLimitToUse, moveOverheadSeconds,
+                                                  applyMoveOverhead: !searchLimit.IsPerGameLimit);
 
 
     List<MGMove> searchMovesTablebaseRestricted = null;
@@ -275,8 +291,27 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
 
 
 
-    // Process graph rewrite if needed (handles memory pressure, low ratio triggers)
-    Graph graphToUse = GraphReuseManager.PrepareGraphToUse(graphToReuse, searchRootNodeInfo, ref searchRootPathFromGraphRoot, paramsSearch, searchLimitToUse, priorMoves);
+    // The graph stores were sized (and fixed) when the graph was created and cannot subsequently
+    // grow. Estimate the node capacity the upcoming search requires so that PrepareGraphToUse can
+    // PROMOTE (copy into a larger store, preserving all evaluations) a store which is too small
+    // (e.g. an interactive session issuing "go nodes 1" and then "go nodes 100000").
+    long minStoreNodesNeeded = 0;
+    int promoteTargetMaxNodes = 0;
+    if (graphToReuse != null)
+    {
+      int nodesInGraph = graphToReuse.Store.NodesStore.NumTotalNodes;
+      int estNodesThisSearch = searchLimitToUse.EstNumSearchNodes(nodesInGraph, 1 + (int)Manager.NNEvaluator0.EstNPSBatch);
+
+      // The estimate is explicitly not a hard upper bound, so require considerable headroom.
+      const float SAFETY_MARGIN = 2.0f;
+      minStoreNodesNeeded = nodesInGraph + (long)(SAFETY_MARGIN * estNodesThisSearch) + 10_000;
+      promoteTargetMaxNodes = FullTierMaxNodes(paramsSearch);
+    }
+
+    // Process graph rewrite if needed (handles store capacity, memory pressure, low ratio triggers)
+    Graph graphToUse = GraphReuseManager.PrepareGraphToUse(graphToReuse, searchRootNodeInfo, ref searchRootPathFromGraphRoot,
+                                                           paramsSearch, searchLimitToUse, priorMoves,
+                                                           minStoreNodesNeeded, promoteTargetMaxNodes);
 
     // If a reusable graph was abandoned, the search will run from a fresh (empty) graph.
     // The allocation above used the (now-discarded) reuse candidate's root N, which with QuickMoves
@@ -291,7 +326,7 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
       ManagerGameLimitInputs coldInputs = new(priorMoves.FinalPosition,
                            paramsSearch, gameMoveHistory,
                            coldTargetType, 0, 0f,
-                           searchLimit.Value, searchLimit.ValueIncrement,
+                           ClockAfterMoveOverheadReserve(searchLimit, moveOverheadSeconds), searchLimit.ValueIncrement,
                            searchLimit.MaxTreeNodes, searchLimit.MaxTreeVisits,
                            float.NaN, float.NaN,
                            maxMovesToGo: searchLimit.MaxMovesToGo,
@@ -308,51 +343,29 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
         + $"(was sized for warm root N={gameLimitsInputs.RootN:N0}).");
       }
 
-      searchLimitToUse = coldOutputs.LimitTarget;
+      searchLimitToUse = AdjustedPerMoveSearchLimit(coldOutputs.LimitTarget, moveOverheadSeconds,
+                                                    applyMoveOverhead: false);
       Manager.OverrideSearchLimit(searchLimitToUse, coldInputs, coldOutputs);
     }
 
     // Create new graph if needed (either no prior graph, or prior graph was abandoned)
     if (graphToUse == null)
     {
-      const long MAX_NODES = 1_100_000_000L;
+      // Size from BOTH the raw incoming limit (for per-game limits, the game clock) and the
+      // resolved per-move limit actually driving this search, taking the larger: sizing from the
+      // raw limit alone is not guaranteed to accommodate the per-move allocation (each term is
+      // internally clamped to the full tier, so the max is safe).
+      int maxNodesInt = Math.Max(GraphStoreSizeNodes(searchLimit, fixedSearchLimit, paramsSearch),
+                                 GraphStoreSizeNodes(searchLimitToUse, fixedSearchLimit, paramsSearch));
 
-      // Attempt to find some safe (hopefully lower value)
-      // to use for max nodes than MAX_NODES to reduce virtual memory reservation length.
-      // Note that if GraphReuseRewriteEnabled then we can be more aggressive in allowing more nodes
-      // because we will rewrite the graph to reduce if approaches the limit.
-      // TODO: possibly unify this with code already in SearchLimit
-      long MAX_MOVES_PER_GRAPH = paramsSearch.GraphReuseEnabled ? (paramsSearch.GraphReuseRewriteEnabled ? 150L : 400L) : 5L;
-      const long MAX_NODES_PER_SECOND = 500_000L;
-      long maxNodes = searchLimit.Type switch
+      if (MCGSParamsFixed.GRAPH_REWRITE_DUMP_REUSE_DIAGNOSTICS)
       {
-        SearchLimitType.BestValueMove => 1,
-        SearchLimitType.BestActionMove => 1,
-
-        SearchLimitType.NodesPerMove => (long)(MAX_MOVES_PER_GRAPH * (float)(searchLimit.Value + searchLimit.ValueIncrement)),
-        SearchLimitType.NodesForAllMoves => (long)(searchLimit.Value + searchLimit.ValueIncrement * MAX_MOVES_PER_GRAPH),
-
-        SearchLimitType.SecondsPerMove => (long)((searchLimit.Value + searchLimit.ValueIncrement) * MAX_NODES_PER_SECOND * MAX_MOVES_PER_GRAPH),
-        SearchLimitType.SecondsForAllMoves => (long)((searchLimit.Value + (searchLimit.ValueIncrement * MAX_MOVES_PER_GRAPH)) * MAX_NODES_PER_SECOND),
-        _ => MAX_NODES
-      };
-
-      maxNodes = Math.Min(MAX_NODES, maxNodes);
-
-      // Possibly apply tighter constraint based on fixedSearchLimit
-      if (fixedSearchLimit != null && fixedSearchLimit.IsNodesLimit)
-      {
-        long fixedMax = MAX_MOVES_PER_GRAPH * (long)(fixedSearchLimit.Value + fixedSearchLimit.ValueIncrement);
-        maxNodes = Math.Min(maxNodes, fixedMax);
+        Console.WriteLine($"Graph store sized at {maxNodesInt:N0} nodes "
+                        + $"({(maxNodesInt >= FullTierMaxNodes(paramsSearch) ? "full tier" : "small tier")}) "
+                        + $"for limit {searchLimitToUse}; total reserved VA now "
+                        + $"{(GraphStore.TotalReservedVirtualBytes + (long)(maxNodesInt * 1100L)) / (1024.0 * 1024.0 * 1024.0):F0} GB across "
+                        + $"{GraphStore.TotalNumAllocated - GraphStore.TotalNumDisposed + 1} live stores");
       }
-
-      // Possibly apply constraint based on max memory
-      long maxBytes = paramsSearch.MaxMemoryBytes;
-      const long MIN_BYTES_PER_NODE = 200; // average probably more typically 400 considering all associated data structures
-      long maxNodesAllowedInMemory = maxBytes / MIN_BYTES_PER_NODE;
-      maxNodes = Math.Min(maxNodes, maxNodesAllowedInMemory);
-
-      int maxNodesInt = (int)Math.Min(maxNodes + 1000, MAX_NODES);
 
       bool hasAction = Manager.NNEvaluator0.HasAction;
 
@@ -376,7 +389,7 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
       // Right-size the transposition dictionaries to the realistic expected number of distinct
       // positions for this search budget, instead of the worst-case node-buffer reservation (maxNodes).
       int dictionarySizeHint = EstimateInitialDictionaryCapacity(searchLimitToUse, Manager.ParamsSearch, 1 + (int)Manager.NNEvaluator0.EstNPSBatch);
-//      ConsoleUtils.WriteLineColored(ConsoleColor.Red, $"dict= {(float)dictionarySizeHint/1_000_000}  graph={maxNodesInt/1_000_000.0}");
+      //      ConsoleUtils.WriteLineColored(ConsoleColor.Red, $"dict= {(float)dictionarySizeHint/1_000_000}  graph={maxNodesInt/1_000_000.0}");
 
       graphToUse = new(maxNodesInt, hasAction,
                        Manager.ParamsSearch.EnableState,
@@ -406,6 +419,101 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
     (MGMove bestMove, BestMoveInfoMCGS moveInfo) = DoSearch(Manager, verbose, progressCallback,
                                                             moveImmediateIfOnlyOneMove, forcedMove);
     BestMove = bestMove;
+  }
+
+
+  /// <summary>
+  /// Assumed lower bound on average COMMITTED bytes per node across all graph data structures
+  /// (average probably more typically 400). Used to convert the MaxMemoryBytes budget into a
+  /// node-count cap. Note this bounds committed memory; the reserve-only virtual address space
+  /// per node is larger (~1 KB) but nearly free (see MCGSParamsFixed.SMALL_TIER_MAX_STORE_NODES).
+  /// </summary>
+  const long MIN_BYTES_PER_NODE = 300;
+
+  /// <summary>
+  /// Returns the "full tier" graph store size in nodes: the largest store this engine instance is
+  /// permitted, independent of any particular search limit. This is the reservation used for all
+  /// searches other than modest node-limited ones, and the target size when a small-tier store is
+  /// promoted (see GraphReuseManager). Bounded by the data-structure/RAM cap (GraphStore.MAX_NODES),
+  /// the user-configurable ParamsSearch.MaxNodes, and the committed-memory budget (MaxMemoryBytes).
+  /// </summary>
+  internal static int FullTierMaxNodes(ParamsSearch paramsSearch)
+  {
+    long maxNodes = Math.Min(GraphStore.MAX_NODES, paramsSearch.MaxNodes);
+
+    if (paramsSearch.MaxMemoryBytes > 0)
+    {
+      maxNodes = Math.Min(maxNodes, paramsSearch.MaxMemoryBytes / MIN_BYTES_PER_NODE);
+    }
+
+    return (int)Math.Max(1, maxNodes);
+  }
+
+
+  /// <summary>
+  /// Returns the number of nodes for which the stores of a new graph should be reserved
+  /// to accommodate a search with the specified limit (allowing also for the graph
+  /// possibly being reused over many subsequent moves).
+  ///
+  /// Two-tier policy. Reservation is reserve-only/commit-on-demand on both Linux and Windows, so
+  /// its only real cost is virtual address space (~1 KB/node of a ~128 TB per-process budget).
+  /// Therefore most searches simply reserve the FULL tier (FullTierMaxNodes) - eliminating any
+  /// possibility of the store proving too small mid-game. Only a modest node-based limit takes the
+  /// SMALL tier (the limit-derived whole-game estimate), so that many concurrent engines (e.g. a
+  /// research harness running ~100 in-process training matches) do not each reserve ~1 TB of
+  /// address space. A small-tier store that later proves too small is PROMOTED by copy, never
+  /// abandoned (see GraphReuseManager.PrepareGraphToUse). Time-based limits never take the small
+  /// tier: a mid-game promotion copy would burn clock time.
+  /// </summary>
+  /// <param name="searchLimit">Search limit for which the graph is being sized.</param>
+  /// <param name="fixedSearchLimit">Optionally a fixed (per-move) limit known to apply to all moves.</param>
+  /// <param name="paramsSearch">Search parameters (used to read graph reuse and memory settings).</param>
+  internal static int GraphStoreSizeNodes(SearchLimit searchLimit, SearchLimit fixedSearchLimit, ParamsSearch paramsSearch)
+  {
+    long fullTierNodes = FullTierMaxNodes(paramsSearch);
+
+    // Estimate the whole-game node requirement from the search limit.
+    // Note that if GraphReuseRewriteEnabled then we can be more aggressive in allowing more nodes
+    // because we will rewrite the graph to reduce if approaches the limit.
+    // TODO: possibly unify this with code already in SearchLimit
+    long MAX_MOVES_PER_GRAPH = paramsSearch.GraphReuseEnabled ? (paramsSearch.GraphReuseRewriteEnabled ? 150L : 400L) : 5L;
+    const long MAX_NODES_PER_SECOND = 500_000L;
+    long maxNodes = searchLimit.Type switch
+    {
+      SearchLimitType.BestValueMove => 1,
+      SearchLimitType.BestActionMove => 1,
+
+      SearchLimitType.NodesPerMove => (long)(MAX_MOVES_PER_GRAPH * (float)(searchLimit.Value + searchLimit.ValueIncrement)),
+      SearchLimitType.NodesForAllMoves => (long)(searchLimit.Value + searchLimit.ValueIncrement * MAX_MOVES_PER_GRAPH),
+
+      SearchLimitType.SecondsPerMove => (long)((searchLimit.Value + searchLimit.ValueIncrement) * MAX_NODES_PER_SECOND * MAX_MOVES_PER_GRAPH),
+      SearchLimitType.SecondsForAllMoves => (long)((searchLimit.Value + (searchLimit.ValueIncrement * MAX_MOVES_PER_GRAPH)) * MAX_NODES_PER_SECOND),
+      _ => fullTierNodes
+    };
+
+    maxNodes = Math.Min(fullTierNodes, maxNodes);
+
+    // Possibly apply tighter constraint based on fixedSearchLimit
+    if (fixedSearchLimit != null && fixedSearchLimit.IsNodesLimit)
+    {
+      long fixedMax = MAX_MOVES_PER_GRAPH * (long)(fixedSearchLimit.Value + fixedSearchLimit.ValueIncrement);
+      maxNodes = Math.Min(maxNodes, fixedMax);
+    }
+
+    // Small tier only for node-based limits with a modest whole-game estimate (see summary above).
+    bool limitIsNodesBased = searchLimit.IsNodesLimit
+                          || (fixedSearchLimit != null && fixedSearchLimit.IsNodesLimit);
+    bool smallTier = limitIsNodesBased && maxNodes <= MCGSParamsFixed.SMALL_TIER_MAX_STORE_NODES;
+
+    // With EnableState the full-tier jump is suppressed: AllStateVectors is an eagerly COMMITTED
+    // managed allocation of 8 bytes per reserved node (GraphStore constructor), which at full-tier
+    // sizes would commit multiple GB up front. The legacy limit-derived size is used instead.
+    if (smallTier || paramsSearch.EnableState)
+    {
+      return (int)Math.Min(maxNodes + 1000, fullTierNodes);
+    }
+
+    return (int)fullTierNodes;
   }
 
 
@@ -445,42 +553,106 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
 
 
   /// <summary>
-  /// Returns new SearchLimit, possibly adjusted for time overhead and max graph nodes.
+  /// Returns the move overhead (seconds) in effect for a game, given the configured value and the
+  /// starting time control of the game.
+  ///
+  /// The configured value (ParamsSearch.MoveOverheadSeconds) is used as-is unless it is still at its
+  /// default, in which case a game played under a short time control (a time-based search limit with
+  /// a starting value below MOVE_OVERHEAD_SHORT_TIME_CONTROL_THRESHOLD_SECONDS) instead receives the
+  /// smaller MOVE_OVERHEAD_SECONDS_SHORT_TIME_CONTROL, since the full default reserve would consume
+  /// an excessive fraction of such a game's time. An explicitly configured overhead (e.g. set by a
+  /// GUI via UCI MoveOverheadMs) is never overridden.
+  ///
+  /// The test is against the starting time control of the game (not the remaining clock), so the
+  /// overhead in effect is constant across all moves of a game.
   /// </summary>
-  /// <param name="limit"></param>
   /// <param name="paramsSearch"></param>
+  /// <param name="gameStartingTimeLimitSeconds">starting value of the game's time-based search limit,
+  /// or null if unknown or the limit is not time-based</param>
   /// <returns></returns>
-  SearchLimit AdjustedSearchLimit(SearchLimit limit, ParamsSearch paramsSearch)
+  static float EffectiveMoveOverheadSeconds(ParamsSearch paramsSearch, float? gameStartingTimeLimitSeconds)
   {
-    // Determine maximum number of tree nodes to allow store to grow to.
-    int? maxTreeNodes;
-    if (limit.MaxTreeNodes is not null)
+    bool isConfiguredValueDefault = paramsSearch.MoveOverheadSeconds == ParamsSearch.MOVE_OVERHEAD_SECONDS_DEFAULT;
+    bool isShortTimeControl = gameStartingTimeLimitSeconds is float startingSeconds
+                           && startingSeconds > 0
+                           && startingSeconds < ParamsSearch.MOVE_OVERHEAD_SHORT_TIME_CONTROL_THRESHOLD_SECONDS;
+
+    // If we have a starting time limit, carve out very small fraction as extra padding
+    // (insurance against long GC pauses possible with long games).
+    const float FRAC_START_TIME_PADDING = 0.002f;
+    const float MAX_EXTRA_PADDING_SECONDS = 10f;  
+    float extraPaddingSeconds = gameStartingTimeLimitSeconds is float ? ((float)gameStartingTimeLimitSeconds * FRAC_START_TIME_PADDING) : 0;
+    extraPaddingSeconds = Math.Min(extraPaddingSeconds, MAX_EXTRA_PADDING_SECONDS);
+
+    return isConfiguredValueDefault && isShortTimeControl ? ParamsSearch.MOVE_OVERHEAD_SECONDS_SHORT_TIME_CONTROL
+                                                          : (paramsSearch.MoveOverheadSeconds + extraPaddingSeconds);
+  }
+
+
+  /// <summary>
+  /// Returns the specified per-move search limit adjusted for actual execution:
+  ///
+  ///   - if applyMoveOverhead, the move overhead in effect (see EffectiveMoveOverheadSeconds)
+  ///     is held back from a time limit, so that the
+  ///     time spent emitting the move and any GUI/network latency do not push the move past its
+  ///     allotted time. The reserve is capped at half of the allotted time so that a short search
+  ///     (e.g. a "go movetime 100" analysis probe, where the overhead exceeds the whole budget) is
+  ///     shortened proportionally rather than collapsed to nothing.
+  ///     This applies only to true per-move limits; a limit allocated from a per-game clock has the
+  ///     overhead reserved once on the clock instead (see ClockAfterMoveOverheadReserve).
+  ///
+  ///   - any MaxTreeNodes configured in Ceres.json is installed if the limit does not already
+  ///     carry an explicit value (the UCI layer applies this setting itself; this covers the
+  ///     in-process entry points, such as tournaments and test suites, which do not).
+  ///     Note that the store's own capacity is enforced independently of this setting
+  ///     (see MCGSManager.CalcSearchStopStatus).
+  /// </summary>
+  /// <param name="limit">The per-move limit about to be searched.</param>
+  /// <param name="moveOverheadSeconds">The move overhead in effect (see EffectiveMoveOverheadSeconds).</param>
+  /// <param name="applyMoveOverhead">If the move overhead should be held back from this limit
+  /// (false when the limit came from a per-game clock which was already reserved against).</param>
+  /// <returns></returns>
+  static SearchLimit AdjustedPerMoveSearchLimit(SearchLimit limit, float moveOverheadSeconds,
+                                                bool applyMoveOverhead)
+  {
+    if (limit.MaxTreeNodes is null && CeresUserSettingsManager.Settings.MaxTreeNodes is not null)
     {
-      // Use explicit value specified.
-      maxTreeNodes = limit.MaxTreeNodes;
-    }
-    else if (CeresUserSettingsManager.Settings.MaxTreeNodes is not null)
-    {
-      // Use value explicitly set in Ceres.json.
-      maxTreeNodes = CeresUserSettingsManager.Settings.MaxTreeNodes;
-    }
-    else
-    {
-      // Use default value based on amount of physical memory.
-      maxTreeNodes = GraphStore.MAX_NODES - 2500;
+      limit = limit with { MaxTreeNodes = CeresUserSettingsManager.Settings.MaxTreeNodes };
     }
 
-    if (limit.IsTimeLimit)
+    if (!applyMoveOverhead || !limit.IsTimeLimit || moveOverheadSeconds <= 0 || limit.Value <= 0)
     {
-      return limit with
-      {
-        MaxTreeNodes = maxTreeNodes,
-        Value = Math.Max(0.01f, limit.Value - paramsSearch.MoveOverheadSeconds)
-      };
+      return limit;
     }
-    else
+
+    const float MIN_SEARCH_SECONDS = 0.01f;
+    const float MAX_FRACTION_RESERVED = 0.5f;
+
+    float overhead = Math.Min(moveOverheadSeconds, MAX_FRACTION_RESERVED * limit.Value);
+    return limit with { Value = Math.Max(MIN_SEARCH_SECONDS, limit.Value - overhead) };
+  }
+
+
+  /// <summary>
+  /// Returns the remaining game clock time of the specified per-game limit less the
+  /// move overhead in effect (see EffectiveMoveOverheadSeconds).
+  ///
+  /// Reserving once from the clock (rather than from every per-move allocation) maintains a
+  /// standing buffer of about the move overhead against move emission and GUI/network latency.
+  /// </summary>
+  /// <param name="searchLimit">A per-game limit whose Value is the remaining clock time.</param>
+  /// <param name="moveOverheadSeconds">The move overhead in effect (see EffectiveMoveOverheadSeconds).</param>
+  /// <returns></returns>
+  static float ClockAfterMoveOverheadReserve(SearchLimit searchLimit, float moveOverheadSeconds)
+  {
+    if (!searchLimit.IsTimeLimit || moveOverheadSeconds <= 0 || searchLimit.Value <= 0)
     {
-      return limit with { MaxTreeNodes = maxTreeNodes };
+      return searchLimit.Value;
     }
+
+    const float MAX_FRACTION_RESERVED = 0.5f;
+
+    float reserve = Math.Min(moveOverheadSeconds, MAX_FRACTION_RESERVED * searchLimit.Value);
+    return searchLimit.Value - reserve;
   }
 }

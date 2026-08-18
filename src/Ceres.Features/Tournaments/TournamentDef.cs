@@ -135,7 +135,7 @@ namespace Ceres.Features.Tournaments
     /// Controls whether each participating in-process Ceres MCGS engine writes a per-tournament
     /// diagnostic "minilog" text file (header, one line per move, per-game result footers).
     /// The file shares the PGN base name with a ".{engineID}.minilog.txt" suffix (with a companion
-    /// ".{engineID}.minilog.html" rendering). Globally gated by CeresUserSettings.EnableMiniLog.
+    /// ".{engineID}.minilog.html" rendering).
     /// Defaults to IfLongSearchLimits (write only for engines whose limit implies a long game).
     /// </summary>
     public MiniLogFilesMode MiniLogFiles = MiniLogFilesMode.IfLongSearchLimits;
@@ -254,9 +254,41 @@ namespace Ceres.Features.Tournaments
     public float BlunderDumpMaxPriorAbsQ = 0.70f;
 
     /// <summary>
+    /// Minimum amount (in units of Q) by which the blundering engine's best alternative root move must
+    /// have been better than the actual outcome for a candidate blunder to be reported.
+    ///
+    /// Suppresses the common false positive in which the position was already lost and no move could
+    /// have helped: the reference engine's evaluation swing then reflects its own belated discovery of
+    /// a win it already had, rather than an error by the opponent. 
+    /// 
+    /// Set to 0 to disable this check.
+    /// </summary>
+    public float BlunderDumpMinAlternativeUpsideQ = 0.10f;
+
+    /// <summary>
+    /// Minimum share of the search root's visits which the blundering engine's best alternative root
+    /// move must have received for its evaluation to be trusted when judging a candidate blunder.
+    ///
+    /// An alternative that was barely searched (typically because futility pruning shut it down) has
+    /// an evaluation which is noise, so it can neither establish that a better move existed nor
+    /// support the upside test above.
+    ///
+    /// Set to 0 to disable.
+    /// </summary>
+    public float BlunderDumpMinAlternativeFractionN = 0.10f;
+
+    /// <summary>
     /// The index of the processor group to which the engines should be affinitized. 
     /// </summary>
     public int ProcessGroupIndex = 0;
+
+    /// <summary>
+    /// Number of concurrent game threads running this tournament (1 if not parallel).
+    /// Assigned by TournamentManager onto each per-thread clone before that thread starts.
+    /// Used to decide whether a per-engine minilog must stage whole games before appending, since
+    /// all concurrent threads share one minilog file per engine (as they share one PGN file).
+    /// </summary>
+    public int NumConcurrentGameThreads = 1;
 
     /// <summary>
     /// Creation time of tournament (use as a unique ID for generating PGN)

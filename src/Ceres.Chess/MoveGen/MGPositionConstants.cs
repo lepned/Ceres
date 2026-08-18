@@ -69,85 +69,34 @@ namespace Ceres.Chess.MoveGen
     // Find the least significant bit
     public static ulong LSB(ulong bb) => (ulong)BitOperations.TrailingZeroCount(bb);
 
-    public static bool CanBlackKingMoveToCastlingPos(in MGPosition pos, int kingSq, int rookSq, int startSquare, int endSquare, bool moveLeft)
+    /// <summary>
+    /// Returns whether every square the king crosses while castling (from its current
+    /// square through to its destination, inclusive) is free of enemy attack.
+    ///
+    /// This replaces a walk which stepped the king one square at a time and ran a full
+    /// check detection at each step. The castling rook is excluded from the occupancy
+    /// used to build the attack map, since it vacates its square as part of the move.
+    /// </summary>
+    /// <param name="ctx">legality context of the position for the side to move</param>
+    /// <param name="kingSq">square the king starts on</param>
+    /// <param name="kingDestSq">square the king ends on (g1/c1, or g8/c8)</param>
+    /// <param name="rookSq">square the castling rook starts on</param>
+    internal static bool KingCastlingPathIsSafe(in MGMoveGen.MGGenContext ctx, int kingSq, int kingDestSq, int rookSq)
     {
-      BitBoard rook = 1UL << rookSq;
-      BitBoard maskRook = ~rook;
-      //remove the rook from the board
-      BitBoard A = pos.A & maskRook;
-      BitBoard B = pos.B & maskRook;
-      BitBoard C = pos.C & maskRook;
-      BitBoard D = pos.D & maskRook;
+      BitBoard path = MGSliderAttacks.BetweenBB(kingSq, kingDestSq) | (1UL << kingSq) | (1UL << kingDestSq);
 
-      BitBoard kingStart = 1UL << kingSq;
-      BitBoard moveKing = moveLeft ? kingStart << 1 : kingStart >> 1;
-
-      int start = startSquare;
-      int end = endSquare;
-      while (end >= start)
+      // Removing the rook can only add attacked squares, so a hit against the
+      // position's ordinary attack map is already decisive.
+      if ((path & ctx.DangerMap) != 0)
       {
-        bool inCheck = MGMoveGen.IsBlackInCheck(A, B, C, D);
-        if (inCheck)
-        {
-          return false;
-        }
-
-        BitBoard mask = ~kingStart;
-        kingStart = moveKing;
-
-        // Apply the mask to each bitboard
-        A = (A & mask) | moveKing;
-        B = (B & mask) | moveKing;
-        C = (C & mask) | moveKing;
-        D = (D & mask) | moveKing;
-        moveKing = moveLeft ? kingStart << 1 : kingStart >> 1;
-        start++;
+        return false;
       }
 
-      return true;
+      return (path & MGMoveGen.DangerMapForCastling(in ctx, 1UL << rookSq)) == 0;
     }
 
-    public static bool CanWhiteKingMoveToCastlingPos(in MGPosition pos, int kingSq, int rookSq, int startSquare, int endSquare, bool moveLeft)
-    {
-      BitBoard rook = 1UL << rookSq;
-      BitBoard maskRook = ~rook;
 
-      //remove the rook from the board
-      BitBoard A = pos.A & maskRook;
-      BitBoard B = pos.B & maskRook;
-      BitBoard C = pos.C & maskRook;
-      BitBoard D = pos.D;
-
-      BitBoard whitePieces = (A | B | C) & ~D;
-      BitBoard kingStart = 1UL << kingSq;
-      BitBoard moveKing = moveLeft ? kingStart << 1 : kingStart >> 1;
-
-      int start = startSquare;
-      int end = endSquare;
-      while (end >= start)
-      {
-        bool inCheck = MGMoveGen.IsWhiteInCheck(A, B, C, D);
-        if (inCheck)
-        {
-          return false;
-        }
-
-        BitBoard mask = ~kingStart;
-        kingStart = moveKing;
-
-        // Apply the mask to each bitboard
-        A = (A & mask) | moveKing;
-        B = (B & mask) | moveKing;
-        C = (C & mask) | moveKing;
-
-        moveKing = moveLeft ? kingStart << 1 : kingStart >> 1;
-        start++;
-      }
-
-      return true;
-    }
-
-    public static bool CanBlackKingReachLongRook(in MGPosition pos, out ulong rookPos)
+    internal static bool CanBlackKingReachLongRook(in MGPosition pos, in MGMoveGen.MGGenContext ctx, out ulong rookPos)
     {
       BitBoard occ = pos.A | pos.B | pos.C;
       BitBoard bKing = (pos.D & pos.C & pos.B & pos.A) & MGPositionConstants.lastRank;
@@ -169,23 +118,13 @@ namespace Ceres.Chess.MoveGen
 
       if (canCastle == 0UL)
       {
-        bool result;
-        if (kingSq > 61)
-        {
-          result = CanBlackKingMoveToCastlingPos(pos, kingSq, rookSq, 61, kingSq, false);
-        }
-        else
-        {
-          result = CanBlackKingMoveToCastlingPos(pos, kingSq, rookSq, kingSq, 61, true);
-        }
-
-        return result;
+        return KingCastlingPathIsSafe(in ctx, kingSq, BLACK_KING_CASTLE_LONG_DEST, rookSq);
       }
 
       return false;
     }
 
-    public static bool CanWhiteKingReachLongRook(in MGPosition pos, out ulong rookPos)
+    internal static bool CanWhiteKingReachLongRook(in MGPosition pos, in MGMoveGen.MGGenContext ctx, out ulong rookPos)
     {
       BitBoard occ = pos.A | pos.B | pos.C;
       BitBoard wRooks = (~pos.D & pos.C & ~pos.B & ~pos.A) & MGPositionConstants.firstRank;
@@ -207,22 +146,13 @@ namespace Ceres.Chess.MoveGen
 
       if (canCastle == 0UL)
       {
-        bool result;
-        if (kingSq > 5)
-        {
-          result = CanWhiteKingMoveToCastlingPos(pos, kingSq, rookSq, 5, kingSq, false);
-        }
-        else
-        {
-          result = CanWhiteKingMoveToCastlingPos(pos, kingSq, rookSq, kingSq, 5, true);
-        }
-        return result;
+        return KingCastlingPathIsSafe(in ctx, kingSq, WHITE_KING_CASTLE_LONG_DEST, rookSq);
       }
-      return false;
 
+      return false;
     }
 
-    public static bool CanBlackKingReachShortRook(in MGPosition pos, out ulong rookPos)
+    internal static bool CanBlackKingReachShortRook(in MGPosition pos, in MGMoveGen.MGGenContext ctx, out ulong rookPos)
     {
       BitBoard bKing = (pos.D & pos.C & pos.B & pos.A) & MGPositionConstants.lastRank;
       BitBoard bRooks = (pos.D & pos.C & ~pos.B & ~pos.A) & MGPositionConstants.lastRank;
@@ -244,14 +174,13 @@ namespace Ceres.Chess.MoveGen
 
       if (canCastle == 0UL)
       {
-        bool result = CanBlackKingMoveToCastlingPos(pos, kingSq, rookSq, 57, kingSq, false);
-        return result;
+        return KingCastlingPathIsSafe(in ctx, kingSq, BLACK_KING_CASTLE_SHORT_DEST, rookSq);
       }
 
       return false;
     }
 
-    public static bool CanWhiteKingReachShortRook(in MGPosition pos, out ulong rookPos)
+    internal static bool CanWhiteKingReachShortRook(in MGPosition pos, in MGMoveGen.MGGenContext ctx, out ulong rookPos)
     {
       BitBoard occ = pos.A | pos.B | pos.C;
       BitBoard wKing = (~pos.D & pos.C & pos.B & pos.A) & MGPositionConstants.firstRank; // pos.B & pos.C; //GetKings(pos.A, pos.B, pos.C, pos.D);
@@ -272,11 +201,18 @@ namespace Ceres.Chess.MoveGen
       BitBoard canCastle = v & occRow1WithoutKingAndRook;
       if (canCastle == 0UL)
       {
-        return CanWhiteKingMoveToCastlingPos(pos, kingSq, rookSq, 1, kingSq, false);
+        return KingCastlingPathIsSafe(in ctx, kingSq, WHITE_KING_CASTLE_SHORT_DEST, rookSq);
       }
 
       return false;
     }
+
+
+    // Square the king ends on when castling (recall bit 0 is h1, so g1 is 1 and c1 is 5).
+    const int WHITE_KING_CASTLE_SHORT_DEST = 1;   // g1
+    const int WHITE_KING_CASTLE_LONG_DEST = 5;    // c1
+    const int BLACK_KING_CASTLE_SHORT_DEST = 57;  // g8
+    const int BLACK_KING_CASTLE_LONG_DEST = 61;   // c8
   }
 
   public static class MGPositionConstants

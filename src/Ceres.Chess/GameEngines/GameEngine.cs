@@ -176,6 +176,12 @@ namespace Ceres.Chess.GameEngines
     /// </summary>
     public virtual bool TryDumpLastSearchDiagnostics(System.IO.TextWriter writer, string description) => false;
 
+    /// <summary>
+    /// If supported by this engine type, returns a compact summary of the root move statistics from
+    /// the most recently completed search (for example, for post-hoc blunder analysis), otherwise null.
+    /// </summary>
+    public virtual GameEngineRootMoveSummary TryGetLastSearchRootMoveSummary() => null;
+
     readonly object dumpLockObj = new();
     public void DumpFullMoveHistory(List<GameMoveStat> gameMoveHistory, bool weAreWhite)
     {

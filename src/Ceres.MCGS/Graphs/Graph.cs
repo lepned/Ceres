@@ -918,6 +918,9 @@ public unsafe partial class Graph : IDisposable
     // Other fields such as uncertainty and child index
     // can remain at their default values (zero).
 
+    // Edge is fully written; make it visible to readers.
+    PublishNewEdge(parentNode);
+
     return new GEdge(ref thisEdgeRef, parent: parentNode, child: default);
   }
 
@@ -1074,6 +1077,9 @@ public unsafe partial class Graph : IDisposable
       thisEdgeRef.SetUncertaintyValues(childNode.UncertaintyValue, childNode.UncertaintyPolicy);
     }
 
+    // Edge is fully written; make it visible to readers.
+    PublishNewEdge(parentNode);
+
     return new GEdge(ref thisEdgeRef, parentNode, child: childNode);
   }
 
@@ -1085,8 +1091,8 @@ public unsafe partial class Graph : IDisposable
     // Edges expected to be expanded strictly in index order: creating edge k relies on edge k-1's
     // block index being set.  An out-of-order expansion (a "hole" left by selection) would
     // otherwise read a garbage block index below and corrupt memory.
-    if (!parentNode.IsGraphRoot 
-      && indexOfChildInParent != parentNode.NumEdgesExpanded 
+    if (!parentNode.IsGraphRoot
+      && indexOfChildInParent != parentNode.NumEdgesExpanded
       && !haveWarnedEdgeOutOfOrder)
     {
       ConsoleUtils.WriteLineColored(ConsoleColor.Yellow, $"Out-of-order edge expansion: indexOfChildInParent={indexOfChildInParent} "
@@ -1095,16 +1101,10 @@ public unsafe partial class Graph : IDisposable
     }
     Debug.Assert(indexOfChildInParent < parentNode.NumPolicyMoves);
 
-    // Update number of expanded edges at the parent.
-    // N.B. A node may have NumEdgesExpanded > 0 with corresponding edge N values of 0,
-    //      yielding N = sumEdgeN + 1 where sumEdgeN = 0.
-    //      This occurs when an edge is created during selection but the visit is 
-    //      subsequently aborted (e.g.PiggybackPendingNNEval failure or transposition collision),
-    //      so BackupToEdge/ BackupToNode are never called.
-    //      The state is harmless — PUCT treats an expanded edge with N = 0 identically
-    //      to an unexpanded move — and self-corrects on the next visit.
-    parentNode.NodeRef.NumEdgesExpanded++;
-
+    // N.B. The parent's NumEdgesExpanded is NOT incremented here. It is the flag by which readers
+    //      decide that an edge exists at a given index, so it is incremented only once the header
+    //      AND the edge body have been fully written - see PublishNewEdge, which every caller
+    //      invokes as its last step.
     Span<GEdgeHeaderStruct> edgeHeaderStructsSpan = parentNode.EdgeHeadersSpan;
 
     int edgesStartBlockIndex;
@@ -1135,6 +1135,24 @@ public unsafe partial class Graph : IDisposable
     Span<GEdgeStruct> edgeSpanThisBlock = Store.EdgesStore.SpanAtBlockIndex(edgesStartBlockIndex);
     return ref edgeSpanThisBlock[edgesIndexInBlock];
 #endif
+  }
+
+
+  /// <summary>
+  /// Publishes an edge created by InitializeNewEdge, by incrementing the parent's count of
+  /// expanded edges. Must be called only after both the edge header and the edge body have been
+  /// fully written.
+  ///
+  /// NumEdgesExpanded is what tells a reader that an edge exists at a given index, so it is the
+  /// publication flag for everything written above it. 
+  /// The volatile write orders the header and body stores ahead of the count store. 
+  /// On x86-64 stores are already ordered, so this compiles to a plain store; 
+  /// the ordering is required on weakly ordered targets such as ARM64.
+  /// </summary>
+  /// <param name="parentNode"></param>
+  private static void PublishNewEdge(GNode parentNode)
+  {
+    Volatile.Write(ref parentNode.NodeRef.NumEdgesExpanded, (byte)(parentNode.NodeRef.NumEdgesExpanded + 1));
   }
 
 
@@ -1293,13 +1311,13 @@ public unsafe partial class Graph : IDisposable
     Span<GEdgeHeaderStruct> childEdgeHeaders = node.EdgeHeadersSpan;
 
 
-    Span<double> n = stats.N.Span;
-    Span<double> nInFlightAdjusted = stats.NInFlightAdjusted.Span;
-    Span<double> p = stats.P.Span;
-    Span<double> w = stats.W.Span;
-    Span<double> uv = stats.UV.Span;
+    Span<float> n = stats.N.Span;
+    Span<float> nInFlightAdjusted = stats.NInFlightAdjusted.Span;
+    Span<float> p = stats.P.Span;
+    Span<float> w = stats.W.Span;
+    Span<float> uv = stats.UV.Span;
 #if ACTION_ENABLED
-    Span<double> a = stats.A.Span;
+    Span<float> a = stats.A.Span;
 #endif
 
     int numEdgesExpanded = node.NumEdgesExpanded;
@@ -1338,12 +1356,14 @@ public unsafe partial class Graph : IDisposable
         p[i] = refEdge.P;
         n[i] = refEdge.N;
 #if ACTION_ENABLED
-        a[i] = (double)childEdgeHeaders[i].ActionV; // Read from header (survives expansion; edge struct has no storage)
+        a[i] = (float)childEdgeHeaders[i].ActionV; // Read from header (survives expansion; edge struct has no storage)
 #endif
         // Extract value uncertainty with fill-in if missing
-        uv[i] = (double)refEdge.UncertaintyV;
+        uv[i] = (float)refEdge.UncertaintyV;
 
-        w[i] = refEdge.N == 0 ? 0 : (refEdge.Q * refEdge.N);
+        // W is accumulated in double and narrowed once: Q is double and N can be large, so forming
+        // the product in float first would lose more than the final rounding does.
+        w[i] = refEdge.N == 0 ? 0 : (float)(refEdge.Q * refEdge.N);
 
         if (isIteratorIDZero)
         {
@@ -1362,7 +1382,7 @@ public unsafe partial class Graph : IDisposable
         p[i] = (childEdgeHeaders[i].P);
         n[i] = 0;
 #if ACTION_ENABLED
-        a[i] = (double)childEdgeHeaders[i].ActionV;
+        a[i] = (float)childEdgeHeaders[i].ActionV;
 #endif
         uv[i] = 0;
         w[i] = 0;
@@ -1372,7 +1392,7 @@ public unsafe partial class Graph : IDisposable
 
       stats.SumNumInFlightAll += sumVisitedThisChild;
 
-      double nI = n[i]; // Now n[i] is already an int, no need for conversion
+      double nI = n[i]; // widened back to double for the summary accumulators below
       if (nI + sumVisitedThisChild > 0)
       {
         stats.SumPVisited += p[i];

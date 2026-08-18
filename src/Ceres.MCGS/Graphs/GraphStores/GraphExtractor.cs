@@ -197,12 +197,13 @@ public static unsafe class GraphExtractor
   /// </summary>
   public static ExtractResult TryExtract(Graph oldGraph, NodeIndex newRootIndex,
                                          PositionWithHistory priorMoves,
-                                         int maxNodesToExtract = int.MaxValue)
+                                         int maxNodesToExtract = int.MaxValue,
+                                         int maxNodesTargetStore = -1)
   {
     Stopwatch sw = Stopwatch.StartNew();
     ReachableSet reachable = EnumerateReachable(oldGraph, newRootIndex, int.MaxValue);
     double enumerateSeconds = sw.Elapsed.TotalSeconds;
-    return ExtractFromReachable(oldGraph, newRootIndex, priorMoves, reachable, enumerateSeconds);
+    return ExtractFromReachable(oldGraph, newRootIndex, priorMoves, reachable, enumerateSeconds, maxNodesTargetStore);
   }
 
 
@@ -216,9 +217,13 @@ public static unsafe class GraphExtractor
   /// <param name="priorMoves">Position+history for the new root (initializes root state/hashes).</param>
   /// <param name="reachable">The reachable set from <see cref="EnumerateReachable"/> (must not be aborted).</param>
   /// <param name="enumerateSeconds">Time already spent enumerating (for reporting in the result).</param>
+  /// <param name="maxNodesTargetStore">Optionally the node capacity for the NEW graph's stores
+  /// (default: same as the old graph). Used by store PROMOTION (GraphReuseManager), which copies a
+  /// too-small store's graph into a larger store instead of abandoning it.</param>
   public static ExtractResult ExtractFromReachable(Graph oldGraph, NodeIndex newRootIndex,
                                                    PositionWithHistory priorMoves,
-                                                   ReachableSet reachable, double enumerateSeconds)
+                                                   ReachableSet reachable, double enumerateSeconds,
+                                                   int maxNodesTargetStore = -1)
   {
     int numUsedOld = oldGraph.NodesStore.NumUsedNodes;
     int numReachable = reachable.Count;
@@ -230,6 +235,9 @@ public static unsafe class GraphExtractor
       return new ExtractResult(null, numUsedOld, 0, enumerateSeconds, 0f, false,
                                enumerateSeconds, 0, 0, null, false);
     }
+
+    // A requested target store size must leave room for the copied nodes (plus modest headroom).
+    Debug.Assert(maxNodesTargetStore < 0 || maxNodesTargetStore > numReachable + 1000);
 
     int numNodesOld = oldGraph.NodesStore.NumTotalNodes;   // includes null node at index 0
 
@@ -251,7 +259,7 @@ public static unsafe class GraphExtractor
     // Graph.Initialize -> a ~128-bucket throwaway) rather than numReachable: the only use of the
     // constructor dictionary is the root-node registration done during construction, which is never
     // read before Phase 6 rebuilds the dictionaries from scratch.
-    Graph newGraph = new(maxNodes: oldGraph.Store.MaxNodes,
+    Graph newGraph = new(maxNodes: maxNodesTargetStore > 0 ? maxNodesTargetStore : oldGraph.Store.MaxNodes,
                          hasAction: oldGraph.Store.HasAction,
                          hasState: oldGraph.Store.HasState,
                          graphEnabled: oldGraph.Store.GraphEnabled,

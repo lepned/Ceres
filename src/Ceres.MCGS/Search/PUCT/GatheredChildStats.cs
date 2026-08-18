@@ -55,16 +55,15 @@ internal class GatheredChildStats
   /// <summary>
   /// Sum of D (D * N) across all children that have been visited.
   /// </summary>
-  internal double SumDVisited; 
+  internal double SumDVisited;
 
-
-  internal SpanAligned<double> N;
-  internal SpanAligned<double> NInFlightAdjusted; // weighted sum across all selectors (by 1 or collision fraction)
-  internal SpanAligned<double> P;
-  internal SpanAligned<double> W;
-  internal SpanAligned<double> UV;
-  internal SpanAligned<double> UP;
-  internal SpanAligned<double> A;
+  internal SpanAligned<float> N;
+  internal SpanAligned<float> NInFlightAdjusted; // weighted sum across all selectors (by 1 or collision fraction)
+  internal SpanAligned<float> P;
+  internal SpanAligned<float> W;
+  internal SpanAligned<float> UV;
+  internal SpanAligned<float> UP;
+  internal SpanAligned<float> A;
 
 
   /// <summary>
@@ -72,13 +71,13 @@ internal class GatheredChildStats
   /// </summary>
   internal GatheredChildStats()
   {
-    N = new SpanAligned<double>(PUCTScoreCalcVector.MAX_CHILDREN, ALIGNMENT);
-    NInFlightAdjusted = new SpanAligned<double>(PUCTScoreCalcVector.MAX_CHILDREN, ALIGNMENT);
-    P = new SpanAligned<double>(PUCTScoreCalcVector.MAX_CHILDREN, ALIGNMENT);
-    W = new SpanAligned<double>(PUCTScoreCalcVector.MAX_CHILDREN, ALIGNMENT);
-    UV = new SpanAligned<double>(PUCTScoreCalcVector.MAX_CHILDREN, ALIGNMENT);
-    UP = new SpanAligned<double>(PUCTScoreCalcVector.MAX_CHILDREN, ALIGNMENT);
-    A = new SpanAligned<double>(PUCTScoreCalcVector.MAX_CHILDREN, ALIGNMENT);
+    N = new SpanAligned<float>(PUCTScoreCalcVector.MAX_CHILDREN, ALIGNMENT);
+    NInFlightAdjusted = new SpanAligned<float>(PUCTScoreCalcVector.MAX_CHILDREN, ALIGNMENT);
+    P = new SpanAligned<float>(PUCTScoreCalcVector.MAX_CHILDREN, ALIGNMENT);
+    W = new SpanAligned<float>(PUCTScoreCalcVector.MAX_CHILDREN, ALIGNMENT);
+    UV = new SpanAligned<float>(PUCTScoreCalcVector.MAX_CHILDREN, ALIGNMENT);
+    UP = new SpanAligned<float>(PUCTScoreCalcVector.MAX_CHILDREN, ALIGNMENT);
+    A = new SpanAligned<float>(PUCTScoreCalcVector.MAX_CHILDREN, ALIGNMENT);
   }
 
 
@@ -111,21 +110,21 @@ internal class GatheredChildStats
       return false;
     }
 
-    Span<double> sN = N.Span;
-    Span<double> sInFlight = NInFlightAdjusted.Span;
-    Span<double> sP = P.Span;
-    Span<double> sA = A.Span;
-    Span<double> sW = W.Span;
-    Span<double> sUV = UV.Span;
-    Span<double> sUP = UP.Span;
+    Span<float> sN = N.Span;
+    Span<float> sInFlight = NInFlightAdjusted.Span;
+    Span<float> sP = P.Span;
+    Span<float> sA = A.Span;
+    Span<float> sW = W.Span;
+    Span<float> sUV = UV.Span;
+    Span<float> sUP = UP.Span;
 
-    Span<double> osN = otherStats.N.Span;
-    Span<double> osInFlight = otherStats.NInFlightAdjusted.Span;
-    Span<double> osP = otherStats.P.Span;
-    Span<double> osA = otherStats.A.Span;
-    Span<double> osW = otherStats.W.Span;
-    Span<double> osUV = otherStats.UV.Span;
-    Span<double> osUP = otherStats.UP.Span;
+    Span<float> osN = otherStats.N.Span;
+    Span<float> osInFlight = otherStats.NInFlightAdjusted.Span;
+    Span<float> osP = otherStats.P.Span;
+    Span<float> osA = otherStats.A.Span;
+    Span<float> osW = otherStats.W.Span;
+    Span<float> osUV = otherStats.UV.Span;
+    Span<float> osUP = otherStats.UP.Span;
 
     for (int i = 0; i <= maxIndex; i++)
     {
@@ -147,13 +146,13 @@ internal class GatheredChildStats
   #region ToString
 
   /// <summary>
-  /// Returns string representation of a Span<double>.
+  /// Returns string representation of a Span<float>.
   /// </summary>
   /// <param name="name"></param>
   /// <param name="s"></param>
   /// <param name="maxItems"></param>
   /// <returns></returns>
-  static string DumpSpan(string name, Span<double> s, int maxItems)
+  static string DumpSpan(string name, Span<float> s, int maxItems)
   {
     string str = $"{name}: ";
     for (int i = 0; i < s.Length && i < maxItems; i++)

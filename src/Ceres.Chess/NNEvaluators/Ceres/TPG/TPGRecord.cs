@@ -195,7 +195,33 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
     /// </summary>
     public byte PUNIMOpponent;
 
-    public fixed byte UnusedArray[42];
+    #region Opponent Evals
+
+    /// <summary>
+    /// Number of nodes searched by opponent (reference) engine 1 (0 if not evaluated).
+    /// </summary>
+    public uint Opponent1Nodes;
+
+    /// <summary>
+    /// Value (W - L) of the position according to opponent engine 1,
+    /// from the perspective of the side to move.
+    /// </summary>
+    public Half Opponent1Q;
+
+    /// <summary>
+    /// Draw probability of the position according to opponent engine 1.
+    /// </summary>
+    public Half Opponent1D;
+
+    /// <summary>
+    /// Best move according to opponent engine 1
+    /// (encoded from the perspective of the side to move, as with RefModel1BestMove).
+    /// </summary>
+    public EncodedMove Opponent1BestMove;
+
+    #endregion
+
+    public fixed byte UnusedArray[32];
 
     /// <summary>
     /// Number of search nodes in the search.
@@ -278,6 +304,12 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
 
 
     public readonly float SearchQ => WDLQ[0] - WDLQ[2];
+
+    /// <summary>
+    /// Returns if an evaluation from opponent (reference) engine 1 is present in this record.
+    /// </summary>
+    public readonly bool HasOpponent1Eval => Opponent1Nodes > 0;
+
     public readonly float ResultQDeblundered => WDLResultDeblundered[0] - WDLResultDeblundered[2];
     public readonly float ResultQNonDeblundered => WDLResultNonDeblundered[0] - WDLResultNonDeblundered[2];
 

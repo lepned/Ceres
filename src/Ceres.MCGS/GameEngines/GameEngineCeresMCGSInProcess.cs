@@ -190,6 +190,58 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   MCGSMiniLog miniLog;
 
   /// <summary>
+  /// Number of move lines written to the minilog for the game currently in progress.
+  /// </summary>
+  int miniLogMovesThisGame;
+
+  /// <summary>
+  /// Whether a result footer has already been written for the game currently in progress.
+  /// The tournament supplies a full footer of its own (MiniLogWriteGameResult); this flag stops
+  /// the synthetic standalone footer from duplicating it.
+  /// </summary>
+  bool miniLogFooterWritten;
+
+  /// <summary>
+  /// Whether the "=== NEW GAME ===" separator for the game in progress still needs to be written.
+  /// The separator is emitted lazily, immediately before that game's first content, rather than at ResetGame.
+  /// </summary>
+  bool miniLogSeparatorPending = true;
+
+  /// <summary>
+  /// Per-game accumulator behind the minilog "=== TIME USAGE ===" summary section: aggregates
+  /// per-move allocation vs. consumption and search stop reasons so end-of-game time usage
+  /// can be characterized (how much of the per-move budgets went unused, and why).
+  /// </summary>
+  sealed class MiniLogTimeUsageStats
+  {
+    public int NumTimedMoves;
+    public double SumAllocSec;
+    public double SumElapsedSec;
+    public readonly List<double> BudgetFracsPct = new();
+    public int StopFutility, StopTimeLimit, StopOnlyMove, StopTablebase, StopInstamove, StopOther;
+    public int NumMovesUnderIncrement;
+    public float MinPostMoveClock = float.NaN;
+    public double FirstMoveElapsed = double.NaN;
+
+    public void Reset()
+    {
+      NumTimedMoves = 0;
+      SumAllocSec = 0;
+      SumElapsedSec = 0;
+      BudgetFracsPct.Clear();
+      StopFutility = StopTimeLimit = StopOnlyMove = StopTablebase = StopInstamove = StopOther = 0;
+      NumMovesUnderIncrement = 0;
+      MinPostMoveClock = float.NaN;
+      FirstMoveElapsed = double.NaN;
+    }
+  }
+
+  /// <summary>
+  /// Accumulator for the current game's minilog time-usage summary (reset per game).
+  /// </summary>
+  readonly MiniLogTimeUsageStats miniLogTimeUsage = new();
+
+  /// <summary>
   /// Time remaining on the tournament clock (in seconds) at the start of the current move, or
   /// null when not playing in a timed tournament. Set by the tournament before each search and
   /// logged as "TimeRem" on the move line.
@@ -313,9 +365,16 @@ public class GameEngineCeresMCGSInProcess : GameEngine
     // Use default limit manager if not specified.
     if (gameLimitManager == null)
     {
-      // Check for alternate limits manager specified in Ceres settings.
-      string altManager = CeresUserSettingsManager.Settings.LimitsManagerName;
-      if (altManager == null)
+      // Check for an alternate limits manager: the per-engine ParamsSearch setting takes
+      // precedence over the process-wide Ceres settings (so two engines in one tournament
+      // can A/B different managers).
+      string altManager = searchParams.LimitsManagerName;
+      if (string.IsNullOrEmpty(altManager))
+      {
+        altManager = CeresUserSettingsManager.Settings.LimitsManagerName;
+      }
+
+      if (string.IsNullOrEmpty(altManager))
       {
         gameLimitManager = new ManagerGameLimitCeresMCGS(searchParams.GameLimitUsageAggressiveness);
       }
@@ -345,6 +404,14 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   bool isFirstMoveOfGame = true;
 
   /// <summary>
+  /// Starting time control of the current game (seconds), captured from the first time-based search
+  /// limit seen since the last ResetGame, or null if none yet seen (or the limit is not time-based).
+  /// Used to resolve the move overhead in effect for the game (see MCGSSearch), which must be based
+  /// on the starting time control rather than the remaining clock (which shrinks as the game plays out).
+  /// </summary>
+  float? gameStartingTimeLimitSeconds;
+
+  /// <summary>
   /// Resets all state between games.
   /// </summary>
   /// <param name="gameID">optional game descriptive string</param>
@@ -355,9 +422,16 @@ public class GameEngineCeresMCGSInProcess : GameEngine
     Search = null;
 
     isFirstMoveOfGame = true;
+    gameStartingTimeLimitSeconds = null;
+
+    MiniLogFinishOpenGame();
+
     CurrentGameID = gameID;
 
-    miniLog?.WriteNewGameSeparator(gameID);
+    miniLogSeparatorPending = true;
+    miniLogMovesThisGame = 0;
+    miniLogFooterWritten = false;
+    miniLogTimeUsage.Reset();
   }
 
 
@@ -416,8 +490,8 @@ public class GameEngineCeresMCGSInProcess : GameEngine
     }
 
     // Validate that the search limit is compatible with FixedSearchLimit (if specified).
-    if (FixedSearchLimit != null 
-        && FixedSearchLimit.IsNodesLimit 
+    if (FixedSearchLimit != null
+        && FixedSearchLimit.IsNodesLimit
         && searchLimit.IsNodesLimit
         && searchLimit.Value > FixedSearchLimit.Value)
     {
@@ -434,6 +508,14 @@ public class GameEngineCeresMCGSInProcess : GameEngine
     {
       MaxTreeVisits = searchLimit.MaxTreeVisits ?? MCGSParamsFixed.MAX_VISITS,
     };
+
+    // Capture the starting time control of this game (the first time-based limit seen since ResetGame).
+    // For a per-game clock this is the full time control, since no time has yet been consumed;
+    // for a per-move limit it is that per-move allotment.
+    if (gameStartingTimeLimitSeconds is null && searchLimit.IsTimeLimit && searchLimit.Value > 0)
+    {
+      gameStartingTimeLimitSeconds = searchLimit.Value;
+    }
 
     // Set up callback passthrough if provided
     MCGSManager.MCGSProgressCallback callbackMCGS = null;
@@ -576,8 +658,11 @@ public class GameEngineCeresMCGSInProcess : GameEngine
       {
         // Emit the limits-manager allocation reasoning (if captured) immediately before the move
         // line it governs, so it sits next to that move header (mirrors the inline blunder block).
+        MiniLogEnsureGameStarted();
         miniLog.AppendLimitsSection(result.Search.Manager.LastGameLimitOutputs?.DiagnosticText);
         miniLog.WriteMoveLine(BuildMiniLogMoveLine(result, bestMoveInfo));
+        UpdateMiniLogTimeUsage(result);
+        miniLogMovesThisGame++;
       }
       catch (Exception exc)
       {
@@ -703,6 +788,132 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   }
 
 
+  /// <summary>
+  /// Minimum fraction of a node's visits which a child must have received before its Q is
+  /// considered reliable enough to appear in the root move summary (with an absolute floor below).
+  /// </summary>
+  const float ROOT_SUMMARY_MIN_CHILD_FRAC_N = 0.005f;
+
+  /// <summary>
+  /// Absolute minimum visits required of a child appearing in the root move summary.
+  /// </summary>
+  const int ROOT_SUMMARY_MIN_CHILD_N = 32;
+
+
+  /// <summary>
+  /// Returns a compact summary of the root move statistics of the most recently completed search.
+  ///
+  /// Sign conventions: the Q on an edge is stated from the perspective of the side to move at the
+  /// child node. Root children are therefore negated to reach our perspective, whereas the replies
+  /// one level further down are already stated from our perspective and are used as-is.
+  /// </summary>
+  public override GameEngineRootMoveSummary TryGetLastSearchRootMoveSummary()
+  {
+    try
+    {
+      GameEngineSearchResultCeresMCGS result = LastSearchResult;
+      MCGSManager manager = result?.Search?.Manager;
+      if (manager == null)
+      {
+        return null;
+      }
+
+      GNode root = manager.Engine.SearchRootNode;
+      if (root.IsNull || root.NumEdgesExpanded == 0)
+      {
+        return null;
+      }
+
+      // Use the authoritative search root position, not GNode.CalcPosition(): under
+      // position-equivalence coalescing a node may describe an earlier occurrence of the same
+      // placement. For the same reason moves are decoded with MoveMGFromPos rather than the
+      // MoveMG property (which internally calls ParentNode.CalcPosition()).
+      MGPosition rootPosMG = manager.Engine.SearchRootPosMG;
+      Position rootPos = rootPosMG.ToPosition;
+      GEdge playedEdge = root.EdgeForMove(result.BestMoveInfo.BestMove);
+      if (playedEdge.IsNull)
+      {
+        return null;
+      }
+
+      GameEngineRootMoveSummary summary = new()
+      {
+        RootN = root.N,
+        StopStatus = manager.StopStatus.ToString(),
+        PlayedMoveSAN = SANOfEdge(playedEdge, in rootPosMG),
+        PlayedMoveQ = (float)-playedEdge.Q,
+        PlayedMoveN = playedEdge.N,
+        PlayedMoveP = (float)playedEdge.P,
+      };
+
+      // Best alternative root move (best Q among the sufficiently visited moves not played)
+      // and the move most favored by policy.
+      int minRootChildN = MinChildN(root.N);
+      float bestAlternativeQ = float.MinValue;
+      float topPolicy = float.MinValue;
+      for (int i = 0; i < root.NumEdgesExpanded; i++)
+      {
+        GEdge edge = root.ChildEdgeAtIndex(i);
+        if (edge.IsNull)
+        {
+          continue;
+        }
+
+        if ((float)edge.P > topPolicy)
+        {
+          topPolicy = (float)edge.P;
+          summary.TopPolicyMoveSAN = SANOfEdge(edge, in rootPosMG);
+        }
+
+        float qOurs = (float)-edge.Q;
+        if (edge != playedEdge && edge.N >= minRootChildN && qOurs > bestAlternativeQ)
+        {
+          bestAlternativeQ = qOurs;
+          summary.HaveBestAlternative = true;
+          summary.BestAlternativeSAN = SANOfEdge(edge, in rootPosMG);
+          summary.BestAlternativeQ = qOurs;
+          summary.BestAlternativeN = edge.N;
+          summary.BestAlternativeP = (float)edge.P;
+        }
+      }
+
+      // Opponent's best reply to the move played. A reply's Q is already stated from our
+      // perspective, and the opponent picks the reply minimizing it.
+      GNode playedNode = playedEdge.ChildNode;
+      if (!playedNode.IsNull && playedNode.NumEdgesExpanded > 0)
+      {
+        MGPosition playedPos = rootPosMG;
+        playedPos.MakeMove(playedEdge.MoveMGFromPos(in rootPosMG));
+        int minReplyN = MinChildN(playedNode.N);
+        float bestReplyQ = float.MaxValue;
+        for (int i = 0; i < playedNode.NumEdgesExpanded; i++)
+        {
+          GEdge replyEdge = playedNode.ChildEdgeAtIndex(i);
+          if (!replyEdge.IsNull && replyEdge.N >= minReplyN && (float)replyEdge.Q < bestReplyQ)
+          {
+            bestReplyQ = (float)replyEdge.Q;
+            summary.HaveBestReply = true;
+            summary.BestReplySAN = SANOfEdge(replyEdge, in playedPos);
+            summary.BestReplyQ = bestReplyQ;
+          }
+        }
+      }
+
+      return summary;
+    }
+    catch (Exception)
+    {
+      // Purely diagnostic; never allow a failure here to disturb play.
+      return null;
+    }
+
+    static int MinChildN(int parentN) => Math.Max(ROOT_SUMMARY_MIN_CHILD_N, (int)(ROOT_SUMMARY_MIN_CHILD_FRAC_N * parentN));
+
+    static string SANOfEdge(GEdge edge, in MGPosition posMG)
+      => MGMoveConverter.ToMove(edge.MoveMGFromPos(in posMG)).ToSAN(posMG.ToPosition);
+  }
+
+
   bool haveEstablishedOpponentGraphReuse = false;
 
   private void PossiblyInitializeForOpponentGraphReuse()
@@ -823,7 +1034,8 @@ public class GameEngineCeresMCGSInProcess : GameEngine
                   curPositionAndMoves, searchLimit, verbose, lastSearchStartTime,
                   gameMoveHistory, callback, null, isFirstMoveOfGame,
                   MoveImmediateIfOnlyOneMove, forcedMove: forcedMove,
-                  fixedSearchLimit: FixedSearchLimit);
+                  fixedSearchLimit: FixedSearchLimit,
+                  gameStartingTimeLimitSeconds: gameStartingTimeLimitSeconds);
     return Search;
   }
 
@@ -876,6 +1088,8 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   {
     try
     {
+      // The final game of a run is never followed by a ResetGame, so terminate it here.
+      MiniLogFinishOpenGame();
       miniLog?.Close();
     }
     catch (Exception)
@@ -902,14 +1116,21 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   /// enabler used by the tournament: calling it activates logging regardless of EmitMiniLog.
   /// Intended to be called once, before the first search. A null file name is ignored.
   /// </summary>
-  public void InitMiniLog(string fileName, SearchLimit assignedSearchLimit)
+  /// <param name="fileName">full path of the minilog file to write</param>
+  /// <param name="assignedSearchLimit">search limit assigned to this engine (recorded in the header)</param>
+  /// <param name="expectedConcurrentWriters">
+  /// number of concurrent game threads whose engine instances share this file (1 = exclusive).
+  /// Greater than one causes whole games to be staged and appended atomically, so that games played
+  /// concurrently do not interleave within the single aggregated file.
+  /// </param>
+  public void InitMiniLog(string fileName, SearchLimit assignedSearchLimit, int expectedConcurrentWriters = 1)
   {
     if (fileName == null || miniLog != null)
     {
       return;
     }
 
-    miniLog = new MCGSMiniLog(fileName);
+    miniLog = MCGSMiniLog.Acquire(fileName, expectedConcurrentWriters);
     miniLog.WriteHeader(ID, EvaluatorDef, assignedSearchLimit, SearchParams, SelectParams);
 
     // Tournament path enables logging here (regardless of EmitMiniLog); make sure the limit manager
@@ -927,7 +1148,187 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   /// </summary>
   public void MiniLogWriteGameResult(string footerText)
   {
-    miniLog?.AppendGameResultFooter(footerText);
+    if (miniLog == null)
+    {
+      return;
+    }
+
+    // A game that logged no moves has no separator yet; emit it so the footer cannot be
+    // misattributed to the preceding game's section by the (positional) HTML renderer.
+    MiniLogEnsureGameStarted();
+
+    // The time-usage summary must precede the footer: the footer is the call that
+    // completes/flushes the staged game block.
+    MiniLogAppendTimeUsageSection();
+
+    miniLog.AppendGameResultFooter(footerText);
+    miniLogFooterWritten = true;
+  }
+
+
+  /// <summary>
+  /// Accumulates this move's time-usage data (allocation vs. consumption, stop reason)
+  /// into the per-game statistics behind the minilog "=== TIME USAGE ===" section.
+  /// Only moves searched under a positive time-typed per-move limit are counted.
+  /// </summary>
+  void UpdateMiniLogTimeUsage(GameEngineSearchResultCeresMCGS result)
+  {
+    MCGSManager manager = result.Search.Manager;
+    SearchLimit limInit = manager.SearchLimitInitial;
+    double elapsed = manager.TimeElapsedTotalSeconds;
+    if (limInit == null || !SearchLimit.TypeIsTimeLimit(limInit.Type)
+      || !(limInit.Value > 0) || double.IsNaN(elapsed))
+    {
+      return;
+    }
+
+    MiniLogTimeUsageStats t = miniLogTimeUsage;
+    t.NumTimedMoves++;
+    t.SumAllocSec += limInit.Value;
+    t.SumElapsedSec += elapsed;
+    t.BudgetFracsPct.Add(100.0 * elapsed / limInit.Value);
+
+    switch (manager.StopStatus)
+    {
+      case MCGSManager.SearchStopStatus.FutilityPrunedAllMoves: t.StopFutility++; break;
+      case MCGSManager.SearchStopStatus.TimeLimitReached: t.StopTimeLimit++; break;
+      case MCGSManager.SearchStopStatus.OnlyOneLegalMove: t.StopOnlyMove++; break;
+      case MCGSManager.SearchStopStatus.TablebaseImmediateMove: t.StopTablebase++; break;
+      case MCGSManager.SearchStopStatus.Instamove: t.StopInstamove++; break;
+      default: t.StopOther++; break;
+    }
+
+    // Moves consuming less than the increment leave the game clock higher than before the move.
+    float increment = manager.LastGameLimitInputs?.IncrementSelf ?? 0;
+    if (increment > 0 && elapsed < increment)
+    {
+      t.NumMovesUnderIncrement++;
+    }
+
+    if (TournamentClockRemainingSeconds is float clockAtMoveStart)
+    {
+      float postMoveClock = clockAtMoveStart - (float)elapsed;
+      if (float.IsNaN(t.MinPostMoveClock) || postMoveClock < t.MinPostMoveClock)
+      {
+        t.MinPostMoveClock = postMoveClock;
+      }
+    }
+
+    if (miniLogMovesThisGame == 0)
+    {
+      t.FirstMoveElapsed = elapsed;
+    }
+  }
+
+
+  /// <summary>
+  /// Emits the per-game "=== TIME USAGE ===" summary section to the minilog and resets the
+  /// accumulator. No-op when no minilog is active or the game had no timed moves (e.g. pure
+  /// node-limit play). Must be called before the game result footer is appended (only the
+  /// footer completes/flushes the staged game block). Never throws.
+  /// </summary>
+  void MiniLogAppendTimeUsageSection()
+  {
+    MiniLogTimeUsageStats t = miniLogTimeUsage;
+    if (miniLog == null || t.NumTimedMoves == 0)
+    {
+      return;
+    }
+
+    try
+    {
+      CultureInfo ci = CultureInfo.InvariantCulture;
+
+      List<double> sortedFracs = new(t.BudgetFracsPct);
+      sortedFracs.Sort();
+      double mean = 0;
+      foreach (double frac in sortedFracs)
+      {
+        mean += frac;
+      }
+      mean /= sortedFracs.Count;
+      static double Percentile(List<double> sorted, double p)
+        => sorted[(int)Math.Round(p * (sorted.Count - 1))];
+
+      string nl = System.Environment.NewLine;
+      StringBuilder sb = new();
+      sb.Append("NumTimedMoves=").Append(t.NumTimedMoves.ToString(ci))
+        .Append(" SumAllocSec=").Append(FormatNumber(t.SumAllocSec, "F2", ci))
+        .Append(" SumElapsedSec=").Append(FormatNumber(t.SumElapsedSec, "F2", ci))
+        .Append(" UnusedAllocSec=").Append(FormatNumber(t.SumAllocSec - t.SumElapsedSec, "F2", ci)).Append(nl);
+      sb.Append("MeanBudgetFrac=").Append(FormatNumber(mean, "F1", ci))
+        .Append("% P25BudgetFrac=").Append(FormatNumber(Percentile(sortedFracs, 0.25), "F1", ci))
+        .Append("% P50BudgetFrac=").Append(FormatNumber(Percentile(sortedFracs, 0.50), "F1", ci))
+        .Append("% P75BudgetFrac=").Append(FormatNumber(Percentile(sortedFracs, 0.75), "F1", ci)).Append("%").Append(nl);
+      sb.Append("StopFutility=").Append(t.StopFutility.ToString(ci))
+        .Append(" StopTimeLimit=").Append(t.StopTimeLimit.ToString(ci))
+        .Append(" StopOnlyMove=").Append(t.StopOnlyMove.ToString(ci))
+        .Append(" StopTablebase=").Append(t.StopTablebase.ToString(ci))
+        .Append(" StopInstamove=").Append(t.StopInstamove.ToString(ci))
+        .Append(" StopOther=").Append(t.StopOther.ToString(ci)).Append(nl);
+      sb.Append("NumMovesUnderIncrement=").Append(t.NumMovesUnderIncrement.ToString(ci))
+        .Append(" MinPostMoveClock=").Append(FormatNumber(t.MinPostMoveClock, "F2", ci))
+        .Append(" FirstMoveElapsed=").Append(FormatNumber(t.FirstMoveElapsed, "F2", ci));
+
+      miniLog.AppendTimeUsageSection(sb.ToString());
+    }
+    catch (Exception exc)
+    {
+      ConsoleUtils.WriteLineColored(ConsoleColor.Yellow, "Minilog write failed: " + exc.Message);
+    }
+    finally
+    {
+      t.Reset();
+    }
+  }
+
+
+  /// <summary>
+  /// Writes the pending "=== NEW GAME ===" separator for the game in progress, if not yet written.
+  /// Called immediately before emitting any content belonging to that game.
+  /// </summary>
+  void MiniLogEnsureGameStarted()
+  {
+    if (miniLog != null && miniLogSeparatorPending)
+    {
+      miniLog.WriteNewGameSeparator(CurrentGameID);
+      miniLogSeparatorPending = false;
+    }
+  }
+
+
+  /// <summary>
+  /// Writes a minimal result footer for the game in progress if nothing else has, so that every
+  /// game section in the log is terminated the same way regardless of how the engine is driven.
+  /// The engine itself never learns the game outcome (the tournament does, and supplies a full
+  /// footer via MiniLogWriteGameResult), so the synthetic footer records Result=Unknown.
+  /// Called when a game ends: at the next ResetGame, and at disposal for the final game.
+  /// No-op if a footer was already written, or if the game logged no moves.
+  /// </summary>
+  void MiniLogFinishOpenGame()
+  {
+    if (miniLog == null || miniLogFooterWritten || miniLogMovesThisGame == 0)
+    {
+      return;
+    }
+
+    try
+    {
+      // Emit any accumulated time-usage summary before the synthetic footer completes the game.
+      MiniLogAppendTimeUsageSection();
+
+      miniLog.AppendGameResultFooter(
+          "=== GAME RESULT ===" + System.Environment.NewLine
+        + $"ThisEngine={ID} Result=Unknown Reason=NoResultRecorded" + System.Environment.NewLine
+        + $"GameID={CurrentGameID ?? "(unnamed)"}" + System.Environment.NewLine
+        + $"MovesLogged={miniLogMovesThisGame}" + System.Environment.NewLine
+        + "=== END GAME RESULT ===");
+      miniLogFooterWritten = true;
+    }
+    catch (Exception exc)
+    {
+      ConsoleUtils.WriteLineColored(ConsoleColor.Yellow, "Minilog write failed: " + exc.Message);
+    }
   }
 
 
@@ -935,6 +1336,13 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   /// True if a diagnostic minilog is currently being written by this engine.
   /// </summary>
   public bool IsMiniLogActive => miniLog != null;
+
+
+  /// <summary>
+  /// True if this engine created its minilog file, rather than attaching to a file already opened
+  /// by the corresponding engine of another concurrent game thread.
+  /// </summary>
+  public bool MiniLogIsPrimaryWriter => miniLog?.IsPrimaryWriter ?? false;
 
 
   /// <summary>
@@ -949,7 +1357,13 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   /// </summary>
   public void MiniLogAppendBlunder(string blunderText)
   {
-    miniLog?.AppendBlunderSection(blunderText);
+    if (miniLog == null)
+    {
+      return;
+    }
+
+    MiniLogEnsureGameStarted();
+    miniLog.AppendBlunderSection(blunderText);
   }
 
 
@@ -1038,6 +1452,7 @@ public class GameEngineCeresMCGSInProcess : GameEngine
     {
       sb.Append(", Sel=").Append(bestMoveInfo.SelectionNote);
     }
+    sb.Append(", Stop=").Append(manager.StopStatus.ToString());
     sb.Append(" | ");
     sb.Append(BuildMiniLogCandidateTable(root, in rootMG, in rootPos, rootN, bestMoveInfo, ci));
 

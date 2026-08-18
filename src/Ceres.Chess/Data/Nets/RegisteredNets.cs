@@ -65,6 +65,7 @@ namespace Ceres.Chess.Data.Nets
 
         {"BT3", ONNXNet16LC0("BT3-768x15x24h-swa-2790000.pb.gz_fp16#16")},
         {"BT3_FP16_TRT", ONNXNet16LC0("BT3-768x15x24h-swa-2790000.pb.gz_fp16#16", true)},
+        {"BT3_NATIVE", SimpleLC0Net("BT3-768x15x24h-swa-2790000.pb.gz")},
         {"BT3_160k", ONNXNet32LC0("BT3-768x15x24h-swa-onnx-160000-baseline.pb.gz")},
         {"BT3_480k_TRT", ONNXNet16LC0("BT3-768x15x24h-swa-480000.pb.gz_fp16#16", true)},
         {"BT3_810k", ONNXNet32LC0("BT3-768x15x24h-swa-onnx-810000-baseline.pb.gz")},
@@ -140,6 +141,9 @@ namespace Ceres.Chess.Data.Nets
         {"T3_DISTILL_512_15_FP16", ONNXNet32LC0("t3-512x15x16h-distill-swa-2767500.pb.gz_fp16#16") },
         {"T3_DISTILL_512_15_FP16_TRT", ONNXNet16LC0("t3-512x15x16h-distill-swa-2767500.pb.gz_fp16#16", true)},
         {"T3_DISTILL_512_15_NATIVE", SimpleLC0Net("t3-512x15x16h-distill-swa-2767500.pb.gz#16") },
+
+        {"T3_DISTILL2_512_15_FP16_TRT", ONNXNet16LC0("t3-512x15x16h-distill2-swa-03477500.pb.gz.onnx#16", true)},
+        {"T3_DISTILL2_512_15_NATIVE", SimpleLC0Net("t3-512x15x16h-distill2-swa-03477500.pb.gz#16") },
 
         {"T3_RPE_512_15_NATIVE", SimpleLC0Net("t3-512x15x16h-rpe-distill-swa-4677500-vanilla-fp16.pb.gz") },
         {"T3_RPE_512_15_FP16_TRT", ONNXNet16LC0("t3-512x15x16h-rpe-distill-swa-4677500-opset18-vanilla-fp16.pb.gz#16") }, // use CUDA16

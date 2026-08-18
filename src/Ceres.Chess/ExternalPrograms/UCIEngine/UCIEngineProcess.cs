@@ -50,7 +50,7 @@ namespace Ceres.Chess.External.CEngine
 
     public string EngineName { set; private get; }
 
-    public StreamReader EngineOutput =>  EngineProcess.StandardOutput; 
+    public StreamReader EngineOutput => EngineProcess.StandardOutput;
 
     public System.IO.StreamWriter EngineInput => EngineProcess.StandardInput;
 
@@ -62,7 +62,7 @@ namespace Ceres.Chess.External.CEngine
     string lastCommandSent;
 
 
-    public UCIEngineProcess(string engineName, string exePath, string args = null, string workingDir = null, Dictionary<string,string> environmentVariables = null)
+    public UCIEngineProcess(string engineName, string exePath, string args = null, string workingDir = null, Dictionary<string, string> environmentVariables = null)
     {
       EngineName = engineName;
       EXEPath = exePath;
@@ -71,7 +71,7 @@ namespace Ceres.Chess.External.CEngine
       EngineProcess = new Process();
       EnvironmentVariables = environmentVariables;
     }
-    
+
     public void SendCommand(string command)
     {
       if (!String.IsNullOrEmpty(command))
@@ -98,13 +98,13 @@ namespace Ceres.Chess.External.CEngine
         if (EngineProcess.HasExited)
         {
           Console.WriteLine("\r\n");
-          Console.WriteLine("EXE         : " + EngineProcess.StartInfo.FileName);
-          Console.WriteLine("Args        : " + EngineProcess.StartInfo.Arguments);
+          Console.WriteLine("EXE         : " + EXEPath);
+          Console.WriteLine("Args        : " + Args);
           Console.WriteLine("Working Dir : " + EngineProcess.StartInfo.WorkingDirectory);
           throw new Exception($"Error: the engine process has exited ({descString}) last command was {lastCommandSent}");
         }
-//        else if (lastError != null)
-//          throw new Exception($"UCI error {lastError} ({descString})");
+        //        else if (lastError != null)
+        //          throw new Exception($"UCI error {lastError} ({descString})");
 
         System.Threading.Thread.Sleep(1);
         if (!haveWarnedWait && waitCount == 30_000)
@@ -134,7 +134,7 @@ namespace Ceres.Chess.External.CEngine
 
     void ErrorReceviedEvent(object sender, DataReceivedEventArgs e)
     {
-      Console.WriteLine($"UCIEngineProcessError: { e.Data }");
+      Console.WriteLine($"UCIEngineProcessError: {e.Data}");
     }
 
     void ReceviedEvent(object sender, DataReceivedEventArgs e)
@@ -158,6 +158,102 @@ namespace Ceres.Chess.External.CEngine
       }
     }
 
+    /// <summary>
+    /// Splits a command line argument string into individual arguments,
+    /// using the same rules as ProcessStartInfo.Arguments (quotes delimit arguments
+    /// and are removed, backslashes escape quotes, doubled quotes within a quoted
+    /// region yield a literal quote).
+    /// </summary>
+    static List<string> SplitArguments(string arguments)
+    {
+      List<string> args = new();
+      if (string.IsNullOrWhiteSpace(arguments))
+      {
+        return args;
+      }
+
+      System.Text.StringBuilder current = new();
+      bool inQuotes = false;
+      bool haveArg = false;
+
+      for (int i = 0; i < arguments.Length; i++)
+      {
+        char c = arguments[i];
+
+        if (c == '\\')
+        {
+          // Count the run of consecutive backslashes.
+          int numBackslash = 0;
+          while (i < arguments.Length && arguments[i] == '\\')
+          {
+            numBackslash++;
+            i++;
+          }
+
+          if (i < arguments.Length && arguments[i] == '"')
+          {
+            // Each pair of backslashes is one literal backslash,
+            // an odd one out escapes the following quote.
+            current.Append('\\', numBackslash / 2);
+            if (numBackslash % 2 != 0)
+            {
+              current.Append('"');
+            }
+            else
+            {
+              i--; // leave the quote to be processed on the next iteration
+            }
+          }
+          else
+          {
+            // Backslashes not followed by a quote are literal.
+            current.Append('\\', numBackslash);
+            i--;
+          }
+          haveArg = true;
+          continue;
+        }
+
+        if (c == '"')
+        {
+          if (inQuotes && i < arguments.Length - 1 && arguments[i + 1] == '"')
+          {
+            // Doubled quote within a quoted region is a literal quote.
+            current.Append('"');
+            i++;
+          }
+          else
+          {
+            inQuotes = !inQuotes;
+          }
+          haveArg = true;
+          continue;
+        }
+
+        if ((c == ' ' || c == '\t') && !inQuotes)
+        {
+          if (haveArg)
+          {
+            args.Add(current.ToString());
+            current.Clear();
+            haveArg = false;
+          }
+          continue;
+        }
+
+        current.Append(c);
+        haveArg = true;
+      }
+
+      if (haveArg)
+      {
+        args.Add(current.ToString());
+      }
+
+      return args;
+    }
+
+
     public void StartEngine(bool checkExecutableExists = true)
     {
       if (EngineName == null)
@@ -167,15 +263,51 @@ namespace Ceres.Chess.External.CEngine
 
       if (checkExecutableExists && !File.Exists(EXEPath))
       {
-        throw new Exception($"Engine executable { EXEPath} not found");
+        throw new Exception($"Engine executable {EXEPath} not found");
       }
 
-      EngineProcess.StartInfo.FileName = EXEPath;
-      EngineProcess.StartInfo.Arguments = Args;
       EngineProcess.StartInfo.UseShellExecute = false;
       EngineProcess.StartInfo.RedirectStandardInput = true;
       EngineProcess.StartInfo.RedirectStandardOutput = true;
       EngineProcess.StartInfo.RedirectStandardError = true;
+
+      // Isolate the engine from interactive Ctrl-C. Otherwise the engine dies immediately upon
+      // Ctrl-C, breaking pipes mid-game while the tournament shutdown handler is still trying to
+      // finish gracefully. Orderly termination is via "quit" (TerminateEngine), and
+      // ChildProcessGuard still force-kills (SIGKILL) the engine if this process exits,
+      // so it cannot be orphaned.
+      if (OperatingSystem.IsWindows())
+      {
+        EngineProcess.StartInfo.FileName = EXEPath;
+        EngineProcess.StartInfo.Arguments = Args;
+
+        // A process started in a new process group has Ctrl-C delivery disabled by default,
+        // so console Ctrl-C no longer reaches the engine. (This property is Windows-only;
+        // setting it on Unix throws PlatformNotSupportedException.)
+        EngineProcess.StartInfo.CreateNewProcessGroup = true;
+      }
+      else
+      {
+        // On Unix the terminal delivers SIGINT/SIGQUIT to the entire foreground process group,
+        // which the engine would inherit membership of. Launch through a shell which marks those
+        // signals ignored and then execs the engine: exec preserves the PID (so EngineProcess
+        // refers to the engine itself, and kill/HasExited work unchanged) and the ignored
+        // disposition survives exec, making the engine immune to terminal Ctrl-C.
+        // Deliberately NOT setsid: staying in the same session leaves Linux autogroup
+        // (per-session) CPU scheduling identical to launching the engine directly.
+        // The executable and its arguments are passed as separate positional parameters ($0, $@)
+        // rather than interpolated into the script text, so that characters which are special to
+        // the shell (parentheses, semicolons, quotes, etc.) appearing within arguments
+        // (e.g. LC0 backend options such as "(backend=onnx-trt,gpu=0)") are not interpreted.
+        EngineProcess.StartInfo.FileName = "/bin/bash";
+        EngineProcess.StartInfo.ArgumentList.Add("-c");
+        EngineProcess.StartInfo.ArgumentList.Add("trap '' INT QUIT; exec \"$0\" \"$@\"");
+        EngineProcess.StartInfo.ArgumentList.Add(EXEPath);
+        foreach (string arg in SplitArguments(Args))
+        {
+          EngineProcess.StartInfo.ArgumentList.Add(arg);
+        }
+      }
 
       // Possibly set provided environment variables
       if (EnvironmentVariables != null)
@@ -192,7 +324,7 @@ namespace Ceres.Chess.External.CEngine
       }
       else
       {
-        EngineProcess.StartInfo.WorkingDirectory = new FileInfo(EngineProcess.StartInfo.FileName).DirectoryName;
+        EngineProcess.StartInfo.WorkingDirectory = new FileInfo(EXEPath).DirectoryName;
       }
 
       if (!VERBOSE)
@@ -227,7 +359,7 @@ namespace Ceres.Chess.External.CEngine
       }
       else
       {
-        throw new Exception($"Engine process start failed for { EngineName }");
+        throw new Exception($"Engine process start failed for {EngineName}");
       }
 
     }

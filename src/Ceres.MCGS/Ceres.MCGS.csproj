@@ -27,7 +27,6 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <InternalsVisibleTo Include="Ceres.MCGS.Test" />
     <InternalsVisibleTo Include="Ceres.MCGS.TestSuite" />
   </ItemGroup>
   

@@ -175,6 +175,7 @@ namespace Ceres.Chess.UserSettings
         const string DEFAULT_CERES_JSON = """
 {
   "SyzygyPath": null,
+  "StockfishPath": null,
   "DirCeresNetworks": ".",
   "DirLC0Networks": ".",
   "device": "GPU:0"

@@ -224,6 +224,10 @@ namespace Ceres.Chess
         {
           Result = GameResult.BlackWins;
         }
+        else if (result == "*")
+        {
+          Result = GameResult.Unterminated;
+        }
       }
       else
       {

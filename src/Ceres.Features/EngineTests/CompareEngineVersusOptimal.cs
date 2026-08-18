@@ -21,6 +21,7 @@ using System.Threading.Tasks;
 using Ceres.Base.Benchmarking;
 using Ceres.Base.DataType.Trees;
 using Ceres.Base.Math;
+using Ceres.Base.Misc;
 using Ceres.Chess;
 using Ceres.Chess.GameEngines;
 using Ceres.Chess.MoveGen;
@@ -119,13 +120,13 @@ namespace Ceres.Features.EngineTests
       WriteIntroBanner();
 
       // Install Ctrl-C handler to allow ad hoc clean termination of tournament (with stats).
-      ConsoleCancelEventHandler ctrlCHandler = new ConsoleCancelEventHandler((object sender,
-        ConsoleCancelEventArgs args) =>
+      // Scoped registration: unsubscribed on every exit path so the run is not kept
+      // reachable forever via the static Console.CancelKeyPress event.
+      using ConsoleCancelHandlerScope ctrlCScope = new((object sender, ConsoleCancelEventArgs args) =>
       {
         Console.WriteLine("Pending shutdown....");
         shutdownRequested = true;
-      }); ;
-      Console.CancelKeyPress += ctrlCHandler;
+      });
 
       if (CeresUserSettingsManager.Settings.TablebaseDirectory != null)
       {

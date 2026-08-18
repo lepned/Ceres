@@ -86,14 +86,14 @@ namespace Ceres.Base.OperatingSystem
     public string StoreInfoString()
     {
 
-      double gbUsed = Marshal.SizeOf<T>() * rawMemoryManager.NumItemsAllocated / (1024.0 * 1024.0 * 1024.0);
+      double gbCommitted = Marshal.SizeOf<T>() * rawMemoryManager.NumItemsAllocated / (1024.0 * 1024.0 * 1024.0);
       return "MemoryBufferOS<" + typeof(T).Name + "[" + Marshal.SizeOf<T>() + " bytes] " +
              (UseExistingSharedMemory ? "shared " : "private ") +
              (UseIncrementalAlloc ? "incremental " : "preallocated ") +
-             NumItems + " items, " +
-             rawMemoryManager.NumItemsAllocated + " reserved " +
-             MathF.Round((float)rawMemoryManager.NumItemsAllocated / NumItems, 4) + " use ratio, " +
-             $"{System.Math.Round(gbUsed, 3)}gb used>";
+             NumItems + " items reserved, " +
+             rawMemoryManager.NumItemsAllocated + " committed " +
+             "(" + MathF.Round((float)rawMemoryManager.NumItemsAllocated / NumItems, 4) + " commit ratio), " +
+             $"{System.Math.Round(gbCommitted, 3)}gb committed>";
     }
 
 

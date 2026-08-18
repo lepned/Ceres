@@ -227,9 +227,33 @@ namespace Ceres.Chess.NNEvaluators.CUDA
     public override int MaxBatchSize => maxBatchSize;
 
     /// <summary>
-    /// Miscellaneous information about the evaluator (network file size used to gate batch sizing).
+    /// Lazily computed backing value for Info, and the object guarding its initialization.
     /// </summary>
-    public override EvaluatorInfo Info => new EvaluatorInfo(0, FileSizeBytesOrZero(Evaluator?.Net?.FileName));
+    EvaluatorInfo infoCached;
+    readonly object infoCachedLockObj = new();
+
+    /// <summary>
+    /// Miscellaneous information about the evaluator (network file size used to gate batch sizing).
+    ///
+    /// </summary>
+    public override EvaluatorInfo Info
+    {
+      get
+      {
+        string netFileName = Evaluator?.Net?.FileName;
+        if (netFileName == null)
+        {
+          // Network file not resolvable (possibly not yet constructed); report unknown size
+          // without caching, so a later call can still pick up the real value.
+          return new EvaluatorInfo(0);
+        }
+
+        lock (infoCachedLockObj)
+        {
+          return infoCached ??= new EvaluatorInfo(0, FileSizeBytesOrZero(netFileName));
+        }
+      }
+    }
 
 
     #endregion
@@ -311,14 +335,14 @@ namespace Ceres.Chess.NNEvaluators.CUDA
 #endif
       }
 
-      return new PositionEvaluationBatch(IsWDL, HasM, HasUncertaintyV, HasUncertaintyP, 
+      return new PositionEvaluationBatch(IsWDL, HasM, HasUncertaintyV, HasUncertaintyP,
                                          HasAction, HasValueSecondary, HasState,
-                                         positions.NumPos, policies, null, w, l, default, default, m, default, 
+                                         positions.NumPos, policies, null, w, l, default, default, m, default,
                                          default, default, activations, new TimingStats(), default, default, copyResults);
     }
 
 
-#region Optional Async support
+    #region Optional Async support
 
     protected override Task DoLaunchEvaluateBatchAsync(IEncodedPositionBatchFlat positions, bool retrieveSupplementalResults = false)
     {
@@ -327,7 +351,7 @@ namespace Ceres.Chess.NNEvaluators.CUDA
       {
         try
         {
-          int numPos = positions == null ? numPreparedPositions : positions.NumPos; 
+          int numPos = positions == null ? numPreparedPositions : positions.NumPos;
           StartEvaluateIntoBuffers(positions, numPos, retrieveSupplementalResults);
         }
         catch (Exception ex)
@@ -338,7 +362,7 @@ namespace Ceres.Chess.NNEvaluators.CUDA
       });
     }
 
-    public override IPositionEvaluationBatch GetLastAsyncBatchResult(IEncodedPositionBatchFlat positions, 
+    public override IPositionEvaluationBatch GetLastAsyncBatchResult(IEncodedPositionBatchFlat positions,
                                                                      short[] numMoves,
                                                                      short[] moveIndices,
                                                                      bool retrieveSupplementalResults,
@@ -347,7 +371,7 @@ namespace Ceres.Chess.NNEvaluators.CUDA
       return GetPostprocessedBatch(positions, numMoves, moveIndices, retrieveSupplementalResults, makeCopyOfResults);
     }
 
-#endregion
+    #endregion
 
 
     const int NUM_POSITIONS_PER_THREAD_INPUT = 48;
@@ -454,7 +478,7 @@ namespace Ceres.Chess.NNEvaluators.CUDA
 
       Span<float> policiesMasked = io.OutputPolicyHeadMasked.AsSpan();
       Span<short> moveIndicesSpan = moveIndices != null ? moveIndices.AsSpan() : io.InputMoveIndices.AsSpan();
-      Span<short> numMovesSpan = numMovesArray != null ? numMovesArray.AsSpan() :  io.InputNumMovesUsed.AsSpan();
+      Span<short> numMovesSpan = numMovesArray != null ? numMovesArray.AsSpan() : io.InputNumMovesUsed.AsSpan();
 
       Span<FP16> mlhSpan = Evaluator.mlhOutputBuffer.AsSpan();
       Span<FP16> wdlOutputBuffer = Evaluator.wdlOutputBuffer.AsSpan();

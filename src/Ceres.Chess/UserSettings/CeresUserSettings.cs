@@ -74,6 +74,12 @@ namespace Ceres.Chess.UserSettings
     public string DirExternalEngines { get; set; } = ".";
 
     /// <summary>
+    /// Full path to the Stockfish executable (optional).
+    /// If null, GameEngineStockfish searches PATH and the conventional install locations.
+    /// </summary>
+    public string StockfishPath { get; set; } = null;
+
+    /// <summary>
     /// Default value for Ceres network specification string (for network evaluation).
     /// </summary>
     public string DefaultNetworkSpecString { get; set; }

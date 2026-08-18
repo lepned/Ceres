@@ -34,6 +34,14 @@ internal class PositionsEvaluationBatchMerged : IPositionEvaluationBatch
   internal readonly int[] BatchSizes;
 
   /// <summary>
+  /// Number of leading entries of Batches/BatchSizes belonging to this merged batch.
+  /// The arrays are allowed to be longer than this: callers may reuse fixed-size buffers across
+  /// calls, in which case the trailing entries still hold data from an earlier (wider) call and
+  /// must not be counted, enumerated, or disposed here.
+  /// </summary>
+  internal readonly int NumBatches;
+
+  /// <summary>
   /// Cumulative offsets for each batch to enable O(log n) lookup.
   /// CumulativeOffsets[i] = sum of BatchSizes[0..i-1]
   /// </summary>
@@ -60,15 +68,23 @@ internal class PositionsEvaluationBatchMerged : IPositionEvaluationBatch
   /// </summary>
   /// <param name="batches"></param>
   /// <param name="batchSizes"></param>
-  internal PositionsEvaluationBatchMerged(IPositionEvaluationBatch[] batches, int[] batchSizes)
+  /// <param name="numBatches">Number of leading entries of batches/batchSizes that are in use.</param>
+  internal PositionsEvaluationBatchMerged(IPositionEvaluationBatch[] batches, int[] batchSizes, int numBatches)
   {
+    if (numBatches < 1 || numBatches > batches.Length || numBatches > batchSizes.Length)
+    {
+      throw new ArgumentOutOfRangeException(nameof(numBatches),
+        $"numBatches {numBatches} not within [1, min({batches.Length}, {batchSizes.Length})].");
+    }
+
     Batches = batches;
     BatchSizes = batchSizes;
+    NumBatches = numBatches;
 
     // Pre-compute cumulative offsets for efficient lookup
-    cumulativeOffsets = new int[batches.Length];
+    cumulativeOffsets = new int[numBatches];
     int cumulativeSum = 0;
-    for (int i = 0; i < batches.Length; i++)
+    for (int i = 0; i < numBatches; i++)
     {
       cumulativeOffsets[i] = cumulativeSum;
       cumulativeSum += batchSizes[i];
@@ -275,7 +291,7 @@ internal class PositionsEvaluationBatchMerged : IPositionEvaluationBatch
   public IEnumerator<NNPositionEvaluationBatchMember> GetEnumerator()
   {
     int globalIndex = 0;
-    for (int batchIndex = 0; batchIndex < Batches.Length; batchIndex++)
+    for (int batchIndex = 0; batchIndex < NumBatches; batchIndex++)
     {
       int batchSize = BatchSizes[batchIndex];
       IPositionEvaluationBatch batch = Batches[batchIndex];
@@ -299,9 +315,11 @@ internal class PositionsEvaluationBatchMerged : IPositionEvaluationBatch
   /// </summary>
   public void Dispose()
   {
-    foreach (IPositionEvaluationBatch batch in Batches)
+    // Only the entries belonging to this merged batch: a trailing entry of a reused buffer
+    // belongs to an earlier batch and is not ours to dispose.
+    for (int i = 0; i < NumBatches; i++)
     {
-      batch?.Dispose();
+      Batches[i]?.Dispose();
     }
   }
 }

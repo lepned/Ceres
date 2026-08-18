@@ -42,7 +42,46 @@ public static class PUCTSelector
   /// <summary>
   /// Thread-local buffer for qWhenNoChildrenComposite to avoid per-call allocations.
   /// </summary>
-  [ThreadStatic] static double[] qWhenNoChildrenBuffer;
+  [ThreadStatic] static float[] qWhenNoChildrenBuffer;
+
+  /// <summary>
+  /// Thread-local double buffer receiving the RPO solver's output before it is narrowed into
+  /// qWhenNoChildrenBuffer (the solver and its shared helpers work in double).
+  /// </summary>
+  [ThreadStatic] static double[] rpoResultBuffer;
+
+  /// <summary>
+  /// Thread-local float copies of the (double) Q-uncertainty adjustment arrays, needed because
+  /// the score kernel loads them as Vector&lt;float&gt;. Only populated when QUnc is active.
+  /// </summary>
+  [ThreadStatic] static float[] quncScoreBonusFloat;
+  [ThreadStatic] static float[] quncUMultiplierFloat;
+
+
+  /// <summary>
+  /// Narrows the first numToProcess entries of a (double) per-child adjustment array into a
+  /// thread-local float array, padding the remainder with a neutral value so the SIMD block
+  /// loads in the score kernel read defined lanes.
+  /// </summary>
+  static float[] NarrowAdjustments(double[] source, ref float[] dest, int numToProcess, float neutralFill)
+  {
+    if (source == null)
+    {
+      return null;
+    }
+
+    dest ??= new float[PUCTScoreCalcVector.MAX_CHILDREN];
+    for (int i = 0; i < numToProcess; i++)
+    {
+      dest[i] = (float)source[i];
+    }
+    for (int i = numToProcess; i < dest.Length; i++)
+    {
+      dest[i] = neutralFill;
+    }
+
+    return dest;
+  }
 
 
   /// <summary>
@@ -117,19 +156,19 @@ public static class PUCTSelector
     graph.GatherChildInfoViaChildren(node, selectorID, maxChildIndex, dualCollisionFraction, stats, refreshStaleEdges);
 
     // Possibly use action head directly
-    double[] qWhenNoChildrenComposite = null;
+    float[] qWhenNoChildrenComposite = null;
     if (numToProcess > 1 && paramsSelect.GetFPUMode(node.IsSearchRoot) == ParamsSelect.FPUType.ActionHead)
     {
       // Use per-move value from the neural network action head as FPU for unvisited children.
-      double fallbackFPU = paramsSelect.CalcQWhenNoChildren(node.IsSearchRoot, node.Q, stats.SumPVisited);
-      ReadOnlySpan<double> actionSpan = stats.A.Span;
-      qWhenNoChildrenComposite = qWhenNoChildrenBuffer ??= new double[PUCTScoreCalcVector.MAX_CHILDREN];
+      float fallbackFPU = (float)paramsSelect.CalcQWhenNoChildren(node.IsSearchRoot, node.Q, stats.SumPVisited);
+      ReadOnlySpan<float> actionSpan = stats.A.Span;
+      qWhenNoChildrenComposite = qWhenNoChildrenBuffer ??= new float[PUCTScoreCalcVector.MAX_CHILDREN];
       for (int i = 0; i < numToProcess; i++)
       {
-        double actionV = actionSpan[i] + MCGSStrategyPUCT.ACTION_HEAD_FPU_VALUE;
+        float actionV = actionSpan[i] + MCGSStrategyPUCT.ACTION_HEAD_FPU_VALUE;
 
         // Negate because child Q values are stored from opponent's perspective
-        qWhenNoChildrenComposite[i] = double.IsNaN(actionV) ? fallbackFPU : -actionV;
+        qWhenNoChildrenComposite[i] = float.IsNaN(actionV) ? fallbackFPU : -actionV;
       }
     }
     else if (numToProcess > 1
@@ -154,19 +193,19 @@ public static class PUCTSelector
 
     if (false && paramsSearch.TestFlag)
     {
-      Span<double> uncertaintyPolicySpan = stats.UP.Span;
-      Span<double> uncertaintyValueSpan = stats.UV.Span;
-      Span<double> nSpan = stats.N.Span;
-      Span<double> wSpan = stats.W.Span;
+      Span<float> uncertaintyPolicySpan = stats.UP.Span;
+      Span<float> uncertaintyValueSpan = stats.UV.Span;
+      Span<float> nSpan = stats.N.Span;
+      Span<float> wSpan = stats.W.Span;
       for (int i = 0; i < Math.Min(node.NumEdgesExpanded, numToProcess); i++)
       {
-        if (!double.IsNaN(uncertaintyValueSpan[i]))
+        if (!float.IsNaN(uncertaintyValueSpan[i]))
         {
-          const double VALUE_UNCERTAINTY_WEIGHT = 0.3f;
-          double n = Math.Max(1, nSpan[i]);
+          const float VALUE_UNCERTAINTY_WEIGHT = 0.3f;
+          float n = MathF.Max(1, nSpan[i]);
           if (n == 1)
           {
-            double adjust = (VALUE_UNCERTAINTY_WEIGHT * uncertaintyValueSpan[i]) / Math.Sqrt(n);
+            float adjust = (VALUE_UNCERTAINTY_WEIGHT * uncertaintyValueSpan[i]) / MathF.Sqrt(n);
             //adjust *= -1;
             wSpan[i] -= adjust * nSpan[i];
           }
@@ -184,8 +223,8 @@ public static class PUCTSelector
     if (node.IsSearchRoot && rootMovePruningStatus != null
    && numTargetVisits != 0) // do not skip any if only querying all scores          
     {
-      Span<double> gatherStatsNSpan = stats.N.Span;
-      Span<double> gatherStatsWSpan = stats.W.Span;
+      Span<float> gatherStatsNSpan = stats.N.Span;
+      Span<float> gatherStatsWSpan = stats.W.Span;
       for (int i = 0; i < numToProcess; i++)
       {
         // Note that moves are never pruned if the do not yet have any visits
@@ -197,7 +236,7 @@ public static class PUCTSelector
           // At root the search wants best Q values 
           // but because of minimax prefers moves with worse Q and W for the children
           // Therefore we set W of the child very high to make it discourage visits to it.
-          gatherStatsWSpan[i] = double.MaxValue;
+          gatherStatsWSpan[i] = float.MaxValue;
         }
       }
     }
@@ -275,6 +314,10 @@ public static class PUCTSelector
                                           quncPathDepth, out quncScoreBonus, out quncUMultiplier);
       }
 
+      // The score kernel consumes these as Vector<float>; narrow (neutral fill past numToProcess).
+      float[] quncScoreBonusF = NarrowAdjustments(quncScoreBonus, ref quncScoreBonusFloat, numToProcess, 0f);
+      float[] quncUMultiplierF = NarrowAdjustments(quncUMultiplier, ref quncUMultiplierFloat, numToProcess, 1f);
+
       numVisitsAccepted = PUCTScoreCalcVector.ScoreCalcMulti(paramsSelect,
                                                               node.IsSearchRoot, nodeRef.N,
                                                               parentNumInFlight,
@@ -285,8 +328,8 @@ public static class PUCTSelector
                                                               scores, childVisitCounts, cpuctMultiplier,
                                                               thresholdPUCTSuboptimalityReject,
                                                               parentNode: node,
-                                                              quncScoreBonus: quncScoreBonus,
-                                                              quncUMultiplier: quncUMultiplier);
+                                                              quncScoreBonus: quncScoreBonusF,
+                                                              quncUMultiplier: quncUMultiplierF);
 
       // Some scoring paths can produce allocations that violate the sequential-expansion
       // invariant ("no child gets a visit before all of its left siblings have at least
@@ -329,11 +372,11 @@ public static class PUCTSelector
   ///   - Otherwise (top-policy child unvisited):
   ///       MatchValue anchor with value = node.Q, so E_mu[q_fill] = node.Q.
   /// </summary>
-  private static double[] ApplyRPOImputedFPU(ParamsSelect paramsSelect, GNode node, GatheredChildStats stats, int numToProcess)
+  private static float[] ApplyRPOImputedFPU(ParamsSelect paramsSelect, GNode node, GatheredChildStats stats, int numToProcess)
   {
-    ReadOnlySpan<double> pSpan = stats.P.Span;
-    ReadOnlySpan<double> nSpan = stats.N.Span;
-    ReadOnlySpan<double> wSpan = stats.W.Span;
+    ReadOnlySpan<float> pSpan = stats.P.Span;
+    ReadOnlySpan<float> nSpan = stats.N.Span;
+    ReadOnlySpan<float> wSpan = stats.W.Span;
 
     int numExpanded = node.NumEdgesExpanded;
 
@@ -365,8 +408,10 @@ public static class PUCTSelector
                           clampQ: true,
                           minPriorProbability: 0.0);
 
-    double[] result = qWhenNoChildrenBuffer ??= new double[PUCTScoreCalcVector.MAX_CHILDREN];
-    Span<double> resultSpan = result.AsSpan(0, numToProcess);
+    // The solver works in double (shared with the CB-GPUCT prior); its output is narrowed into
+    // the float buffer the score kernel loads from.
+    double[] solved = rpoResultBuffer ??= new double[PUCTScoreCalcVector.MAX_CHILDREN];
+    Span<double> resultSpan = solved.AsSpan(0, numToProcess);
 
     RegularizedPolicyOptimum.Solve(mu, qIn, lambda, anchor, regularization,
                                    yOut: default,
@@ -380,9 +425,15 @@ public static class PUCTSelector
     double maxQ = 0.20 + defaultFPU;
     for (int i = numExpanded; i < numToProcess; i++)
     {
-      double thisResult = result[i] + paramsSelect.RPOFPUValue;
+      double thisResult = solved[i] + paramsSelect.RPOFPUValue;
       thisResult = Math.Clamp(thisResult, -1, 1);
-      result[i] = thisResult > maxQ ? maxQ : thisResult;
+      solved[i] = thisResult > maxQ ? maxQ : thisResult;
+    }
+
+    float[] result = qWhenNoChildrenBuffer ??= new float[PUCTScoreCalcVector.MAX_CHILDREN];
+    for (int i = 0; i < numToProcess; i++)
+    {
+      result[i] = (float)solved[i];
     }
 
     if (FPUDumpDiagnostics.DEBUG_DUMP_FPU_CALCS)

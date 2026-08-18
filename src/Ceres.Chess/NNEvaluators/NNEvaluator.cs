@@ -406,6 +406,21 @@ namespace Ceres.Chess.NNEvaluators
     /// </summary>
     public BackendTimeTracker BackendTimeTracker { get; set; }
 
+    /// <summary>
+    /// Optional gate serializing device execution across the evaluators of an
+    /// NNEvaluatorSet which share the same device(s). When non-null, backends that
+    /// support it (currently NNEvaluatorTensorRT) acquire this lock for the duration
+    /// of each device dispatch, so the shared device executes one batch at a time,
+    /// back-to-back (work-conserving exclusive FIFO; with at most one other evaluator,
+    /// FIFO order is automatic). This makes the two-iterator eval pipeline stagger
+    /// structurally: batch completions are separated by a full batch duration, so each
+    /// iterator's CPU phases (select/backup/encode) overlap the other's evaluation
+    /// instead of coinciding with it ("clumping", which idles the device once per
+    /// batch-pair). CPU-side work should be kept outside the held region wherever
+    /// possible. Null (the default) leaves dispatches free to run concurrently.
+    /// </summary>
+    public object DeviceExclusiveExecutionLock { get; set; }
+
 
     /// <summary>
     /// Evaluates positions into internal buffers. 

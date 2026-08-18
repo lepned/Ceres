@@ -278,7 +278,7 @@ internal static class TranspositionAutoExtension
       MGMoveGen.GenerateMoves(in n2Pos, n2MovesScratch);
       MGMoveList n2Moves = n2MovesScratch;
       int minRepetitionCountForDraw = paramsSearch.TwofoldDrawEnabled ? 1 : 2;
-      (GameResult result, float v, float d, bool wasDrawByRepetition) resultInfo =
+      (GameResult result, float v, float d, bool wasDrawByRepetition, bool wasDrawByRule50) resultInfo =
         path.CalcPathTerminationFromUnexpandedLeaf(minRepetitionCountForDraw, in n2Pos, n2Moves, possiblyUseTablebase: true);
 
       MCGSSelectBackupStrategyBase strategy = engine.Strategy;
@@ -296,8 +296,10 @@ internal static class TranspositionAutoExtension
         // two-visit statistics. ORDER MATTERS: n1's first BackupToNode must precede the
         // edge backup so the node.N == sum(edge.N) + 1 invariant holds at each step.
         bool propagateAsDraw = resultInfo.v == 0;
-        bool historySensitiveDraw = resultInfo.wasDrawByRepetition
-                                 || (resultInfo.result == GameResult.Draw && n2Pos.Rule50Count >= 100);
+        // N.B. auto-extension runs only in PositionAndHistoryEquivalence mode (see the
+        // ParamsSearch.Validate fixup), where history-sensitive terminal edges are valid:
+        // node identity includes the history, so every path into the node shares it.
+        bool historySensitiveDraw = resultInfo.wasDrawByRepetition || resultInfo.wasDrawByRule50;
         GEdge terminalEdge = engine.Graph.AddNewTerminalEdge(n1, 0, resultInfo.v, resultInfo.d, 1, propagateAsDraw,
                                                              historySensitiveDraw);
 

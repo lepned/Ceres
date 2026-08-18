@@ -47,6 +47,18 @@ namespace Ceres.Chess.GameEngines
     public float ScoreCentipawns;
 
     /// <summary>
+    /// Win/draw/loss probabilities as directly reported by the engine
+    /// (from the perspective of the side to move), or NaN if not reported.
+    /// UCI engines only report this if they support and are sent the UCI_ShowWDL option.
+    /// </summary>
+    public (float W, float D, float L) WDL = (float.NaN, float.NaN, float.NaN);
+
+    /// <summary>
+    /// Returns if the engine reported win/draw/loss probabilities.
+    /// </summary>
+    public bool HasWDL => !float.IsNaN(WDL.W);
+
+    /// <summary>
     /// The N of the tree at beginning of search.
     /// </summary>
     public int StartingN;

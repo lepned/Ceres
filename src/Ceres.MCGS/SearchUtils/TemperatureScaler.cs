@@ -28,7 +28,7 @@ public static class TemperatureScaler
   /// probability mass is spread uniformly over the unseen moves so that the output is
   /// properly normalized.
   /// </summary>
-  public static void ApplyTemperature(int countAllProbabilities, Span<double> probabilitiesKnown, double sumProbabilities, double temperature)
+  public static void ApplyTemperature(int countAllProbabilities, Span<float> probabilitiesKnown, double sumProbabilities, double temperature)
   {
     int count = probabilitiesKnown.Length;
 
@@ -43,7 +43,7 @@ public static class TemperatureScaler
     int missingCount = countAllProbabilities - count;
     double alpha = 1.0 / temperature;
 
-    TensorPrimitives.Pow(probabilitiesKnown, alpha, probabilitiesKnown);
+    TensorPrimitives.Pow(probabilitiesKnown, (float)alpha, probabilitiesKnown);
 
     double denominator = TensorPrimitives.Sum(probabilitiesKnown);
 
@@ -61,7 +61,7 @@ public static class TemperatureScaler
     }
 
     // Normalize and write back in place.
-    double invDenominator = 1.0 / denominator;
+    float invDenominator = (float)(1.0 / denominator);
     for (int i = 0; i < count; i++)
     {
       probabilitiesKnown[i] *= invDenominator;

@@ -96,92 +96,95 @@ public partial class MCGSManager
 
       if ((sections & DumpFullInfoSections.Info) != 0)
       {
-      int moveIndex = searchRootNode.Graph.Store.HistoryHashes.PriorPositionsMG.Length;
+        int moveIndex = searchRootNode.Graph.Store.HistoryHashes.PriorPositionsMG.Length;
 
-      writer.WriteLine();
-      writer.WriteLine("=================================================================================");
-      writer.Write(DateTime.Now + " MCGS SEARCH RESULT INFORMATION,  Move = " + ((1 + moveIndex / 2)));
-      writer.WriteLine($" Thread = {Thread.CurrentThread.ManagedThreadId}");
-      if (description != null)
-      {
-        writer.WriteLine(description);
-      }
-
-      writer.WriteLine();
-
-      // Print the actual graph root and the search root as distinct nodes. Under graph reuse the
-      // search root descends below the graph root, so these are frequently different nodes.
-      writer.WriteLine("Graph root           : " + Engine.Graph.GraphRootNode);
-      writer.WriteLine("Search root          : " + Engine.SearchRootNode);
-      if (!searchRootNode.IsNull && searchRootNode != Engine.SearchRootNode)
-      {
-        writer.WriteLine("Search root (arg)    : " + searchRootNode);
-      }
-      writer.WriteLine();
-
-      GEdge[] nodesSortedN = null;
-      GEdge[] nodesSortedQ = null;
-
-      string bestMoveInfoStr = "";
-      if (searchRootNode.NumEdgesExpanded > 0
-       && StopStatus != SearchStopStatus.TablebaseImmediateMove
-       && StopStatus != SearchStopStatus.OnlyOneLegalMove)
-      {
-        GEdge[] childrenSortedN = searchRootNode.EdgesSorted(node => -node.N);
-        GEdge[] childrenSortedQ = searchRootNode.EdgesSorted(node => (float)node.Q);
-
-        GEdge bestMoveEdge = searchRootNode.EdgeForMove(bestMove);
-        GNode bestMoveNode = bestMoveEdge.ChildNode;
-
-        bool isTopN = childrenSortedN[0].N == bestMoveNode.N; // could be ties
-        bool isTopQ = childrenSortedQ[0].MoveMG == bestMove;
-        if (isTopN && isTopQ)
+        writer.WriteLine();
+        writer.WriteLine("=================================================================================");
+        writer.Write(DateTime.Now + " MCGS SEARCH RESULT INFORMATION,  Move = " + ((1 + moveIndex / 2)));
+        writer.WriteLine($" Thread = {Thread.CurrentThread.ManagedThreadId}");
+        if (description != null)
         {
-          bestMoveInfoStr = "(TopN and TopQ)";
+          writer.WriteLine(description);
         }
-        else if (isTopN)
+
+        writer.WriteLine();
+
+        // Print the actual graph root and the search root as distinct nodes. Under graph reuse the
+        // search root descends below the graph root, so these are frequently different nodes.
+        writer.WriteLine("Graph root           : " + Engine.Graph.GraphRootNode);
+        writer.WriteLine("Search root          : " + Engine.SearchRootNode);
+        if (!searchRootNode.IsNull && searchRootNode != Engine.SearchRootNode)
         {
-          bestMoveInfoStr = "(TopN)";
+          writer.WriteLine("Search root (arg)    : " + searchRootNode);
         }
-        else if (isTopQ)
+        writer.WriteLine();
+
+        GEdge[] nodesSortedN = null;
+        GEdge[] nodesSortedQ = null;
+
+        string bestMoveInfoStr = "";
+        if (searchRootNode.NumEdgesExpanded > 0
+         && StopStatus != SearchStopStatus.TablebaseImmediateMove
+         && StopStatus != SearchStopStatus.OnlyOneLegalMove)
         {
-          bestMoveInfoStr = "(TopQ)";
+          GEdge[] childrenSortedN = searchRootNode.EdgesSorted(node => -node.N);
+          GEdge[] childrenSortedQ = searchRootNode.EdgesSorted(node => (float)node.Q);
+
+          GEdge bestMoveEdge = searchRootNode.EdgeForMove(bestMove);
+
+          bool isTopN = childrenSortedN[0].N == bestMoveEdge.N; // could be ties
+          bool isTopQ = childrenSortedQ[0] == bestMoveEdge;
+          if (isTopN && isTopQ)
+          {
+            bestMoveInfoStr = "(TopN and TopQ)";
+          }
+          else if (isTopN)
+          {
+            bestMoveInfoStr = "(TopN)";
+          }
+          else if (isTopQ)
+          {
+            bestMoveInfoStr = "(TopQ)";
+          }
         }
-      }
 
-      // Output position (with history) information.
-      // NOTE: Under graph reuse (especially Position / PositionEquivalence mode) the search root
-      // descends BELOW the graph root by design, so "Position (search root)" and "Graph root
-      // position" (an ancestor) legitimately differ. The "Search root path" line shows the moves
-      // from the graph root down to the search root; its final FEN matches the "Position" line.
-      int pliesBelowGraphRoot = Engine.SearchRootPathFromGraphRoot?.Length ?? 0;
-      writer.WriteLine("Position (search root): " + searchRootNode.CalcPosition().ToPosition.FEN);
-      writer.WriteLine($"Graph root position   : {this.Engine.Graph.Store.NodesStore.PositionHistory} "
-                     + $"(ancestor, +{pliesBelowGraphRoot} plies above search root)");
+        // Output position (with history) information.
+        // NOTE: Under graph reuse (especially Position / PositionEquivalence mode) the search root
+        // descends BELOW the graph root by design, so "Position (search root)" and "Graph root
+        // position" (an ancestor) legitimately differ. The "Search root path" line shows the moves
+        // from the graph root down to the search root; its final FEN matches the "Position" line.
+        int pliesBelowGraphRoot = Engine.SearchRootPathFromGraphRoot?.Length ?? 0;
+        writer.WriteLine("Position (search root): " + searchRootNode.CalcPosition().ToPosition.FEN);
+        writer.WriteLine($"Graph root position   : {this.Engine.Graph.Store.NodesStore.PositionHistory} "
+                       + $"(ancestor, +{pliesBelowGraphRoot} plies above search root)");
 
-      // Move sequence from the graph root down to the search root (final FEN matches "Position" above).
-      System.Text.StringBuilder sbPath = new();
-      sbPath.Append(Engine.Graph.Store.NodesStore.PositionHistory.FinalPosition.FEN);
-      foreach (var pathInfo in Engine.SearchRootPathFromGraphRoot ?? [])
-      {
-        sbPath.Append("  " + pathInfo.MoveToChild.MoveStr(MGMoveNotationStyle.Coordinates)
-                    + " -> " + pathInfo.ChildPosMG.ToPosition.FEN);
-      }
-      writer.WriteLine("Search root path      : " + sbPath.ToString());
+        // Move sequence from the graph root down to the search root (final FEN matches "Position" above).
+        System.Text.StringBuilder sbPath = new();
+        sbPath.Append(Engine.Graph.Store.NodesStore.PositionHistory.FinalPosition.FEN);
+        foreach (var pathInfo in Engine.SearchRootPathFromGraphRoot ?? [])
+        {
+          sbPath.Append("  " + pathInfo.MoveToChild.MoveStr(MGMoveNotationStyle.Coordinates)
+                      + " -> " + pathInfo.ChildPosMG.ToPosition.FEN);
+        }
+        writer.WriteLine("Search root path      : " + sbPath.ToString());
 
-      // Internal consistency of the root state (also logs a red diagnostic block above on mismatch).
-      bool rootConsistent = MCGSRootConsistencyCheck.Validate(Engine, Engine.SearchRootPosMG.ToPosition, "dump", out _);
-      writer.WriteLine("Root consistency      : " + (rootConsistent ? "OK" : "*** MISMATCH — see red diagnostic above ***"));
-      writer.WriteLine("Search stop status  : " + StopStatus);
-      writer.WriteLine("Best move selected  : " + bestMove.MoveStr(MGMoveNotationStyle.Coordinates) + " " + bestMoveInfoStr);
-      writer.WriteLine();
+        // Internal consistency of the root state (also logs a red diagnostic block above on mismatch).
+        bool rootConsistent = MCGSRootConsistencyCheck.Validate(Engine, Engine.SearchRootPosMG.ToPosition, "dump", out _);
+        writer.WriteLine("Root consistency      : " + (rootConsistent ? "OK" : "*** MISMATCH — see red diagnostic above ***"));
+        writer.WriteLine("Search stop status  : " + StopStatus);
+        GNodeStore dumpNodesStore = Engine.Graph.Store.NodesStore;
+        writer.WriteLine($"Node store          : {dumpNodesStore.NumTotalNodes:N0} of {dumpNodesStore.MaxNodes:N0} nodes "
+                       + $"({Engine.Graph.Store.FractionInUse:P0} full)");
+        writer.WriteLine("Graph reuse (run)   : " + GraphReuseManager.StatsSummary());
+        writer.WriteLine("Best move selected  : " + bestMove.MoveStr(MGMoveNotationStyle.Coordinates) + " " + bestMoveInfoStr);
+        writer.WriteLine();
 
-      string infoUpdate = UCIInfoMCGS.UCIInfoString(this);
-      writer.WriteLine(infoUpdate);
+        string infoUpdate = UCIInfoMCGS.UCIInfoString(this);
+        writer.WriteLine(infoUpdate);
 
-      writer.WriteLine("\r\nLIMITS MANAGER DECISION");
-      limitInputs?.Dump(writer);
-      DumpTimeInfo(writer, searchRootNode);
+        writer.WriteLine("\r\nLIMITS MANAGER DECISION");
+        limitInputs?.Dump(writer);
+        DumpTimeInfo(writer, searchRootNode);
       }
 
       if ((sections & DumpFullInfoSections.Moves) != 0)
@@ -214,7 +217,7 @@ public partial class MCGSManager
     MCGSPosGraphNodeDumper.WriteHeaders(true, writer);
 
     MCGSPosGraphNodeDumper.DumpNodeStr(this, depth, Engine.SearchRootNode, default, node, default, 0, true, writer);
-    foreach (GEdge edge in node.EdgesSorted(e=>-e.N))
+    foreach (GEdge edge in node.EdgesSorted(e => -e.N))
     {
       if (edge.ChildNode.IsNull)
       {
@@ -223,7 +226,7 @@ public partial class MCGSManager
         continue;
       }
 
-      MCGSPosGraphNodeDumper.DumpNodeStr(this,depth,  Engine.SearchRootNode, node, edge.ChildNode, edge, 0, true, writer);
+      MCGSPosGraphNodeDumper.DumpNodeStr(this, depth, Engine.SearchRootNode, node, edge.ChildNode, edge, 0, true, writer);
     }
   }
 
@@ -292,6 +295,10 @@ public partial class MCGSManager
       double busyFrac = (!double.IsNaN(backendBusy) && searchSecs > 0) ? backendBusy / searchSecs : double.NaN;
       writer.WriteLine($"Backend Busy Time           {backendBusy,14:F2}");
       writer.WriteLine($"Backend Busy Fraction       {busyFrac,14:F3}");
+      if (backendTracker?.EverUsed ?? false)
+      {
+        writer.WriteLine($"Backend Busy Detail         {backendTracker.DetailString}");
+      }
       PhaseCoordinator coord = Engine.Coordinator;
       writer.WriteLine($"Phase Timing                {coord.PhaseTimingSummary()}");
       writer.WriteLine($"Backup Out-Of-Order         {coord.BackupOutOfOrderFraction,14:F4}  ({coord.BackupOutOfOrderCount:N0} of {coord.BackupTotalCount:N0} backups; inorderEnforced={coord.EnforceInOrderBackup})");

@@ -19,6 +19,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Numerics.Tensors;
+using System.Threading;
 using System.Threading.Tasks;
 
 using Ceres.Base.DataTypes;
@@ -59,7 +60,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
   const int NAN_LOG_MIN_INTERVAL_SECONDS = 5 * 60;
   static long nanOccurrenceCount;
   static long nanLastLoggedTicks;
-  static readonly object nanLogLock = new();
+  static readonly Lock nanLogLock = new();
 
   /// <summary>
   /// If true, loads TensorRT engines in parallel across GPUs (legacy path: each device independently
@@ -206,7 +207,6 @@ public class NNEvaluatorTensorRT : NNEvaluator
   private CompressedPolicyVector[] policiesBuffer;
   private CompressedPolicyVector[] policies2Buffer;
   private CompressedActionVector[] actionsBuffer;
-  private ParallelOptions cachedParallelOptions;
 
   // Network capabilities (determined from output tensors)
   private readonly bool isWDL;
@@ -254,8 +254,29 @@ public class NNEvaluatorTensorRT : NNEvaluator
   /// <inheritdoc/>
   public override int NumDevices => GpuIDs.Length;
 
+  /// <summary>
+  /// Lazily computed backing value for Info, and the object guarding its initialization.
+  /// </summary>
+  EvaluatorInfo infoCached;
+  readonly Lock infoCachedLockObj = new();
+
   /// <inheritdoc/>
-  public override EvaluatorInfo Info => ONNXFileName == null ? null : new EvaluatorInfo(0, FileSizeBytesOrZero(ONNXFileName));
+
+  public override EvaluatorInfo Info
+  {
+    get
+    {
+      if (ONNXFileName == null)
+      {
+        return null;
+      }
+
+      lock (infoCachedLockObj)
+      {
+        return infoCached ??= new EvaluatorInfo(0, FileSizeBytesOrZero(ONNXFileName));
+      }
+    }
+  }
 
   /// <inheritdoc/>
   public override int PaddedBatchCapacity(int numPositions)
@@ -598,12 +619,6 @@ public class NNEvaluatorTensorRT : NNEvaluator
     punimSelfBuffer = hasPunimOutputs ? new Half[maxBatchSize * 8] : Array.Empty<Half>();
     punimOpponentBuffer = hasPunimOutputs ? new Half[maxBatchSize * 8] : Array.Empty<Half>();
 
-    // Cache ParallelOptions to avoid allocation per batch
-    cachedParallelOptions = new ParallelOptions
-    {
-      MaxDegreeOfParallelism = ParallelUtils.CalcMaxParallelism(maxBatchSize, 32)
-    };
-
     // Important to capture possible CUDA graphs and timing statistics up front
     Warmup();
   }
@@ -737,20 +752,6 @@ public class NNEvaluatorTensorRT : NNEvaluator
 
   // Thread-static buffers for native input conversion
   [ThreadStatic] static byte[] inputsPrimaryNative;
-  [ThreadStatic] static Half[] inputsPrimaryNativeF;
-
-  // Lookup table for fast byte to Half conversion
-  static bool haveInitializedLookupByteToHalf = false;
-  static readonly Half[] LookupByteToHalf = new Half[256];
-
-  static void InitLookupTable()
-  {
-    for (int i = 0; i <= byte.MaxValue; i++)
-    {
-      LookupByteToHalf[i] = (Half)i;
-    }
-    haveInitializedLookupByteToHalf = true;
-  }
 
 
   /// <summary>
@@ -825,11 +826,6 @@ public class NNEvaluatorTensorRT : NNEvaluator
       throw new Exception("ConverterToFlatFromTPG must be provided");
     }
 
-    if (!haveInitializedLookupByteToHalf)
-    {
-      InitLookupTable();
-    }
-
     EnsureInputBuffers(numPositions);
 
     // Allocate thread-static buffers if needed (sized to the actual batch, grown on demand)
@@ -838,7 +834,6 @@ public class NNEvaluatorTensorRT : NNEvaluator
     if (inputsPrimaryNative == null || inputsPrimaryNative.Length < requiredBufferSize)
     {
       inputsPrimaryNative = new byte[requiredBufferSize];
-      inputsPrimaryNativeF = new Half[requiredBufferSize];
     }
 
     // Convert native input to flat format
@@ -851,12 +846,6 @@ public class NNEvaluatorTensorRT : NNEvaluator
     }
     else
     {
-      // Convert bytes to Half (efficiently via lookup table) for Half input path
-      for (int i = 0; i < numConverted; i++)
-      {
-        inputsPrimaryNativeF[i] = LookupByteToHalf[inputsPrimaryNative[i]];
-      }
-
       // Convert byte buffer to half buffer with /100 scaling
       int elemsToCopy = numPositions * inputElementsPerPosition;
       Memory<byte> sourceBytes = new Memory<byte>(inputsPrimaryNative, 0, elemsToCopy);
@@ -1147,16 +1136,17 @@ public class NNEvaluatorTensorRT : NNEvaluator
 
   /// <summary>
   /// Converts the output heads from FP16 to float, EXCEPT the large policy head, and only
-  /// for the used positions [0, count). The policy head is read sparsely (legal moves only)
-  /// directly from the FP16 buffer by ExtractSubBatchResults — (float)Half is exact — so
-  /// bulk-converting all ~1858 policy entries per position would be wasted work (the policy
-  /// is ~99% of the output for typical LC0 nets). Other heads (value/MLH/uncertainty and,
-  /// when present, policy2/action/ply-bin/PUNIM/qDev) are still converted here and read from
-  /// the float buffer as before. Walks tensors with the identical offset/alignment logic as
-  /// ComputeTensorOffsets so offsets stay consistent.
+  /// for the used positions [0, count).
   /// </summary>
-  private void PerfConvertNonPolicyHeads(ReadOnlySpan<Half> rawSpan, Span<float> floatBuf, int count, int engineBatchSize)
+  /// <remarks>
+  /// Also reports (and neutralizes) any NaN in the heads it converts. The test rides along with
+  /// the conversion, while each head is still hot in cache.
+  /// </remarks>
+  /// <returns>True if any converted head contained a NaN (which has been replaced by 0).</returns>
+  private bool PerfConvertNonPolicyHeads(ReadOnlySpan<Half> rawSpan, Span<float> floatBuf, int count, int engineBatchSize)
   {
+    bool anyNaN = false;
+
     const int ALIGN = 128;
     int currentOffset = 0;
     for (int t = 0; t < outputInfos.Length; t++)
@@ -1167,11 +1157,31 @@ public class NNEvaluatorTensorRT : NNEvaluator
       if (t != policyTensorIndex && sizePerPos > 0)
       {
         int n = count * sizePerPos;
-        TensorPrimitives.ConvertToSingle(rawSpan.Slice(currentOffset, n), floatBuf.Slice(currentOffset, n));
+        ReadOnlySpan<Half> sourceSlice = rawSpan.Slice(currentOffset, n);
+        Span<float> destSlice = floatBuf.Slice(currentOffset, n);
+        TensorPrimitives.ConvertToSingle(sourceSlice, destSlice);
+
+        // Tested on the FP16 source (half the bandwidth of the float result, and an early-exit
+        // bitmask test rather than a full reduction).
+        if (MathUtils.ContainsNaN(sourceSlice))
+        {
+          anyNaN = true;
+
+          // Substitute 0 so downstream consumers of this head see a sane value.
+          for (int i = 0; i < destSlice.Length; i++)
+          {
+            if (float.IsNaN(destSlice[i]))
+            {
+              destSlice[i] = 0;
+            }
+          }
+        }
       }
 
       currentOffset += (tensorSize + ALIGN - 1) / ALIGN * ALIGN;
     }
+
+    return anyNaN;
   }
 
 
@@ -1264,7 +1274,8 @@ public class NNEvaluatorTensorRT : NNEvaluator
     float policyTemperature = Options?.PolicyTemperature ?? 1.0f;
 
     // Parallel extraction of per-position results
-    Parallel.For(0, count, new ParallelOptions() { MaxDegreeOfParallelism = 1 + count / 48 }, i =>
+    const int MIN_PARALLEL_COUNT = 48;
+    Parallel.For(0, count, count < MIN_PARALLEL_COUNT ? null : new ParallelOptions() { MaxDegreeOfParallelism = 1 + count / MIN_PARALLEL_COUNT }, i =>
     {
       int resultIndex = startPos + i;
 
@@ -1736,14 +1747,37 @@ public class NNEvaluatorTensorRT : NNEvaluator
 
     // Bracket the pool dispatch (the full GPU round-trip: H2D copy + inference +
     // D2H copy + stream sync) as "backend time" for utilization measurement.
-    // NOTE: for LC0-format nets the plane->Half conversion runs inside
-    // ProcessWithHandlerDirect (via FillInputLC0) and is therefore included here;
-    // TPG/Ceres nets convert outside this region (see above) so are unaffected.
     BackendTimeTracker tracker = this.BackendTimeTracker;
+
+    // Exclusive device execution: when the NNEvaluatorSet installed a shared gate
+    // (see NNEvaluator.DeviceExclusiveExecutionLock), the two evaluators' dispatches
+    // execute on the shared device one at a time, back-to-back (work-conserving FIFO),
+    // rather than concurrently on independent streams. Any wait here occurs while the
+    // device is busy with the companion evaluator's batch. To keep CPU work out of the
+    // exclusively-held region, the LC0 plane->Half conversion is performed BEFORE
+    // acquiring the gate (into the managed scratch buffer, then dispatched via the
+    // standard path — the same combination ProcessWithHandlerDirect's own multi-sub-batch
+    // fallback uses); TPG/Ceres nets already convert above, outside this region.
+    object deviceGate = DeviceExclusiveExecutionLock;
+    bool lc0PreconvertedForGate = NetType == ONNXNetExecutor.NetTypeEnum.LC0 && deviceGate != null;
+    if (lc0PreconvertedForGate)
+    {
+      FillInputLC0(new Memory<Half>(inputHalfBuffer, 0, numPos * inputElementsPerPosition));
+    }
+
+    if (deviceGate != null)
+    {
+      Monitor.Enter(deviceGate);
+    }
     tracker?.EnterBackend();
     try
     {
-      if (NetType == ONNXNetExecutor.NetTypeEnum.LC0)
+      if (lc0PreconvertedForGate)
+      {
+        // LC0 with exclusive gate: input already converted above, outside the gate.
+        pool.ProcessWithHandler(inputHalfBuffer, numPos, handler);
+      }
+      else if (NetType == ONNXNetExecutor.NetTypeEnum.LC0)
       {
         // LC0: convert the 112-plane input directly into the pinned input buffer via
         // FillInputLC0 (no managed staging buffer + redundant copy). handlerBatch was set above.
@@ -1764,6 +1798,10 @@ public class NNEvaluatorTensorRT : NNEvaluator
     finally
     {
       tracker?.ExitBackend();
+      if (deviceGate != null)
+      {
+        Monitor.Exit(deviceGate);
+      }
     }
 
     // Apply value head blending into separate buffers if FractionValueHead2 is specified
@@ -1873,44 +1911,24 @@ public class NNEvaluatorTensorRT : NNEvaluator
     {
       ReadOnlySpan<Half> rawSpan = new ReadOnlySpan<Half>((void*)rawOutputPtr, outputElementCount);
 
-      // Check for NaNs on raw Half data (half the bandwidth vs checking floats).
-      // outputElementsPerPosition is a single global, floor(largestEngine.TotalOutputSize /
-      // largestBatch); because TotalOutputSize sums each output tensor aligned-up independently,
-      // positionCount * outputElementsPerPosition can slightly EXCEED this engine's actual aligned
-      // output (outputElementCount = rawSpan.Length) for some bucket sets — e.g. an exact-fit batch
-      // on a mid engine whose per-tensor alignment padding amortizes less than the largest engine's.
-      // Clamp to the real buffer length to avoid over-reading rawSpan (was an ArgumentOutOfRange in
-      // the NaN slice). The genuine per-head data is read via aligned per-tensor offsets elsewhere
-      // (PerfConvertNonPolicyHeads / ExtractSubBatchResults / ComputeTensorOffsets), so this scan is
-      // only an approximate sanity bound; when it clamps, positionCount == engineBatchSize and the
-      // whole buffer is valid used data anyway. A no-op whenever the product already fits.
-      int usedOutputElements = Math.Min(positionCount * outputElementsPerPosition, outputElementCount);
-      bool hasNaN = MathUtils.ContainsNaN(rawSpan.Slice(0, usedOutputElements));
-
-      // Convert only the small heads (value/MLH/uncertainty/etc.) to float. The large
-      // policy/policy2/action heads are NOT converted here: extraction reads only the
-      // handful of legal-move logits it needs directly from this Half buffer (and
-      // (float)Half is exact), so converting the full ~1858-wide policy per position is
-      // pure waste. Only the used positions (count, not engineBatchSize) are converted.
-      PerfConvertNonPolicyHeads(rawSpan, threadLocalOutputFloatBuffer.AsSpan(), positionCount, engineBatchSize);
+      // Convert every head except policy to float, for the used positions only. The policy head is
+      // not converted: extraction reads only the handful of legal-move logits it needs directly
+      // from this Half buffer ((float)Half is exact), so converting all ~1858 entries per position
+      // would be pure waste.
+      //
+      // The NaN check for those heads is performed inside the same walk (and substitutes 0), rather
+      // than as a separate dense pass over the whole raw buffer — see the method's remarks. The
+      // policy head is therefore no longer scanned; its own extraction NaN-guards each logit it
+      // reads (see ExtractSubBatchResults), so values stay sane either way.
+      bool hasNaN = PerfConvertNonPolicyHeads(rawSpan, threadLocalOutputFloatBuffer.AsSpan(), positionCount, engineBatchSize);
 
       if (hasNaN)
       {
-        // Identify which head(s) contain the NaN before we substitute zeros.
+        // Report which head(s) contain the NaN. Unlike the trigger above, this scan covers ALL
+        // heads (policy included), so the message still names policy when it is also affected.
         string nanHeads = IdentifyNaNHeads(rawSpan, positionCount, engineBatchSize);
 
-        // Substitute NaN with 0 in the converted float buffer so downstream
-        // consumers see sane values, then emit a rate-limited warning.
-        Span<float> usedFloats = threadLocalOutputFloatBuffer.AsSpan(0, usedOutputElements);
-        for (int i = 0; i < usedFloats.Length; i++)
-        {
-          if (float.IsNaN(usedFloats[i]))
-          {
-            usedFloats[i] = 0;
-          }
-        }
-
-        ReportNaNOccurrence(positionCount, usedOutputElements, nanHeads);
+        ReportNaNOccurrence(positionCount, outputElementCount, nanHeads);
       }
     }
 
@@ -2714,8 +2732,11 @@ public class NNEvaluatorTensorRT : NNEvaluator
 
 
   /// <summary>
-  /// Modifies in place a sequence of batch sizes to be 
-  /// aligned with exact SM count (if within a specified tolerance).
+  /// Returns a sequence of batch sizes aligned with the exact SM count of the specified device
+  /// (if within a specified tolerance). The returned sizes are sorted ascending with duplicates
+  /// removed, since snapping can map two nearby anchor sizes onto the same SM multiple and
+  /// downstream code (engine construction, engine lookup by batch size, execution time lookup,
+  /// batch size optimization) requires a strictly ascending set of distinct sizes.
   /// </summary>
   /// <param name="anchorBatchSizes"></param>
   /// <returns></returns>
@@ -2767,7 +2788,14 @@ public class NNEvaluatorTensorRT : NNEvaluator
       adjustedSizes[i] = bestAdjusted;
     }
 
-    return adjustedSizes;
+    int[] normalizedSizes = EnginePool.SortedDistinctSizes(adjustedSizes, descending: false);
+    if (normalizedSizes.Length != adjustedSizes.Length)
+    {
+      Console.WriteLine($"  NOTE: GPU {deviceID} SM alignment ({smCount} SMs) collapsed batch sizes "
+                      + $"[{string.Join(", ", anchorBatchSizes)}] --> [{string.Join(", ", normalizedSizes)}]");
+    }
+
+    return normalizedSizes;
   }
 
 

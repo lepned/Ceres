@@ -409,9 +409,11 @@ public record ParamsSearch
   public bool EnablePathDependentCPUCTScaling = false;
 
   /// <summary>
-  /// Maximum number of nodes allowed in the search graph.
-  /// Some internal efficiencies may result if a smaller value 
-  /// than the large default is specified.
+  /// Maximum number of nodes allowed in the search graph. Caps the graph store reservation:
+  /// both the "full tier" size reserved for time-based (or large node-based) search limits and the
+  /// target size when a small store is promoted (see MCGSSearch.GraphStoreSizeNodes and
+  /// GraphReuseManager). Reservation is reserve-only/commit-on-demand, so its cost is virtual
+  /// address space (~1 KB per node); the default reserves ~1.2 TB of a ~128 TB per-process budget.
   /// </summary>
   public int MaxNodes = 1_100_000_000; // pending testing expand to at least: 2_001_000_000;
 
@@ -559,12 +561,13 @@ public record ParamsSearch
   /// history, diluting the move's value so the engine walks into a repetition with its eval frozen.
   ///   0 = off.
   ///   1 = search root's direct children only (the dominant, decision-determining case; cheap).
-  ///   N > 1 = also reconcile that many plies deeper (cost grows with depth; when > 1 a yellow
-  ///           per-search timing/stats line is printed). Only history-level repetitions are converted,
-  ///           which is sound at any depth regardless of node sharing.
+  ///   N > 1 = also reconcile that many plies deeper (cost grows with depth). 
+  ///           Only history-level repetitions are converted, which is sound at any depth regardless of node sharing.
   /// See GNode.ReconcileDrawByRepetitions. Is a no-op unless such a repetition exists in range.
+  /// N.B. Values higher than 2 are too expensive (exponential node count in depth,
+  ///      with MCGSPath.HashFoundInGraphRootPathOrPrehistory being called for each).
   /// </summary>
-  public int RepetitionDrawReconciliationDepth = 4;
+  public int RepetitionDrawReconciliationDepth = 2; // max 2; see above
 
   /// <summary>
   /// If nodes should apply supplemental updates.
@@ -603,6 +606,15 @@ public record ParamsSearch
   /// </summary>
   [CeresOption(Name = "time-management-aggressiveness", Desc = "Aggressiveness with which limited search resource (time or nodes) is consumed.", Default = "1.0")]
   public float GameLimitUsageAggressiveness = 1.0f;
+
+  /// <summary>
+  /// Optional name of an alternate limits manager to use for this engine
+  /// (currently only "TEST", the trajectory-controller testbed), taking precedence over
+  /// the process-wide Ceres.json "LimitsManagerName" setting. Null or empty defers to that
+  /// setting, or to the default manager if neither is specified. Being per-engine, this
+  /// allows two engines in one tournament to A/B different limits managers.
+  /// </summary>
+  public string LimitsManagerName = null;
 
 
   /// <summary>
@@ -697,10 +709,32 @@ public record ParamsSearch
 
 
   /// <summary>
+  /// Default amount of time subtracted from time allotments (see MoveOverheadSeconds).
+  /// </summary>
+  public const float MOVE_OVERHEAD_SECONDS_DEFAULT = 0.5f;
+
+  /// <summary>
+  /// Default amount of time subtracted from time allotments (see MoveOverheadSeconds)
+  /// when the game is played under a short time control.
+  /// </summary>
+  public const float MOVE_OVERHEAD_SECONDS_SHORT_TIME_CONTROL = 0.25f;
+
+  /// <summary>
+  /// Starting time control value (seconds) below which a game is considered to be played
+  /// under a short time control for purposes of choosing the default move overhead.
+  /// </summary>
+  public const float MOVE_OVERHEAD_SHORT_TIME_CONTROL_THRESHOLD_SECONDS = 15f;
+
+  /// <summary>
   /// Amount of time subtracted from time allotments to
   /// compensate for lag or various unpredictable latencies.
+  ///
+  /// If left at the default value, the overhead actually applied is reduced to
+  /// MOVE_OVERHEAD_SECONDS_SHORT_TIME_CONTROL for games played under a time-based search limit
+  /// whose starting value is below MOVE_OVERHEAD_SHORT_TIME_CONTROL_THRESHOLD_SECONDS.
+  /// A value explicitly set (e.g. via the UCI MoveOverheadMs option) is always used as-is.
   /// </summary>
-  public float MoveOverheadSeconds = 0.25f;
+  public float MoveOverheadSeconds = MOVE_OVERHEAD_SECONDS_DEFAULT;
 
 
   /// <summary>
