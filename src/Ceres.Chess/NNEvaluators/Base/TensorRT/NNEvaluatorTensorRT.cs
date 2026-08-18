@@ -1229,9 +1229,8 @@ public class NNEvaluatorTensorRT : NNEvaluator
     // Get policy temperature
     float policyTemperature = Options?.PolicyTemperature ?? 1.0f;
 
-    // Parallel extraction of per-position results
-    const int MIN_PARALLEL_COUNT = 48;
-    Parallel.For(0, count, count < MIN_PARALLEL_COUNT ? null : new ParallelOptions() { MaxDegreeOfParallelism = 1 + count / MIN_PARALLEL_COUNT }, i =>
+    const int POSITIONS_PER_THREAD = 32;
+    ParallelUtils.For(0, count, POSITIONS_PER_THREAD, i =>
     {
       int resultIndex = startPos + i;
 
@@ -2111,9 +2110,12 @@ public class NNEvaluatorTensorRT : NNEvaluator
     ReadOnlyMemory<MGMoveList> moves = batch.Moves;
     ReadOnlyMemory<MGPosition> positions = batch.Positions;
 
-    // Single parallel loop extracts all per-position results: values, M, uncertainties, and policies.
+    // Single loop extracts all per-position results: values, M, uncertainties, and policies.
     // This improves cache locality and parallelism compared to separate sequential + parallel passes.
-    Parallel.For(0, count, new ParallelOptions() { MaxDegreeOfParallelism = 1 + count / 48 }, /*cachedParallelOptions,*/ i =>
+    // Parallel only once the sub-batch is large enough to pay for the threading, and without
+    // allocating a ParallelOptions per sub-batch.
+    const int POSITIONS_PER_THREAD = 32;
+    ParallelUtils.For(0, count, POSITIONS_PER_THREAD, i =>
     {
       int resultIndex = startPos + i;
 

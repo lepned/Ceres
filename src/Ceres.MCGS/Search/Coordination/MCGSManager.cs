@@ -25,6 +25,7 @@ using Ceres.Base.Misc;
 using Ceres.Chess;
 using Ceres.Chess.EncodedPositions.Basic;
 using Ceres.Chess.GameEngines;
+using Ceres.Chess.LC0.Batches;
 using Ceres.Chess.MoveGen;
 using Ceres.Chess.MoveGen.Converters;
 using Ceres.Chess.NetEvaluation.Batch;
@@ -288,7 +289,8 @@ public partial class MCGSManager : IDisposable
                      bool forceNoTablebaseTerminals,
                      List<MGMove> searchMovesTablebaseRestricted,
                      bool engineIsWhite,
-                     SearchLimit fixedSearchLimit = null)
+                     SearchLimit fixedSearchLimit = null,
+                     EncodedPositionBatchFlat[] reusableNNBatches = null)
   {
     // Ensure engine initialization is performed (thread-safe, only runs once)
     MCGSEngineInitialization.BaseInitialize();
@@ -384,7 +386,8 @@ public partial class MCGSManager : IDisposable
                                               LOW_PRIORITY, paramsSearch.ValueTemperature,
                                               paramsSearch.EnableState,
                                               null,  // GFIX: context.Tree.PositionCache,
-                                              null, engineIsWhite); // batch index dynamic selector
+                                              null, engineIsWhite, // batch index dynamic selector
+                                              reusableNNBatches, 0);
 
     if (paramsSearch.Execution.DualOverlappedIterators)
     {
@@ -396,7 +399,8 @@ public partial class MCGSManager : IDisposable
                                                 LOW_PRIORITY, paramsSearch.ValueTemperature,
                                                 paramsSearch.EnableState,
                                                 null, // GFIX: context.Tree.PositionCache,
-                                                null, engineIsWhite); // batch index dynamic selector
+                                                null, engineIsWhite, // batch index dynamic selector
+                                                reusableNNBatches, 1);
     }
 
     // TODO: cleanup? see notes relating to forceNoTablebaseTerminals in MCGSSearch.cs

@@ -16,7 +16,6 @@
 using System;
 using System.Threading.Tasks;
 using System.Runtime.CompilerServices;
-using System.Collections.Concurrent;
 
 using Ceres.Base.OperatingSystem;
 using Ceres.Base.DataTypes;
@@ -314,11 +313,10 @@ namespace Ceres.Chess.NNEvaluators.CUDA
     {
       Evaluator.ExtractActivations(positions.NumPos);
 
-      ParallelOptions parallelOptions = ParallelUtils.ParallelOptions(positions.NumPos, NUM_POSITIONS_PER_THREAD_OUTPUT);
-      Parallel.ForEach(Partitioner.Create(0, positions.NumPos), parallelOptions,
-        range =>
+      ParallelUtils.ForRange(0, positions.NumPos, NUM_POSITIONS_PER_THREAD_OUTPUT,
+        (rangeStart, rangeEnd) =>
         {
-          PrepareOutputPositions(positions, numMoves, moveIndices, range.Item1, range.Item2);
+          PrepareOutputPositions(positions, numMoves, moveIndices, rangeStart, rangeEnd);
         });
 
       NNEvaluatorResultActivations[] activations = null;
@@ -394,16 +392,14 @@ namespace Ceres.Chess.NNEvaluators.CUDA
       Span<ulong> masksDest = Evaluator.inputOutput.InputBoardMasks.AsSpan().Slice(0, batch.NumPos * numPlanes);
       masksSource.CopyTo(masksDest);
 
-      ParallelOptions parallelOptions = ParallelUtils.ParallelOptions(batch.NumPos, NUM_POSITIONS_PER_THREAD_INPUT);
-
-      Parallel.ForEach(Partitioner.Create(0, batch.NumPos), parallelOptions,
-        range =>
+      ParallelUtils.ForRange(0, batch.NumPos, NUM_POSITIONS_PER_THREAD_INPUT,
+        (rangeStart, rangeEnd) =>
         {
           Span<MGMoveList> movesSpan = batch.Moves.Span;
           Span<byte> valuesSource = batch.PosPlaneValues.Span;
           Span<float> valuesDest = Evaluator.inputOutput.InputBoardValues.AsSpan();
 
-          for (int i = range.Item1; i < range.Item2; i++)
+          for (int i = rangeStart; i < rangeEnd; i++)
           {
             // Determine legal move list
             MGMoveList movesLegal = movesSpan[i];

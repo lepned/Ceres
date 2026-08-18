@@ -75,7 +75,7 @@ public partial class MCGSBackup
   {
     Engine = mcgsCoordinator;
     trackLeafValueVolatility = mcgsCoordinator.Manager.ParamsSearch.TrackLeafValueVolatility;
-    applyLeafNodeUpdatesAction = ApplyLeafNodeUpdates;
+    applyLeafNodeUpdatesAtIndexAction = i => ApplyLeafNodeUpdates(leafPrepPaths[i]);
 
     if (mcgsCoordinator.Manager.ParamsSearch.Execution.BackupMode == BackupMethodEnum.ReductionMultiThread)
     {
@@ -138,12 +138,21 @@ public partial class MCGSBackup
 
     int numBackupThreads = MaxConcurrentThreadsForPaths(iterator.numAllocatedPaths);
 
-    for (int i = 0; i < numBackupThreads; i++)
+    if (numBackupThreads == 1)
     {
-      cachedBackupTasks[i] = Task.Run(() => BackupWorkerLoop(numPaths, strategy, iterator));
+      // Run inline: with a single worker the Tasks (and the closure capturing their arguments)
+      // are pure overhead, as is the round trip through the thread pool.
+      BackupWorkerLoop(numPaths, strategy, iterator);
     }
+    else
+    {
+      for (int i = 0; i < numBackupThreads; i++)
+      {
+        cachedBackupTasks[i] = Task.Run(() => BackupWorkerLoop(numPaths, strategy, iterator));
+      }
 
-    Task.WaitAll(cachedBackupTasks.AsSpan(0, numBackupThreads));
+      Task.WaitAll(cachedBackupTasks.AsSpan(0, numBackupThreads));
+    }
 
 #if DEBUG
     for (int i = 0; i < numPaths; i++)
