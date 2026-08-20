@@ -357,7 +357,12 @@ public partial class MCGSManager : IDisposable
     // Skip this for a pooled evaluator: it returns freshly allocated result buffers to each caller
     // (so there is no shared output buffer to protect) and the evaluator instance is shared across
     // many engines, so a single lock on it would be incorrectly shared (and its count corrupted).
-    if (!ParamsSearch.Execution.DualEvaluators && NNEvaluator0 is not NNEvaluatorPooled)
+    bool overlappedIteratorsShareEvaluator = ParamsSearch.Execution.DualEvaluators
+                                          && ParamsSearch.Execution.DualOverlappedIterators
+                                          && ReferenceEquals(NNEvaluator0, NNEvaluator1);
+
+    if ((!ParamsSearch.Execution.DualEvaluators || overlappedIteratorsShareEvaluator)
+     && NNEvaluator0 is not NNEvaluatorPooled)
     {
       NNEvaluator0.BuffersLock = new System.Threading.SemaphoreSlim(1, 1);
     }
