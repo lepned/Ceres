@@ -1576,8 +1576,45 @@ public class NNEvaluatorTensorRT : NNEvaluator
   }
 
 
+  /// <summary>
+  /// Number of threads currently inside the evaluation path (expected to never exceed one).
+  /// </summary>
+  int numThreadsInEvaluate;
+
+
   /// <inheritdoc/>
   protected override IPositionEvaluationBatch DoEvaluateIntoBuffers(IEncodedPositionBatchFlat batch, bool retrieveSupplementalResults = false)
+  {
+    // This evaluation path is not reentrant: the batch being extracted (handlerBatch), the pinned
+    // input buffer and every result buffer are instance fields reused across calls. Two threads
+    // inside it at once therefore produce results silently attributed to the wrong positions, or
+    // an IndexOutOfRange/NullReference deep inside ExtractSubBatchResults when the batches differ
+    // in size. Fail loudly instead: a caller which shares one evaluator instance across threads
+    // must serialize the calls itself (see NNEvaluator.BuffersLock).
+    if (System.Threading.Interlocked.Increment(ref numThreadsInEvaluate) != 1)
+    {
+      System.Threading.Interlocked.Decrement(ref numThreadsInEvaluate);
+      throw new InvalidOperationException($"NNEvaluatorTensorRT ({Description}) was entered concurrently by more than "
+                                        + "one thread. This evaluator is not reentrant; serialize the callers, give each "
+                                        + "concurrent user its own evaluator instance, or use a pooled evaluator.");
+    }
+
+    try
+    {
+      return DoEvaluateIntoBuffersNonReentrant(batch, retrieveSupplementalResults);
+    }
+    finally
+    {
+      System.Threading.Interlocked.Decrement(ref numThreadsInEvaluate);
+    }
+  }
+
+
+  /// <summary>
+  /// Performs the evaluation. Never call directly: DoEvaluateIntoBuffers enforces the
+  /// single threaded access this method (and the instance buffers it uses) requires.
+  /// </summary>
+  private IPositionEvaluationBatch DoEvaluateIntoBuffersNonReentrant(IEncodedPositionBatchFlat batch, bool retrieveSupplementalResults)
   {
     int numPos = batch.NumPos;
     if (numPos > maxBatchSize)
