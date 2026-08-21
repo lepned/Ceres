@@ -132,11 +132,15 @@ public partial class MCGSIterator
       return records;
     }
 
-    // Probes reuse iterator lane 0 for in-flight accounting, which is only correct when no
-    // other select/backup is in flight. Verify quiescence at the search root's edges.
+    // Probes reuse this iterator's lane for in-flight accounting, which is only correct when no
+    // other select/backup is in flight. Verify quiescence at the search root's edges, checking
+    // BOTH iterator lanes: under DualOverlappedIterators the peer iterator can be sitting in NN
+    // evaluate with a full batch in flight on the other lane, which a single-lane check would
+    // silently miss. That configuration is rejected by ParamsProbeGraft.Validate, so this is
+    // a fail-fast backstop rather than a live code path.
     foreach (GEdge rootEdge in Engine.SearchRootNode.ChildEdgesExpanded)
     {
-      if (rootEdge.NInFlightForIterator(IteratorID) != 0)
+      if (rootEdge.NumInFlight0 != 0 || rootEdge.NumInFlight1 != 0)
       {
         throw new InvalidOperationException("RunProbeSpecs requires a quiescent graph (found in-flight visits at root)");
       }

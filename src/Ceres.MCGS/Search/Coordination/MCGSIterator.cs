@@ -579,6 +579,18 @@ public partial class MCGSIterator : IDisposable
     // a nested batch's EnterBackupOrder waits on this batch's ExitBackupOrder.)
     Engine.PostBatchHook?.Invoke(this);
 
+    // Pump the PICKET M1 graft coordinator (if enabled) at this same quiescent
+    // point, after the external hook so that hook consumers still observe this batch's
+    // intact PathsSet (the pump's RunProbeSpecs calls reset it).
+    // Restricted to iterator 0 (always the first iterator, see MCGSEngine.RunLoop): the
+    // coordinator holds unsynchronized per-search state and must only ever be entered from
+    // one thread. This is a no-op today because ParamsProbeGraft.Validate forbids
+    // DualOverlappedIterators, but it keeps the single-pump-thread invariant explicit.
+    if (IteratorID == 0)
+    {
+      Manager.ProbeGraft?.PumpAtQuiescentPoint(this);
+    }
+
     LogFlush();
 
     Engine.PossiblySynchronizeIterators(this);

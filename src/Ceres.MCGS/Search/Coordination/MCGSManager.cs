@@ -147,6 +147,19 @@ public partial class MCGSManager : IDisposable
 
 
   /// <summary>
+  /// Optional PICKET M1 refutation-grafting coordinator (null unless
+  /// ParamsSearch.ProbeGraft.Mode != Disabled). Created in the constructor
+  /// (which resolves the probe source, failing fast on an unknown ID), pumped from
+  /// MCGSIterator.RunOnce at the post-batch quiescent point, ended in DoSearchInner.
+  /// </summary>
+  public ProbeGraft.ProbeGraftCoordinator ProbeGraft;
+
+  /// <summary>
+  /// Per-search statistics of the refutation-grafting feature (null when disabled).
+  /// </summary>
+  public ProbeGraft.ProbeGraftStats ProbeGraftStats => ProbeGraft?.Stats;
+
+  /// <summary>
   /// Futility pruning manager associated with this search
   /// (for determining if and when top-level moves should be not further searched).
   /// </summary>
@@ -419,6 +432,18 @@ public partial class MCGSManager : IDisposable
       //evaluatorTBPly1 = new LeafEvaluatorSyzygyPly1(evaluatorTB, Manager.ForceNoTablebaseTerminals);
     }
 
+    // PICKET M1 refutation grafting: create the per-search coordinator when enabled
+    // (resolves the probe source from the registry and begins its session; an unknown
+    // ProbeSourceID throws here - fail fast at search start, never silently).
+    // Deliberately the LAST fallible step of construction: the coordinator's BeginSession
+    // must not be left stranded (never EndSession'd) by a later constructor exception,
+    // since the probe source may be a shared instance reused across searches.
+    if (paramsSearch.ProbeGraft != null
+     && paramsSearch.ProbeGraft.Mode != ParamsProbeGraft.ModeType.Disabled)
+    {
+      ProbeGraft = new ProbeGraft.ProbeGraftCoordinator(this);
+    }
+
     //    LeafEvaluatorSyzygyPly1 evaluatorTBPly1;
 
     MGMove RootTablebaseMoveCheck(in Position currentPos, out WDLResult result, out List<(MGMove, short)> fullWinningMoveList, out bool winningMoveListOrderedByDTM)
@@ -529,20 +554,28 @@ public partial class MCGSManager : IDisposable
       manager.TrySetImmediateBestMove(manager.Engine.SearchRootNode);
 
       manager.StopStatus = SearchStopStatus.TablebaseImmediateMove;
+
+      // Early return: DoSearchInner never runs, so finalize grafting here (idempotent)
+      // so that its statistics are reported/aggregated for this search like any other.
+      manager.ProbeGraft?.EndSearch();
       return (manager.TablebaseImmediateBestMove, null);
     }
 
     // Check if playing using only action head.
     if (manager.SearchLimit.Type == SearchLimitType.BestActionMove)
     {
-      return (ChooseActionHeadMove(manager, priorMoves), null);
+      MGMove actionHeadMove = ChooseActionHeadMove(manager, priorMoves);
+      manager.ProbeGraft?.EndSearch();   // early return, see note above
+      return (actionHeadMove, null);
     }
 
 
     // Check if playing using only value head (TopV).
     if (manager.SearchLimit.Type == SearchLimitType.BestValueMove)
     {
-      return (ChooseValueHeadMove(manager, priorMoves, ref moves), null);
+      MGMove valueHeadMove = ChooseValueHeadMove(manager, priorMoves, ref moves);
+      manager.ProbeGraft?.EndSearch();   // early return, see note above
+      return (valueHeadMove, null);
     }
 
     bool shouldStopAfterTwoNodesDueToOnlyOneLegalMove = false;
@@ -754,6 +787,11 @@ public partial class MCGSManager : IDisposable
       Console.WriteLine(Engine.QUnc.Stats.SummaryLine(stats.ElapsedTimeSecs));
     }
 
+    // Finalize PICKET M1 probe grafting for this search: cancel outstanding probes,
+    // compute impact/Shadow verdicts against the final graph, and possibly print the
+    // one-line summary (gated on ParamsProbeGraft.EnableStatsSummary).
+    ProbeGraft?.EndSearch();
+
     return stats;
   }
 
@@ -852,6 +890,10 @@ public partial class MCGSManager : IDisposable
     disposed = true;
     iterator0?.Dispose();
     iterator1?.Dispose();
+
+    // Safety net: ensure the probe session is ended even if the search never completed
+    // (EndSearch already ran in the normal path; Dispose here is idempotent).
+    ProbeGraft?.Dispose();
 
     // Dispose the per-manager NN evaluator wrapper(s) owned by this manager. Each only
     // shuts down its own batch buffers (Batch.Shutdown()); the underlying shared

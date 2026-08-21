@@ -152,6 +152,17 @@ public record ParamsSearch
 
 
   /// <summary>
+  /// Opt-in "refutation grafting" hybrid feature (PICKET M1): important interior nodes are
+  /// asynchronously verified by an external probe source; when a probe refutes the
+  /// currently dominant move at a node (or surfaces a strong low-prior alternative), the probe's
+  /// witness line is grafted into the graph as forced, committed, NN-evaluated visits (plus an
+  /// optional bounded prior nudge). No value is ever written to the graph.
+  /// Disabled by default; see ParamsProbeGraft.
+  /// </summary>
+  public ParamsProbeGraft ProbeGraft = new();
+
+
+  /// <summary>
   /// Implementation related parameters related to execution of a batch
   /// which are potentially recomputed based on the characterstic of the batch.
   /// </summary>
@@ -844,6 +855,7 @@ public record ParamsSearch
   public void Validate()
   {
     RootMinimaxBlend?.Validate();
+    ProbeGraft?.Validate(this);
 
     if (RedescentScaleByVolatility && !TrackLeafValueVolatility)
     {
