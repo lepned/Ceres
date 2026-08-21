@@ -139,6 +139,12 @@ public partial class MCGSIterator : IDisposable
     = ENABLE_LOGGING ? TextWriter.Synchronized(new StreamWriter(@"c:\temp\iterator_log.txt", append: true) { AutoFlush = false })
                      : null;
 
+  /// <summary>
+  /// Writes a diagnostic line for this iterator. Every call site is guarded by the
+  /// ENABLE_LOGGING compile-time constant so that neither the message lambda nor its
+  /// closure is allocated (per batch, on the search critical path) when logging is off.
+  /// </summary>
+  /// <param name="messageFunc"></param>
   private void LogWrite(Func<string> messageFunc)
     => iteratorLogWriter?.WriteLine($"{IteratorID} [{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {messageFunc()}");
   private void LogFlush() => iteratorLogWriter?.Flush();
@@ -205,7 +211,10 @@ public partial class MCGSIterator : IDisposable
   /// <param name="engine"></param>
   /// <param name="iteratorID"></param>
   /// <param name="evaluatorNN"></param>
-  public MCGSIterator(MCGSEngine engine, int iteratorID, MCGSEvaluatorNeuralNet evaluatorNN)
+  /// <param name="pathVisitPool">optionally a (recycled) pool to use for path visit slots,
+  /// otherwise a new pool is created</param>
+  public MCGSIterator(MCGSEngine engine, int iteratorID, MCGSEvaluatorNeuralNet evaluatorNN,
+                      ArraySegmentPool<MCGSPathVisit> pathVisitPool = null)
   {
     Engine = engine;
     Manager = engine.Manager;
@@ -219,7 +228,7 @@ public partial class MCGSIterator : IDisposable
     paths = new MCGSPath[maxBatchSize + 5];
     moveListSnapshotPool = new MGMoveList[maxBatchSize + 5];
 
-    pathVisitPool = new ArraySegmentPool<MCGSPathVisit>();
+    this.pathVisitPool = pathVisitPool ?? new ArraySegmentPool<MCGSPathVisit>();
   }
 
 
@@ -234,6 +243,12 @@ public partial class MCGSIterator : IDisposable
     }
 
     PathsSet.Dispose();
+
+    // Release any object references (paths, edges and thus their graph, move lists) still
+    // embedded in the path visit slots. Required because the pool may be recycled by a
+    // subsequent search, in which case stale slots would otherwise keep this search's
+    // graph reachable indefinitely.
+    pathVisitPool.Reset();
 
     // NOTE: EvaluatorNN is intentionally NOT disposed here. It is owned by MCGSManager
     // (exposed as EvaluatorNN0/EvaluatorNN1) and, in the non-dual-evaluator case, the same
@@ -317,7 +332,10 @@ public partial class MCGSIterator : IDisposable
         return;
       }
 
-      LogWrite(()=> $"Starting batch {batchSequenceNum} with size {batchSize}, rootN={Engine.SearchRootNode.N}, inFlight={Engine.numVisitsInFlight}");
+      if (ENABLE_LOGGING)
+      {
+        LogWrite(()=> $"Starting batch {batchSequenceNum} with size {batchSize}, rootN={Engine.SearchRootNode.N}, inFlight={Engine.numVisitsInFlight}");
+      }
 
       Interlocked.Add(ref Engine.numVisitsInFlight, batchSize);
 
@@ -384,7 +402,10 @@ public partial class MCGSIterator : IDisposable
     // STEP1 : Descend graph selecting children to build paths.
     long tsPhase = Stopwatch.GetTimestamp();
     Engine.Coordinator.EnterSelect(IteratorID, thisBatchID);
-    LogWrite(() => $"Start select batch {batchSequenceNum}");
+    if (ENABLE_LOGGING)
+    {
+      LogWrite(() => $"Start select batch {batchSequenceNum}");
+    }
 
     RunSelectionPhase(batchSize);
 
@@ -392,7 +413,10 @@ public partial class MCGSIterator : IDisposable
 
     PossiblyRunSecondSelectionForNNBatchSizePadding(batchSize, hardMaxRootN);
 
-    LogWrite(() => $"End select batch {batchSequenceNum} with {PathsSet.Paths.Count} paths");
+    if (ENABLE_LOGGING)
+    {
+      LogWrite(() => $"End select batch {batchSequenceNum} with {PathsSet.Paths.Count} paths");
+    }
     Engine.Coordinator.ExitSelect(IteratorID, thisBatchID);
     long tsAfterSelect = Stopwatch.GetTimestamp();
     long selectTicks = tsAfterSelect - tsPhase;
@@ -429,13 +453,19 @@ public partial class MCGSIterator : IDisposable
 
     // STEP2: Evaluate any nodes needing neural network.
     Engine.Coordinator.EnterEvaluate(IteratorID, thisBatchID);
-    LogWrite(() => $"Start evaluate batch {batchSequenceNum} with {PathsSet.NNPaths.Count} NN paths");
+    if (ENABLE_LOGGING)
+    {
+      LogWrite(() => $"Start evaluate batch {batchSequenceNum} with {PathsSet.NNPaths.Count} NN paths");
+    }
 
     // Retrieve deferred NN results outside of the locked region (if two distinct evaluators exist).
     bool deferRetrieveResults = Manager.ParamsSearch.Execution.DualEvaluators 
                              && Manager.ParamsSearch.Execution.DualOverlappedIterators;
     RunNNEvaluationPhase(deferRetrieveResults);
-    LogWrite(() => $"End evaluate batch {batchSequenceNum} with {PathsSet.NNPaths.Count} NN paths");
+    if (ENABLE_LOGGING)
+    {
+      LogWrite(() => $"End evaluate batch {batchSequenceNum} with {PathsSet.NNPaths.Count} NN paths");
+    }
     Engine.Coordinator.ExitEvaluate(IteratorID, thisBatchID);
 
     if (deferRetrieveResults && PathsSet.NNPaths.Count > 0)
@@ -447,7 +477,10 @@ public partial class MCGSIterator : IDisposable
 
     // STEP3: Backup the selected visits.
     Engine.Coordinator.EnterBackup(IteratorID, thisBatchID);
-    LogWrite(() => $"Start backup with mode {BackupMode}");
+    if (ENABLE_LOGGING)
+    {
+      LogWrite(() => $"Start backup with mode {BackupMode}");
+    }
 
     const bool VERIFY_MULTISET_CORRECTNESS = false;
     if (VERIFY_MULTISET_CORRECTNESS)
@@ -530,7 +563,10 @@ public partial class MCGSIterator : IDisposable
     Manager.RunPeriodicMaintenance(batchSequenceNum);
     batchSequenceNum++;
 
-    LogWrite(() => $"End backup with mode {BackupMode}");
+    if (ENABLE_LOGGING)
+    {
+      LogWrite(() => $"End backup with mode {BackupMode}");
+    }
     Engine.Coordinator.ExitBackup(IteratorID, thisBatchID);
     long backupTicks = Stopwatch.GetTimestamp() - tsAfterEval;
     Engine.Coordinator.RecordBackupPhase(backupTicks);

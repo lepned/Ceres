@@ -132,6 +132,15 @@ public partial class MCGSEngine
 
   public WorkerPool<ExtendPathsWorkerInfo>[] SelectWorkerPools;
 
+  /// <summary>
+  /// Per-iterator pools of MCGSPathVisit slots, owned by the caller (typically the game engine)
+  /// and therefore reused across successive searches. Each pool is a multi-megabyte fixed-size
+  /// inline buffer, so allocating one per search would put a large object on the LOH every move.
+  /// Null if the caller does not supply pools (in which case each iterator allocates its own).
+  /// Indexed by iterator ID exactly as SelectWorkerPools.
+  /// </summary>
+  public ArraySegmentPool<MCGSPathVisit>[] PathVisitPools;
+
   internal int nextBatchID;
 
   /// <summary>
@@ -158,7 +167,8 @@ public partial class MCGSEngine
   public MCGSEngine(MCGSManager manager,
                     WorkerPool<ExtendPathsWorkerInfo>[] selectWorkerPools,
                     Graph graph,
-                    GraphRootToSearchRootNodeInfo[] searchRootPathFromGraphRoot)
+                    GraphRootToSearchRootNodeInfo[] searchRootPathFromGraphRoot,
+                    ArraySegmentPool<MCGSPathVisit>[] pathVisitPools = null)
   {
     Manager = manager;
 
@@ -173,6 +183,7 @@ public partial class MCGSEngine
     Graph.PTBMaxRepDrawFraction = manager.ParamsSearch.PseudoTranspositionBlendingMaxRepDrawFraction;
     Strategy = new MCGSStrategyPUCT(this);
     SelectWorkerPools = selectWorkerPools;
+    PathVisitPools = pathVisitPools;
     QRecalculator = new BottomUpQRecalculator(this);
     QPropagator = new SelectiveQPropagator(this);
 
@@ -459,6 +470,30 @@ public partial class MCGSEngine
   }
 
 
+  /// <summary>
+  /// Returns the pool of MCGSPathVisit slots to be used by the iterator with specified ID,
+  /// taken from the caller-owned (search-spanning) set if available, else newly created.
+  /// A recycled pool is fully reset first so no references from the prior search remain live.
+  /// </summary>
+  /// <param name="iteratorID"></param>
+  internal ArraySegmentPool<MCGSPathVisit> GetPathVisitPool(int iteratorID)
+  {
+    if (PathVisitPools == null || iteratorID >= PathVisitPools.Length)
+    {
+      return new ArraySegmentPool<MCGSPathVisit>();
+    }
+
+    ArraySegmentPool<MCGSPathVisit> pool = PathVisitPools[iteratorID];
+    if (pool == null)
+    {
+      return PathVisitPools[iteratorID] = new ArraySegmentPool<MCGSPathVisit>();
+    }
+
+    pool.Reset();
+    return pool;
+  }
+
+
   internal void RunLoop(int hardMaxRootN)
   {
     const bool DEBUG_MODE = false;
@@ -471,7 +506,7 @@ public partial class MCGSEngine
     int firstIteratorID = 0;
     int secondIteratorID = 1;
 
-    iterator0 = new(this, firstIteratorID, Manager.EvaluatorNN0);
+    iterator0 = new(this, firstIteratorID, Manager.EvaluatorNN0, GetPathVisitPool(firstIteratorID));
 
     if (!SearchRootNode.IsEvaluated)
     {
@@ -511,7 +546,7 @@ public partial class MCGSEngine
     if (Manager.ParamsSearch.Execution.DualOverlappedIterators && ShouldContinue())
     {
       MCGSEvaluatorNeuralNet evaluator1ToUse = Manager.ParamsSearch.Execution.DualEvaluators ? Manager.EvaluatorNN1 : Manager.EvaluatorNN0;
-      iterator1 = new MCGSIterator(this, secondIteratorID, evaluator1ToUse);
+      iterator1 = new MCGSIterator(this, secondIteratorID, evaluator1ToUse, GetPathVisitPool(secondIteratorID));
 
       startedOverlapping = true;
 

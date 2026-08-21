@@ -25,6 +25,7 @@ using Ceres.Base.Misc;
 using Ceres.Chess;
 using Ceres.Chess.EncodedPositions.Basic;
 using Ceres.Chess.GameEngines;
+using Ceres.Chess.LC0.Batches;
 using Ceres.Chess.MoveGen;
 using Ceres.Chess.MoveGen.Converters;
 using Ceres.Chess.NetEvaluation.Batch;
@@ -288,7 +289,8 @@ public partial class MCGSManager : IDisposable
                      bool forceNoTablebaseTerminals,
                      List<MGMove> searchMovesTablebaseRestricted,
                      bool engineIsWhite,
-                     SearchLimit fixedSearchLimit = null)
+                     SearchLimit fixedSearchLimit = null,
+                     EncodedPositionBatchFlat[] reusableNNBatches = null)
   {
     // Ensure engine initialization is performed (thread-safe, only runs once)
     MCGSEngineInitialization.BaseInitialize();
@@ -355,7 +357,12 @@ public partial class MCGSManager : IDisposable
     // Skip this for a pooled evaluator: it returns freshly allocated result buffers to each caller
     // (so there is no shared output buffer to protect) and the evaluator instance is shared across
     // many engines, so a single lock on it would be incorrectly shared (and its count corrupted).
-    if (!ParamsSearch.Execution.DualEvaluators && NNEvaluator0 is not NNEvaluatorPooled)
+    bool overlappedIteratorsShareEvaluator = ParamsSearch.Execution.DualEvaluators
+                                          && ParamsSearch.Execution.DualOverlappedIterators
+                                          && ReferenceEquals(NNEvaluator0, NNEvaluator1);
+
+    if ((!ParamsSearch.Execution.DualEvaluators || overlappedIteratorsShareEvaluator)
+     && NNEvaluator0 is not NNEvaluatorPooled)
     {
       NNEvaluator0.BuffersLock = new System.Threading.SemaphoreSlim(1, 1);
     }
@@ -384,7 +391,8 @@ public partial class MCGSManager : IDisposable
                                               LOW_PRIORITY, paramsSearch.ValueTemperature,
                                               paramsSearch.EnableState,
                                               null,  // GFIX: context.Tree.PositionCache,
-                                              null, engineIsWhite); // batch index dynamic selector
+                                              null, engineIsWhite, // batch index dynamic selector
+                                              reusableNNBatches, 0);
 
     if (paramsSearch.Execution.DualOverlappedIterators)
     {
@@ -396,7 +404,8 @@ public partial class MCGSManager : IDisposable
                                                 LOW_PRIORITY, paramsSearch.ValueTemperature,
                                                 paramsSearch.EnableState,
                                                 null, // GFIX: context.Tree.PositionCache,
-                                                null, engineIsWhite); // batch index dynamic selector
+                                                null, engineIsWhite, // batch index dynamic selector
+                                                reusableNNBatches, 1);
     }
 
     // TODO: cleanup? see notes relating to forceNoTablebaseTerminals in MCGSSearch.cs

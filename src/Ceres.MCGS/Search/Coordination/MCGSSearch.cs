@@ -15,10 +15,12 @@
 
 using System;
 using System.Collections.Generic;
+using Ceres.Base.DataTypes;
 using Ceres.Base.Misc;
 using Ceres.Base.Threading;
 using Ceres.Chess;
 using Ceres.Chess.GameEngines;
+using Ceres.Chess.LC0.Batches;
 using Ceres.Chess.MoveGen;
 using Ceres.Chess.MoveGen.Converters;
 using Ceres.Chess.PositionEvalCaching;
@@ -30,6 +32,7 @@ using Ceres.MCGS.Graphs.GraphStores;
 using Ceres.MCGS.Managers;
 using Ceres.MCGS.Managers.Limits;
 using Ceres.MCGS.Search.Params;
+using Ceres.MCGS.Search.Paths;
 using Ceres.MCGS.Search.Phases.Evaluation;
 
 using static Ceres.MCGS.Search.Coordination.MCGSManager;
@@ -112,6 +115,9 @@ public partial class MCGSSearch
   /// </summary>
   /// <param name="nnEvaluators"></param>
   /// <param name="graphToPossiblyReuse"></param>
+  /// <param name="selectWorkerPools"></param>
+  /// <param name="pathVisitPools">caller-owned per-iterator path visit slot pools, reused across searches</param>
+  /// <param name="reusableNNBatches">caller-owned per-evaluator neural network input batches, reused across searches</param>
   /// <param name="paramsSelect"></param>
   /// <param name="paramsSearch"></param>
   /// <param name="limitManager"></param>
@@ -128,6 +134,8 @@ public partial class MCGSSearch
   public void Search(NNEvaluatorSet nnEvaluators,
                      Graph graphToPossiblyReuse,
                      WorkerPool<ExtendPathsWorkerInfo>[] selectWorkerPools,
+                     ArraySegmentPool<MCGSPathVisit>[] pathVisitPools,
+                     EncodedPositionBatchFlat[] reusableNNBatches,
                      ParamsSelect paramsSelect,
                      ParamsSearch paramsSearch,
                      IManagerGameLimit limitManager,
@@ -283,7 +291,7 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
                   gameMoveHistory, isFirstMoveOfGame,
                   forceNoTablebaseTerminals,
                   searchMovesTablebaseRestricted, priorMoves.FinalPosition.IsWhite,
-                  fixedSearchLimit)
+                  fixedSearchLimit, reusableNNBatches)
     {
       LastGameLimitInputs = gameLimitsInputs,
       LastGameLimitOutputs = gameLimitsOutputs
@@ -408,7 +416,8 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
     }
 
     Manager.Engine = new MCGSEngine(Manager, selectWorkerPools, graphToUse, searchRootPathFromGraphRoot == null ? []
-                                                                                              : [.. searchRootPathFromGraphRoot]);
+                                                                                              : [.. searchRootPathFromGraphRoot],
+                                    pathVisitPools);
 
 #if DEBUG
     // Verify the search root actually represents the current position before searching it.
