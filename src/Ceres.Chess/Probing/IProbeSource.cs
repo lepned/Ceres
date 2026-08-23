@@ -47,6 +47,15 @@ public interface IProbeSource
   /// number of concurrent sessions; results are routed to the session that submitted them.
   /// </summary>
   IProbeSession BeginSession(Action<ProbeResult> onProbeCompleted);
+
+
+  /// <summary>
+  /// Human-readable description of the probing engine and its configuration (engine name, network,
+  /// worker count, table size). Reported in hybrid statistics dumps so a research log records WHICH
+  /// prober produced the numbers -- without it a saved run is not reproducible from its output.
+  /// Default implementation keeps existing sources source-compatible.
+  /// </summary>
+  string Description => GetType().Name;
 }
 
 

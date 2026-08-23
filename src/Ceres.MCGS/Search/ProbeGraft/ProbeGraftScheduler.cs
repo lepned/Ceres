@@ -82,6 +82,13 @@ internal sealed class ProbeGraftScheduler
   /// <summary>Pumps a graft may stall (e.g. on a contended deferred policy copy) before being aborted.</summary>
   const int MAX_STALLS = 8;
 
+  /// <summary>
+  /// Consecutive pumps a graft may miss its forced-crossing path record before being abandoned.
+  /// Under graph reuse (i.e. in game play) these misses dominated aborts entirely, so retrying
+  /// converts most of them into completed grafts; see AbortReason.NoPathRecord.
+  /// </summary>
+  const int MAX_RECORD_MISSES = 8;
+
   /// <summary>One graft being advanced ply-by-ply.</summary>
   sealed class ActiveGraft
   {
@@ -98,6 +105,12 @@ internal sealed class ProbeGraftScheduler
 
     /// <summary>Consecutive pumps this graft could not make progress.</summary>
     public int StallCount;
+
+    /// <summary>
+    /// Consecutive pumps on which the forced crossing produced no path record. Kept separate from
+    /// StallCount, which TryResolveCursorNode resets on every successful cursor resolution.
+    /// </summary>
+    public int RecordMissCount;
 
     /// <summary>Anchor node Q immediately before the first grafted ply (impact baseline).</summary>
     public double AnchorQBefore;
@@ -231,7 +244,7 @@ internal sealed class ProbeGraftScheduler
     GNode anchor = ProbeGraftCoordinator.TryResolveNode(graph, plan.AnchorNodeIndex);
     if (anchor.IsNull || anchor.Terminal.IsTerminal() || !anchor.IsEvaluated || anchor.NumPolicyMoves == 0)
     {
-      Stats.NumGraftsAbortedPathDropped++;
+      RecordAbort(AbortReason.AnchorNotViable);
       return;
     }
 
@@ -253,7 +266,7 @@ internal sealed class ProbeGraftScheduler
     GNode cursor = ProbeGraftCoordinator.TryResolveNode(graph, graft.CursorNodeIndex);
     if (cursor.IsNull || !cursor.IsEvaluated)
     {
-      Abort(graft, moveNotFound: false);
+      Abort(graft, AbortReason.CursorGone);
       return default;
     }
 
@@ -287,7 +300,7 @@ internal sealed class ProbeGraftScheduler
       {
         if (++graft.StallCount > MAX_STALLS)
         {
-          Abort(graft, moveNotFound: false);
+          Abort(graft, AbortReason.PolicyCopyStalled);
         }
         return default;
       }
@@ -295,7 +308,7 @@ internal sealed class ProbeGraftScheduler
 
     if (cursor.NumPolicyMoves == 0)
     {
-      Abort(graft, moveNotFound: false);
+      Abort(graft, AbortReason.NoPolicyMoves);
       return default;
     }
 
@@ -321,7 +334,7 @@ internal sealed class ProbeGraftScheduler
     int childIndex = ResolveMoveToChildIndex(cursor, in cursorPos, nextMove);
     if (childIndex < 0)
     {
-      Abort(graft, moveNotFound: true);
+      Abort(graft, AbortReason.MoveNotFound);
       return false;
     }
 
@@ -335,7 +348,7 @@ internal sealed class ProbeGraftScheduler
     if (groupVisits > maxBatchSize)
     {
       // Cannot fit this ply in a single call (implausible: <= 63 backfills); be defensive.
-      Abort(graft, moveNotFound: false);
+      Abort(graft, AbortReason.PlyTooLarge);
       return false;
     }
 
@@ -389,7 +402,7 @@ internal sealed class ProbeGraftScheduler
     if (cursor.IsNull || childIndex >= cursor.NumEdgesExpanded)
     {
       // The forced expansion did not happen (path evaporated/aborted on the spine).
-      Abort(graft, moveNotFound: false);
+      Abort(graft, AbortReason.SlotNotExpanded);
       return false;
     }
 
@@ -399,7 +412,7 @@ internal sealed class ProbeGraftScheduler
       // The slot no longer carries the resolved witness move (e.g. an unexpanded-header
       // rearrangement performed by another spec's stock descent in this same pump);
       // the forced visits went through a different move - do not advance along it.
-      Abort(graft, moveNotFound: false);
+      Abort(graft, AbortReason.WitnessMoved);
       return false;
     }
 
@@ -413,15 +426,34 @@ internal sealed class ProbeGraftScheduler
 
     if (edge.Type != GEdgeStruct.EdgeType.ChildEdge || edge.ChildNodeIndex.IsNull)
     {
-      Abort(graft, moveNotFound: false);
+      Abort(graft, AbortReason.NotChildEdge);
       return false;
     }
 
     // Classify using this call's record for the forced crossing when available.
     ProbePathRecord record = FindRecord(records, graft.CursorNodeIndex, childIndex);
-    if (record == null || record.TerminationReason == MCGSPathTerminationReason.Abort)
+    if (record == null)
     {
-      Abort(graft, moveNotFound: false);
+      // No record means this call's forced visit was dropped during select (typically a
+      // transposition collision within the probe batch), which is transient. The spine itself is
+      // intact -- cursor, witness slot and child edge were all re-validated immediately above -- so
+      // the ply is retried on a later pump rather than discarding the graft and the probe behind
+      // it. Only a graft that keeps missing is abandoned.
+      if (++graft.RecordMissCount > MAX_RECORD_MISSES)
+      {
+        Abort(graft, AbortReason.NoPathRecord);
+      }
+      else
+      {
+        Stats.NumGraftPlyRetriesNoRecord++;
+      }
+      return false;
+    }
+
+    graft.RecordMissCount = 0;
+    if (record.TerminationReason == MCGSPathTerminationReason.Abort)
+    {
+      Abort(graft, AbortReason.PathRecordAborted);
       return false;
     }
 
@@ -438,7 +470,7 @@ internal sealed class ProbeGraftScheduler
     GNode child = edge.ChildNode;
     if (child.IsNull || !child.IsEvaluated || child.N == 0)
     {
-      Abort(graft, moveNotFound: false);
+      Abort(graft, AbortReason.ChildUnvisited);
       return false;
     }
 
@@ -505,7 +537,7 @@ internal sealed class ProbeGraftScheduler
   /// </summary>
   void FinishApplied(ActiveGraft graft, Graph graph, string outcome)
   {
-    if (Params.PriorNudgeFloor > 0)
+    if (Params.AllowPriorNudges && Params.PriorNudgeFloor > 0)
     {
       ApplyPriorNudges(graft, graph);
     }
@@ -523,9 +555,68 @@ internal sealed class ProbeGraftScheduler
   }
 
 
-  void Abort(ActiveGraft graft, bool moveNotFound)
+  /// <summary>
+  /// Why a graft was abandoned. Every value except MoveNotFound rolls up into the
+  /// NumGraftsAbortedPathDropped total, but each is counted separately so the dominant
+  /// failure mode is visible without a full event dump.
+  /// </summary>
+  internal enum AbortReason
   {
-    if (moveNotFound)
+    /// <summary>Witness move is not among the cursor's policy moves.</summary>
+    MoveNotFound,
+
+    /// <summary>Cursor node no longer resolvable or not yet evaluated.</summary>
+    CursorGone,
+
+    /// <summary>Deferred policy copy could not be materialized within MAX_STALLS pumps.</summary>
+    PolicyCopyStalled,
+
+    /// <summary>Cursor has no policy moves.</summary>
+    NoPolicyMoves,
+
+    /// <summary>Ply would not fit in one RunProbeSpecs call.</summary>
+    PlyTooLarge,
+
+    /// <summary>Forced expansion did not materialize the target slot.</summary>
+    SlotNotExpanded,
+
+    /// <summary>Target slot no longer carries the resolved witness move.</summary>
+    WitnessMoved,
+
+    /// <summary>Edge is not a normal child edge after the forced visit.</summary>
+    NotChildEdge,
+
+    /// <summary>RunProbeSpecs returned no path record at all for the forced crossing.</summary>
+    NoPathRecord,
+
+    /// <summary>A path record exists for the forced crossing but its descent aborted.</summary>
+    PathRecordAborted,
+
+    /// <summary>Child exists but was not evaluated / received no visit.</summary>
+    ChildUnvisited,
+
+    /// <summary>Anchor was not a viable graft start when promoted.</summary>
+    AnchorNotViable,
+  }
+
+
+  void Abort(ActiveGraft graft, AbortReason reason)
+  {
+    RecordAbort(reason);
+
+    active.Remove(graft);
+    Coordinator.LogEvent($"graft abort anchor=#{graft.Plan.AnchorNodeIndex} "
+                       + $"{reason} plies={graft.PliesApplied}");
+  }
+
+
+  /// <summary>
+  /// Increments the aggregate and per-reason abort counters.
+  /// </summary>
+  /// <param name="reason"></param>
+  void RecordAbort(AbortReason reason)
+  {
+    if (reason == AbortReason.MoveNotFound)
     {
       Stats.NumGraftsAbortedMoveNotFound++;
     }
@@ -534,9 +625,7 @@ internal sealed class ProbeGraftScheduler
       Stats.NumGraftsAbortedPathDropped++;
     }
 
-    active.Remove(graft);
-    Coordinator.LogEvent($"graft abort anchor=#{graft.Plan.AnchorNodeIndex} "
-                       + $"{(moveNotFound ? "moveNotFound" : "pathDropped")} plies={graft.PliesApplied}");
+    Stats.NumGraftsAbortedByReason[(int)reason]++;
   }
 
 
@@ -633,7 +722,7 @@ internal sealed class ProbeGraftScheduler
   /// position-aware (each stored EncodedMove is converted to an MGMove at the node's
   /// position) to be robust to encoding-convention differences.
   /// </summary>
-  static int ResolveMoveToChildIndex(GNode node, in MGPosition nodePos, MGMove move)
+  internal static int ResolveMoveToChildIndex(GNode node, in MGPosition nodePos, MGMove move)
   {
     int numPolicy = node.NumPolicyMoves;
     int numExpanded = node.NumEdgesExpanded;

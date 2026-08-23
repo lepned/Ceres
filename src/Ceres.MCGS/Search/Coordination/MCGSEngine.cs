@@ -630,6 +630,58 @@ public partial class MCGSEngine
 
 
   /// <summary>
+  /// Creates a dedicated iterator over the (still-alive) underlying NNEvaluator, suitable for
+  /// running extra committed visits against a quiescent graph outside (or between batches of)
+  /// the main search: deep rollouts (RunFromInnerNodes) and directed/forced visits
+  /// (MCGSIterator.RunProbeSpecs, see Search/ProbeGraft/DirectedVisits.cs).
+  ///
+  /// A prior search's RunLoop disposes its iterator (and thus Manager.EvaluatorNN0's batch /
+  /// pooled buffers), but the underlying NNEvaluator itself is left intact and reusable, so a
+  /// fresh evaluator wrapper is constructed over it. Caller disposes the iterator.
+  /// </summary>
+  /// <param name="cpuctMultiplier">exploration multiplier applied below forced prefixes (1 = stock PUCT)</param>
+  /// <param name="disableTranspositionSufficiencyStop">if true descents always reach a true frontier</param>
+  /// <returns></returns>
+  internal MCGSIterator CreateInnerIterator(float cpuctMultiplier = 1.0f, bool disableTranspositionSufficiencyStop = false)
+  {
+    int maxBatchSize = Manager.ParamsSearch.Execution.MaxBatchSize;
+    MCGSEvaluatorNeuralNet evaluatorNN = new MCGSEvaluatorNeuralNet(
+      Manager.EvaluatorsSet.EvaluatorDef, Manager.NNEvaluator0, null,
+      Manager.ParamsSearch.HistoryFillIn,
+      Math.Min(Manager.NNEvaluator0.MaxBatchSize, maxBatchSize),
+      false, Manager.ParamsSearch.ValueTemperature, Manager.ParamsSearch.EnableState,
+      null, null, Manager.EvaluatorNN0.EngineIsWhite);
+
+    MCGSIterator iterator = new MCGSIterator(this, 0, evaluatorNN);
+    iterator.CPUCTMultiplier = cpuctMultiplier;
+    iterator.DisableTranspositionSufficiencyStop = disableTranspositionSufficiencyStop;
+    return iterator;
+  }
+
+
+  /// <summary>
+  /// Runs an action against a dedicated inner iterator (see CreateInnerIterator), disposing
+  /// the iterator afterwards. The graph must be quiescent (no search in progress).
+  /// </summary>
+  /// <typeparam name="T"></typeparam>
+  /// <param name="action"></param>
+  /// <param name="cpuctMultiplier"></param>
+  /// <returns></returns>
+  internal T RunWithInnerIterator<T>(Func<MCGSIterator, T> action, float cpuctMultiplier = 1.0f)
+  {
+    MCGSIterator iterator = CreateInnerIterator(cpuctMultiplier, false);
+    try
+    {
+      return action(iterator);
+    }
+    finally
+    {
+      iterator.Dispose();
+    }
+  }
+
+
+  /// <summary>
   /// Runs "deep rollout" visits that begin at the specified inner nodes (rather than the search
   /// root), growing the existing graph. Each round sends exactly one visit to each still-active
   /// node; rollouts are aggregated into shared NN batches and backed up (propagating each value up
@@ -687,19 +739,7 @@ public partial class MCGSEngine
     MCGSIterator iterator = null;
     try
     {
-      // Fresh evaluator wrapper over the (still-alive) underlying NNEvaluator: a prior search's
-      // RunLoop disposes its iterator (and thus Manager.EvaluatorNN0's batch / pooled buffers), but
-      // the underlying NNEvaluator itself is left intact and reusable.
-      MCGSEvaluatorNeuralNet evaluatorNN = new MCGSEvaluatorNeuralNet(
-        Manager.EvaluatorsSet.EvaluatorDef, Manager.NNEvaluator0, null,
-        Manager.ParamsSearch.HistoryFillIn,
-        Math.Min(Manager.NNEvaluator0.MaxBatchSize, maxBatchSize),
-        false, Manager.ParamsSearch.ValueTemperature, Manager.ParamsSearch.EnableState,
-        null, null, Manager.EvaluatorNN0.EngineIsWhite);
-
-      iterator = new MCGSIterator(this, 0, evaluatorNN);
-      iterator.CPUCTMultiplier = explorationMultiplier;
-      iterator.DisableTranspositionSufficiencyStop = deepRollout;
+      iterator = CreateInnerIterator(explorationMultiplier, deepRollout);
 
       List<GNode> activeNodes = new(startNodes.Length);
       activeNodes.AddRange(startNodes);

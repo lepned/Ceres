@@ -14,6 +14,7 @@
 #region Using directives
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text;
 
@@ -87,6 +88,33 @@ public sealed class ProbeGraftStats
   /// <summary>Grafts aborted because their forced path evaporated (dropped/aborted visits).</summary>
   public long NumGraftsAbortedPathDropped;
 
+  /// <summary>Graft plies retried because the forced crossing produced no path record.</summary>
+  public long NumGraftPlyRetriesNoRecord;
+
+  /// <summary>Completed root probes whose verdict was recorded (proposal M5).</summary>
+  public long NumRootProbeVerdicts;
+
+  /// <summary>Root verdicts that met the veto depth and margin bar (a veto WOULD be considered).</summary>
+  public long NumRootVetoCandidates;
+
+  /// <summary>Root adaptive directed visits (RootAdaptMode): campaigns started / ended in a flip / rolled back / visits forced.</summary>
+  public long NumRootAdaptTriggers;
+  public long NumRootAdaptFlips;
+  public long NumRootAdaptRollbacks;
+  public long NumRootAdaptVisits;
+  /// <summary>Campaigns whose flipped move was still the move chosen (top-N) at end of search.</summary>
+  public long NumRootAdaptFlipsHeld;
+
+  /// <summary>
+  /// Aborts broken down by ProbeGraftScheduler.AbortReason (indexed by the enum value).
+  /// The PathDropped total above is a roll-up of every reason except MoveNotFound; this array
+  /// is what identifies WHICH failure dominates, which the single total cannot.
+  /// </summary>
+  public long[] NumGraftsAbortedByReason = new long[NUM_ABORT_REASONS];
+
+  /// <summary>Number of distinct AbortReason values (kept in sync with the enum).</summary>
+  public const int NUM_ABORT_REASONS = 12;
+
   /// <summary>Pumps on which graft advancement was paused by the MaxGraftEvalFraction budget.</summary>
   public long NumGraftsPausedBudget;
 
@@ -135,6 +163,21 @@ public sealed class ProbeGraftStats
 
   /// <summary>Sum of prober iteration depths over completed probes.</summary>
   public long ProbeDepthSum;
+
+  /// <summary>Sum of selective depth over completed probes (0 when a source does not report it).</summary>
+  public long ProbeSelDepthSum;
+
+  /// <summary>Completed probes that stopped on the node budget rather than converging.</summary>
+  public long NumProbesHitNodeBudget;
+
+  /// <summary>Searches in which at least one graft was started (for cross-search rates).</summary>
+  public long NumSearchesWithGraft;
+
+  /// <summary>Searches in which at least one trigger fired.</summary>
+  public long NumSearchesWithTrigger;
+
+  /// <summary>Searches accumulated into this object (global accumulation only).</summary>
+  public long NumSearchesAccumulated;
 
   #endregion
 
@@ -187,6 +230,135 @@ public sealed class ProbeGraftStats
   /// Renders the depth histograms as "dN:probes/triggers" over the occupied bins.
   /// </summary>
   /// <returns></returns>
+  /// <summary>
+  /// One line naming the abort causes in descending order, so the dominant failure mode is
+  /// visible without enabling the full event log. Only non-zero reasons are listed.
+  /// </summary>
+  /// <summary>
+  /// Multi-line hybrid statistics block for one search (ParamsSearch.DumpHybridSearchStats = Full).
+  ///
+  /// Every count is paired with the denominator that makes it interpretable: probes as a fraction
+  /// of those submitted, triggers as a fraction of probes that actually completed, graft cost as a
+  /// fraction of the search's own NN evaluations. Raw counts alone have repeatedly proved
+  /// misleading here -- a large trigger count means nothing if few probes complete, and graft
+  /// activity means nothing if it never reaches the root.
+  /// </summary>
+  /// <param name="mode"></param>
+  /// <param name="numSearchEvals"></param>
+  /// <param name="probeSourceDescription"></param>
+  /// <param name="searchSeconds"></param>
+  public string SearchReport(ParamsProbeGraft.ModeType mode, long numSearchEvals,
+                             string probeSourceDescription = null, double searchSeconds = 0)
+  {
+    long trig = NumTriggersRefutation + NumTriggersDiscovery;
+    long aborts = NumGraftsAbortedMoveNotFound + NumGraftsAbortedPathDropped;
+    string Pct(double num, double den) => den <= 0 ? "n/a" : $"{100.0 * num / den:F1}%";
+
+    StringBuilder sb = new();
+    sb.AppendLine("=== HYBRID STATISTICS (PICKET) ===");
+    sb.AppendLine($"  mode          : {mode}"
+                + (probeSourceDescription == null ? "" : $"   source: {probeSourceDescription}"));
+    sb.AppendLine($"  search        : {numSearchEvals:N0} NN evals"
+                + (searchSeconds > 0 ? $"   {searchSeconds:F2}s" : ""));
+    sb.AppendLine($"  probes        : submitted {NumProbesSubmitted:N0}   completed {NumProbesCompleted:N0} "
+                + $"({Pct(NumProbesCompleted, NumProbesSubmitted)})   stale {NumResultsStale:N0} "
+                + $"({Pct(NumResultsStale, NumProbesCompleted)})   incomplete {NumProbesIncomplete:N0}");
+    if (NumProbesCompleted > 0)
+    {
+      sb.AppendLine($"                  depth avg {(double)ProbeDepthSum / NumProbesCompleted:F1}"
+                  + (ProbeSelDepthSum > 0 ? $"  seldepth avg {(double)ProbeSelDepthSum / NumProbesCompleted:F1}" : "")
+                  + $"   latency avg {ProbeLatencySumMs / NumProbesCompleted:F0}ms max {ProbeLatencyMaxMs:F0}ms"
+                  + (NumProbesHitNodeBudget > 0
+                       ? $"   hit budget {Pct(NumProbesHitNodeBudget, NumProbesCompleted)}" : ""));
+    }
+    sb.AppendLine($"  triggers      : refutation {NumTriggersRefutation:N0}  discovery {NumTriggersDiscovery:N0}"
+                + $"   = {Pct(trig, NumProbesCompleted)} of completed probes");
+    sb.AppendLine($"  grafts        : started {NumGraftsStarted:N0}  completed {NumGraftsCompleted:N0} "
+                + $"({Pct(NumGraftsCompleted, NumGraftsStarted)})  aborted {aborts:N0} "
+                + $"({Pct(aborts, NumGraftsStarted)})  terminal {NumGraftsEndedTerminal:N0}");
+    sb.AppendLine($"                  forced plies {NumGraftPliesApplied:N0}   graft NN evals {NumGraftNNEvals:N0} "
+                + $"({Pct(NumGraftNNEvals, numSearchEvals)} of search)   prior nudges {NumPriorNudgesApplied:N0}");
+    sb.AppendLine($"  impact        : anchors |dQ|>0.03: {NumAnchorsQMovedOverThreshold:N0}   "
+                + $"max |dQ| {MaxAbsAnchorQDeltaAtEnd:F3}   ROOT MOVE CHANGES {NumRootBestMoveChangesAfterGraft:N0}");
+    if (NumRootProbeVerdicts > 0)
+    {
+      sb.AppendLine($"  root verdicts : {NumRootProbeVerdicts:N0}   veto candidates {NumRootVetoCandidates:N0} "
+                  + $"({Pct(NumRootVetoCandidates, NumRootProbeVerdicts)})");
+    }
+    if (ShadowNumEvents > 0)
+    {
+      sb.AppendLine($"  shadow        : events {ShadowNumEvents:N0}  confirmed {ShadowNumConfirmedBySearch:N0}  "
+                  + $"unresolved {ShadowNumUnresolved:N0} ({Pct(ShadowNumUnresolved, ShadowNumEvents)})");
+    }
+    sb.AppendLine($"  cost          : pump {TimePumpTotalMs:F0}ms (sweep {TimeTargetSweepMs:F0} / graft {TimeGraftAdvanceMs:F0} "
+                + $"/ drain {TimeDrainMs:F0})"
+                + (searchSeconds > 0 ? $"   = {Pct(TimePumpTotalMs / 1000.0, searchSeconds)} of search" : ""));
+    if (aborts > 0)
+    {
+      sb.AppendLine("  " + AbortBreakdownLine());
+    }
+    return sb.ToString().TrimEnd();
+  }
+
+
+  /// <summary>
+  /// Cross-search aggregate report: the per-search RATES that decide whether the feature is worth
+  /// carrying. Requires EnableGlobalAccumulation; read via GlobalAggregateReport().
+  /// </summary>
+  /// <param name="numSearches"></param>
+  public string AggregateReport(long numSearches)
+  {
+    long trig = NumTriggersRefutation + NumTriggersDiscovery;
+    string Pct(double num, double den) => den <= 0 ? "n/a" : $"{100.0 * num / den:F2}%";
+    StringBuilder sb = new();
+    sb.AppendLine($"=== HYBRID AGGREGATE over {numSearches:N0} searches ===");
+    sb.AppendLine($"  probes per search            : {(double)NumProbesSubmitted / Math.Max(1, numSearches):F2} submitted, "
+                + $"{(double)NumProbesCompleted / Math.Max(1, numSearches):F2} completed");
+    sb.AppendLine($"  grafts started per search    : {(double)NumGraftsStarted / Math.Max(1, numSearches):F2}");
+    sb.AppendLine($"  searches with >=1 trigger    : {Pct(NumSearchesWithTrigger, numSearches)}");
+    sb.AppendLine($"  searches with >=1 graft      : {Pct(NumSearchesWithGraft, numSearches)}");
+    sb.AppendLine($"  forced plies per search      : {(double)NumGraftPliesApplied / Math.Max(1, numSearches):F1}");
+    sb.AppendLine($"  anchors moved |dQ|>0.03      : {NumAnchorsQMovedOverThreshold:N0} = "
+                + $"{Pct(NumAnchorsQMovedOverThreshold, NumGraftsCompleted)} of completed grafts, "
+                + $"{Pct(NumAnchorsQMovedOverThreshold, numSearches)} of searches");
+    sb.AppendLine($"  largest anchor Q move        : {MaxAbsAnchorQDeltaAtEnd:F3}");
+    sb.AppendLine($"  root move changes            : {NumRootBestMoveChangesAfterGraft:N0} = "
+                + $"{Pct(NumRootBestMoveChangesAfterGraft, numSearches)} of searches");
+    sb.AppendLine($"  graft abort rate             : {Pct(NumGraftsAbortedMoveNotFound + NumGraftsAbortedPathDropped, NumGraftsStarted)}");
+    sb.Append($"  pump cost per search         : {TimePumpTotalMs / Math.Max(1, numSearches):F1}ms");
+    return sb.ToString();
+  }
+
+
+  public string AbortBreakdownLine()
+  {
+    long total = NumGraftsAbortedMoveNotFound + NumGraftsAbortedPathDropped;
+    if (total == 0)
+    {
+      return "[ProbeGraft-aborts] none";
+    }
+
+    List<(string Name, long Count)> rows = new();
+    string[] names = Enum.GetNames(typeof(Search.ProbeGraft.ProbeGraftScheduler.AbortReason));
+    for (int i = 0; i < NUM_ABORT_REASONS && i < names.Length; i++)
+    {
+      if (NumGraftsAbortedByReason[i] > 0)
+      {
+        rows.Add((names[i], NumGraftsAbortedByReason[i]));
+      }
+    }
+    rows.Sort((a, b) => b.Count.CompareTo(a.Count));
+
+    StringBuilder sb = new();
+    sb.Append($"[ProbeGraft-aborts] total={total} retriesNoRecord={NumGraftPlyRetriesNoRecord} ");
+    foreach ((string name, long count) in rows)
+    {
+      sb.Append($"{name}={count} ({100.0 * count / total:F1}%) ");
+    }
+    return sb.ToString().TrimEnd();
+  }
+
+
   public string DepthHistogramLine()
   {
     StringBuilder builder = new();
@@ -249,6 +421,18 @@ public sealed class ProbeGraftStats
     NumGraftsEndedTerminal += other.NumGraftsEndedTerminal;
     NumGraftsAbortedMoveNotFound += other.NumGraftsAbortedMoveNotFound;
     NumGraftsAbortedPathDropped += other.NumGraftsAbortedPathDropped;
+    NumGraftPlyRetriesNoRecord += other.NumGraftPlyRetriesNoRecord;
+    NumRootProbeVerdicts += other.NumRootProbeVerdicts;
+    NumRootVetoCandidates += other.NumRootVetoCandidates;
+    NumRootAdaptTriggers += other.NumRootAdaptTriggers;
+    NumRootAdaptFlips += other.NumRootAdaptFlips;
+    NumRootAdaptRollbacks += other.NumRootAdaptRollbacks;
+    NumRootAdaptVisits += other.NumRootAdaptVisits;
+    NumRootAdaptFlipsHeld += other.NumRootAdaptFlipsHeld;
+    for (int i = 0; i < NUM_ABORT_REASONS; i++)
+    {
+      NumGraftsAbortedByReason[i] += other.NumGraftsAbortedByReason[i];
+    }
     NumGraftsPausedBudget += other.NumGraftsPausedBudget;
     NumGraftPliesApplied += other.NumGraftPliesApplied;
     NumGraftNNEvals += other.NumGraftNNEvals;
@@ -263,6 +447,12 @@ public sealed class ProbeGraftStats
     ProbeLatencyMaxMs = Math.Max(ProbeLatencyMaxMs, other.ProbeLatencyMaxMs);
     ProbeNodesSum += other.ProbeNodesSum;
     ProbeDepthSum += other.ProbeDepthSum;
+    ProbeSelDepthSum += other.ProbeSelDepthSum;
+    NumProbesHitNodeBudget += other.NumProbesHitNodeBudget;
+    // Cross-search rates need per-search indicators, which only the accumulator can form.
+    NumSearchesWithGraft += other.NumGraftsStarted > 0 ? 1 : 0;
+    NumSearchesWithTrigger += (other.NumTriggersRefutation + other.NumTriggersDiscovery) > 0 ? 1 : 0;
+    NumSearchesAccumulated++;
 
     SumAbsAnchorQDeltaAtEnd += other.SumAbsAnchorQDeltaAtEnd;
     MaxAbsAnchorQDeltaAtEnd = Math.Max(MaxAbsAnchorQDeltaAtEnd, other.MaxAbsAnchorQDeltaAtEnd);
@@ -359,6 +549,16 @@ public sealed class ProbeGraftStats
   /// per-search summary, prefixed with the number of contributing searches).
   /// </summary>
   /// <returns></returns>
+  /// <summary>
+  /// Cross-search aggregate report for everything accumulated since the last ResetGlobal.
+  /// </summary>
+  public static string GlobalAggregateReport()
+  {
+    (ProbeGraftStats stats, int numSearches, long _) = GlobalSnapshot();
+    return stats.AggregateReport(numSearches);
+  }
+
+
   public static string GlobalSummaryLine()
   {
     (ProbeGraftStats stats, int numSearches, long numEvals) = GlobalSnapshot();
@@ -388,6 +588,15 @@ public sealed class ProbeGraftStats
     NumGraftsEndedTerminal = 0;
     NumGraftsAbortedMoveNotFound = 0;
     NumGraftsAbortedPathDropped = 0;
+    NumGraftPlyRetriesNoRecord = 0;
+    NumRootProbeVerdicts = 0;
+    NumRootVetoCandidates = 0;
+    NumRootAdaptTriggers = 0;
+    NumRootAdaptFlips = 0;
+    NumRootAdaptRollbacks = 0;
+    NumRootAdaptVisits = 0;
+    NumRootAdaptFlipsHeld = 0;
+    Array.Clear(NumGraftsAbortedByReason);
     NumGraftsPausedBudget = 0;
     NumGraftPliesApplied = 0;
     NumGraftNNEvals = 0;
@@ -439,6 +648,12 @@ public sealed class ProbeGraftStats
                 + $"| pump={TimePumpTotalMs:F1}ms (drain={TimeDrainMs:F1} graft={TimeGraftAdvanceMs:F1} sweep={TimeTargetSweepMs:F1}) "
                 + $"probeLatAvg={probeLatAvg:F0}ms | impact: dQmax={MaxAbsAnchorQDeltaAtEnd:F3} "
                 + $"movedGT.03={NumAnchorsQMovedOverThreshold} rootFlips={NumRootBestMoveChangesAfterGraft}";
+
+    if (NumRootAdaptTriggers > 0 || NumRootProbeVerdicts > 0)
+    {
+      line += $" | rootadapt: verdicts={NumRootProbeVerdicts} trig={NumRootAdaptTriggers} flips={NumRootAdaptFlips} "
+            + $"held={NumRootAdaptFlipsHeld} rollback={NumRootAdaptRollbacks} visits={NumRootAdaptVisits}";
+    }
 
     if (mode == ParamsProbeGraft.ModeType.Shadow)
     {

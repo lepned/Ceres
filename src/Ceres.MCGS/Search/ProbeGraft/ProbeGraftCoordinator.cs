@@ -173,7 +173,8 @@ public sealed class ProbeGraftCoordinator : IDisposable
 
     bool anyResults = Volatile.Read(ref numPendingResults) != 0;
     bool sweepDue = sweepTimer.Elapsed.TotalSeconds >= Params.TargetSweepIntervalSeconds;
-    if (!anyResults && !scheduler.HasWork && !sweepDue)
+    bool rootAdaptDue = Params.RootAdaptMode == ParamsProbeGraft.RootAdaptModeType.Active && !rootAdaptDone;
+    if (!anyResults && !scheduler.HasWork && !sweepDue && !rootAdaptDue)
     {
       return;
     }
@@ -211,6 +212,18 @@ public sealed class ProbeGraftCoordinator : IDisposable
         sweepTimer.Restart();
         Stats.TimeTargetSweepMs += MsSince(tSweep);
       }
+
+      if (rootAdaptDue)
+      {
+        if (searchStopping)
+        {
+          FinishRootAdapt(iterator.Engine, abandoned: true);
+        }
+        else
+        {
+          PumpRootAdapt(iterator);
+        }
+      }
     }
     catch (Exception exc)
     {
@@ -231,6 +244,25 @@ public sealed class ProbeGraftCoordinator : IDisposable
   /// </summary>
   public void EndSearch()
   {
+    if (!endSearchDone && Params.RootAdaptMode == ParamsProbeGraft.RootAdaptModeType.Active)
+    {
+      try
+      {
+        if (rootAdaptActive)
+        {
+          FinishRootAdapt(Manager.Engine, abandoned: true);
+        }
+        if (rootAdaptFlipped && rootAdaptMoveRaw == TopNRootMoveRaw(Manager.Engine))
+        {
+          Stats.NumRootAdaptFlipsHeld++;
+        }
+      }
+      catch (Exception exc)
+      {
+        DisableAfterError(exc);
+      }
+    }
+
     if (endSearchDone)
     {
       return;
@@ -256,7 +288,15 @@ public sealed class ProbeGraftCoordinator : IDisposable
         ComputeShadowVerdicts(Manager.Engine.Graph);
       }
 
-      if (Params.EnableStatsSummary)
+      // ParamsSearch.DumpHybridSearchStats is the research switch and takes precedence over the
+      // terse per-search line; Off leaves the legacy EnableStatsSummary behavior untouched.
+      ParamsSearch.HybridStatsDumpType dumpMode = Manager.ParamsSearch.DumpHybridSearchStats;
+      if (dumpMode == ParamsSearch.HybridStatsDumpType.Full)
+      {
+        ConsoleUtils.WriteLineColored(ConsoleColor.Cyan,
+          Stats.SearchReport(Params.Mode, Manager.NumEvalsThisSearch, source?.Description));
+      }
+      else if (dumpMode == ParamsSearch.HybridStatsDumpType.Compact || Params.EnableStatsSummary)
       {
         ConsoleUtils.WriteLineColored(ConsoleColor.Cyan,
                                       Stats.SummaryLine(Params.Mode, Manager.NumEvalsThisSearch));
@@ -304,6 +344,61 @@ public sealed class ProbeGraftCoordinator : IDisposable
 
 
   #region Result drain and trigger interpretation
+
+  /// <summary>
+  /// Verdict of the most recent completed root probe in this search: what would play at
+  /// the root, and by how much it preferred that over the move the search was favoring when the
+  /// probe was issued. Consumed at move commit (Shadow: recorded only).
+  /// </summary>
+  public readonly struct RootVerdict
+  {
+    public readonly bool HasValue;
+    public readonly MGMove ProbeBestMove;
+    public readonly MGMove SearchDominantMove;
+    public readonly int MarginCp;
+    public readonly int ProbeDepth;
+
+    public RootVerdict(MGMove probeBestMove, MGMove searchDominantMove, int marginCp, int probeDepth)
+    {
+      HasValue = true;
+      ProbeBestMove = probeBestMove;
+      SearchDominantMove = searchDominantMove;
+      MarginCp = marginCp;
+      ProbeDepth = probeDepth;
+    }
+  }
+
+
+  /// <summary>Most recent root probe verdict of this search (see RootVerdict).</summary>
+  public RootVerdict LastRootVerdict { get; private set; }
+
+
+  /// <summary>
+  /// Records the root probe verdict. A verdict only counts as a veto candidate when the probe both
+  /// searched deeply enough to be trusted and preferred a different move by a clear margin; the
+  /// comparison against the move actually played happens at commit, since the search continues
+  /// after this probe returns and may change its mind on its own.
+  /// </summary>
+  /// <param name="snapshot"></param>
+  /// <param name="result"></param>
+  void RecordRootVerdict(ProbeGraftTargetSnapshot snapshot, ProbeResult result)
+  {
+    Stats.NumRootProbeVerdicts++;
+
+    if (result.Depth < Params.RootVetoMinProbeDepth || result.DominantMoveScoreCp == int.MinValue)
+    {
+      return;
+    }
+
+    int marginCp = result.BestScoreCp - result.DominantMoveScoreCp;
+    LastRootVerdict = new RootVerdict(result.BestMove, snapshot.DominantMove, marginCp, result.Depth);
+
+    if (result.BestMove != snapshot.DominantMove && marginCp >= Params.RootVetoMinMarginCp)
+    {
+      Stats.NumRootVetoCandidates++;
+    }
+  }
+
 
   void DrainInbox(MCGSEngine engine)
   {
@@ -363,6 +458,11 @@ public sealed class ProbeGraftCoordinator : IDisposable
     {
       Stats.NumResultsStale++;
       return;
+    }
+
+    if (Params.RootVetoMode != ParamsProbeGraft.RootVetoModeType.Disabled && node.IsSearchRoot)
+    {
+      RecordRootVerdict(snapshot, result);
     }
 
     bool refutation = result.DominantMoveScoreCp != int.MinValue
@@ -733,6 +833,150 @@ public sealed class ProbeGraftCoordinator : IDisposable
   /// Raw encoded move of the search root's most-visited expanded edge
   /// (cheap best-move snapshot for the root-flip impact counter).
   /// </summary>
+  #region Root adaptive directed visits (LOCUS rootadapt)
+
+  // One campaign per search: once the budget fraction has elapsed and the latest root probe
+  // prefers a move other than the current top-N move, force visits into that move one chunk per
+  // pump until it is best-by-Q at the root (flip) or the cap is reached (roll back).
+  bool rootAdaptDone;
+  bool rootAdaptActive;
+  bool rootAdaptFlipped;
+  int rootAdaptSlot = -1;
+  ushort rootAdaptMoveRaw = ushort.MaxValue;
+  int rootAdaptVisitsApplied;
+  int rootAdaptCap;
+
+
+  /// <summary>Fraction of this search's budget consumed so far (1 when unknown).</summary>
+  double SearchProgressFraction()
+  {
+    SearchLimit limit = Manager.SearchLimit;
+    if (limit == null || limit.Value <= 0)
+    {
+      return 1;
+    }
+    if (limit.Type == SearchLimitType.NodesPerTree)
+    {
+      double remaining = limit.Value - Manager.RootNWhenSearchStarted;
+      return remaining <= 0 ? 1 : Manager.NumNodesVisitedThisSearch / remaining;
+    }
+    if (limit.IsNodesLimit)
+    {
+      return Manager.NumNodesVisitedThisSearch / (double)limit.Value;
+    }
+    return (DateTime.Now - Manager.StartTimeThisSearch).TotalSeconds / limit.Value;
+  }
+
+
+  void PumpRootAdapt(MCGSIterator iterator)
+  {
+    MCGSEngine engine = iterator.Engine;
+    GNode root = engine.SearchRootNode;
+
+    if (!rootAdaptActive)
+    {
+      if (!LastRootVerdict.HasValue || SearchProgressFraction() < Params.RootAdaptTriggerFraction)
+      {
+        return;
+      }
+
+      MGPosition rootPos = engine.SearchRootPosMG;
+      int slot = ProbeGraftScheduler.ResolveMoveToChildIndex(root, in rootPos, LastRootVerdict.ProbeBestMove);
+      if (slot < 0)
+      {
+        rootAdaptDone = true;
+        return;
+      }
+      ushort probeRaw = (slot < root.NumEdgesExpanded ? root.ChildEdgeAtIndex(slot).Move
+                                                        : root.EdgeHeadersSpan[slot].Move).RawValue;
+      if (probeRaw == TopNRootMoveRaw(engine))
+      {
+        rootAdaptDone = true;   // the search already prefers the probe's move
+        return;
+      }
+
+      SearchLimit limit = Manager.SearchLimit;
+      int cap = Params.RootAdaptMaxVisits;
+      if (limit != null && limit.IsNodesLimit && limit.Value > 0)
+      {
+        cap = Math.Min(cap, Math.Max(Params.RootAdaptVisitsPerPump, (int)(Params.RootAdaptMaxVisitsFraction * limit.Value)));
+      }
+
+      rootAdaptActive = true;
+      rootAdaptSlot = slot;
+      rootAdaptMoveRaw = probeRaw;
+      rootAdaptVisitsApplied = 0;
+      rootAdaptCap = cap;
+      Stats.NumRootAdaptTriggers++;
+    }
+
+    int chunk = Math.Min(Params.RootAdaptVisitsPerPump, rootAdaptCap - rootAdaptVisitsApplied);
+    DirectedVisits.Outcome step = chunk > 0
+      ? DirectedVisits.ForceChildVisits(iterator, root, rootAdaptSlot, chunk)
+      : new DirectedVisits.Outcome(0, 0, 0, "CapReached");
+    rootAdaptVisitsApplied += step.VisitsApplied;
+    Stats.NumRootAdaptVisits += step.VisitsApplied;
+
+    bool decided = false;
+    if (rootAdaptSlot < root.NumEdgesExpanded)
+    {
+      GEdge edge = root.ChildEdgeAtIndex(rootAdaptSlot);
+      if (edge.Move.RawValue != rootAdaptMoveRaw)
+      {
+        FinishRootAdapt(engine, abandoned: true);   // slot reordered: abandon (rollback)
+        return;
+      }
+      if (edge.Type != GEdgeStruct.EdgeType.Uninitialized
+          && -edge.Q >= DirectedVisits.BestSiblingValue(root, rootAdaptSlot) + Params.RootAdaptMarginQ)
+      {
+        rootAdaptFlipped = true;
+        decided = true;
+      }
+    }
+
+    if (decided)
+    {
+      Stats.NumRootAdaptFlips++;
+      rootAdaptActive = false;
+      rootAdaptDone = true;
+      if (Params.VerboseEventLogging)
+      {
+        Console.WriteLine($"[ROOTADAPT] flip after {rootAdaptVisitsApplied} visits (cap {rootAdaptCap})");
+      }
+      return;
+    }
+
+    if (step.Abort != null || step.VisitsApplied == 0 || rootAdaptVisitsApplied >= rootAdaptCap)
+    {
+      FinishRootAdapt(engine, abandoned: true);
+    }
+  }
+
+
+  /// <summary>Ends an unflipped campaign: rolls its visits back (if configured) and marks it done.</summary>
+  void FinishRootAdapt(MCGSEngine engine, bool abandoned)
+  {
+    if (rootAdaptActive && abandoned && !rootAdaptFlipped && Params.RootAdaptRollback && rootAdaptVisitsApplied > 0)
+    {
+      GNode root = engine.SearchRootNode;
+      if (rootAdaptSlot >= 0 && rootAdaptSlot < root.NumEdgesExpanded
+          && root.ChildEdgeAtIndex(rootAdaptSlot).Move.RawValue == rootAdaptMoveRaw)
+      {
+        DirectedVisits.ForgetEdgeVisits(root, rootAdaptSlot, rootAdaptVisitsApplied);
+      }
+      Stats.NumRootAdaptRollbacks++;
+      if (Params.VerboseEventLogging)
+      {
+        Console.WriteLine($"[ROOTADAPT] no flip after {rootAdaptVisitsApplied} visits (cap {rootAdaptCap}); rolled back");
+      }
+    }
+    rootAdaptActive = false;
+    rootAdaptDone = true;
+  }
+
+  #endregion
+
+
   static ushort TopNRootMoveRaw(MCGSEngine engine)
   {
     int bestN = -1;

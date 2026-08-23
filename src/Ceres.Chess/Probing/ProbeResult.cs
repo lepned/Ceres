@@ -58,6 +58,20 @@ public sealed record ProbeResult
   /// <summary>Prober iteration depth reached (for requester statistics and trust gating).</summary>
   public int Depth { get; init; }
 
+  /// <summary>
+  /// Deepest ply reached on any line (selective depth), or 0 when the source does not report it.
+  /// Nominal Depth understates how far a probe actually looked along forcing lines, so this is the
+  /// honest measure of how much the probe saw.
+  /// </summary>
+  public int SelDepth { get; init; }
+
+  /// <summary>
+  /// True when the probe stopped because it exhausted NodeBudget rather than finishing its final
+  /// iteration. Distinguishes "the budget was the binding constraint" (raise it to get value) from
+  /// "the probe converged" (raising it buys nothing) -- which a node count alone cannot tell you.
+  /// </summary>
+  public bool HitNodeBudget { get; init; }
+
   /// <summary>Prober node count actually spent (for requester statistics only).</summary>
   public long Nodes { get; init; }
 

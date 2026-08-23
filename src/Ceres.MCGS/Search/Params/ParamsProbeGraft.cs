@@ -208,8 +208,113 @@ public record ParamsProbeGraft
   /// </summary>
   public float PriorNudgeFloor = 0.03f;
 
+  /// <summary>
+  /// If prior nudges are allowed to take effect. DEFAULT FALSE: nudging is inert unless explicitly
+  /// enabled.
+  ///
+  /// Nudging is the only part of this feature that mutates persistent state. ApplyPriorNudges writes
+  /// through GEdge.SetPolicyPrior directly into the graph, nothing restores the original policy, and
+  /// game play reuses the graph across moves -- so a nudge outlives the search that applied it. The
+  /// per-node PriorNudgeMaxTotalMass ledger lives on the scheduler, which is rebuilt each search, so
+  /// the cap is per-move rather than per-game and repeated nudges at one node compound (each one
+  /// rescales every sibling, so unnudged siblings decay geometrically).
+  ///
+  /// It is a separate switch from PriorNudgeFloor rather than a zero value of it because the floor
+  /// doubles as the discovery trigger's low-prior threshold: zeroing the floor would silently
+  /// disable discovery triggering as well, which is the large majority of all triggers.
+  /// </summary>
+  public bool AllowPriorNudges = false;
+
   /// <summary>Cap on cumulative prior mass moved by nudges at any single node.</summary>
   public float PriorNudgeMaxTotalMass = 0.15f;
+
+  #region Root verification and veto (proposal M5)
+
+  /// <summary>
+  /// Root verification mode (proposal M5). The root probe asks the one question that maps directly
+  /// onto the move played -- "is the move we are about to play refuted?" -- and, unlike grafting,
+  /// acting on the answer does not have to fight averaging inertia: it is one decision at move
+  /// commit rather than an attempt to move a large-N ancestor's Q with a handful of visits.
+  /// </summary>
+  public enum RootVetoModeType
+  {
+    /// <summary>No root verification.</summary>
+    Disabled,
+
+    /// <summary>
+    /// Record what a veto WOULD have done without changing the move played. This is the kill-gate:
+    /// it yields a fire rate and, when adjudicated against a deeper search, a precision.
+    /// </summary>
+    Shadow,
+
+    /// <summary>
+    /// Act on the verdict at move commit. NOT IMPLEMENTED -- rejected by Validate until the Shadow
+    /// measurement justifies building it.
+    /// </summary>
+    Active
+  }
+
+  /// <summary>Root verification mode. See RootVetoModeType.</summary>
+  public RootVetoModeType RootVetoMode = RootVetoModeType.Disabled;
+
+  /// <summary>
+  /// Minimum margin (centipawns) by which the probe must prefer its move over the move the search
+  /// is about to play before a veto is considered. Deliberately higher than TriggerMarginCp: a veto
+  /// overrides the decision outright, so it should fire only on a clear demonstrated difference.
+  /// </summary>
+  public int RootVetoMinMarginCp = 200;
+
+  /// <summary>Minimum probe depth for a root verdict to be considered trustworthy.</summary>
+  public int RootVetoMinProbeDepth = 10;
+
+  #endregion
+
+
+  #region Root adaptive directed visits (LOCUS rootadapt)
+
+  /// <summary>Mode for the root adaptive directed-visit rule. See RootAdaptModeType.</summary>
+  public enum RootAdaptModeType
+  {
+    /// <summary>Disabled (default).</summary>
+    Disabled,
+
+    /// <summary>
+    /// Active: once the search has used RootAdaptTriggerFraction of its budget, if the latest root
+    /// probe prefers a move other than the search's current top-N move, directed visits are forced
+    /// into that move (one chunk per pump, stock PUCT below it, MCGS's own net evaluating) until
+    /// its value exceeds the best reliable sibling's by RootAdaptMarginQ -- at which point ordinary
+    /// selection takes over -- or the visit cap is reached, in which case the forced visits are
+    /// rolled back in N only (the line keeps what it learned, the edge regains its exploration
+    /// credit). No probe value is ever written into the graph; the move changes only if the net,
+    /// led to the line, rates it above the incumbent. Requires RootVetoMode != Disabled (the root
+    /// verdict is the trigger) and single-threaded select (SelectOperationParallelThresholdNumVisits
+    /// = int.MaxValue).
+    /// </summary>
+    Active
+  }
+
+  /// <summary>Root adaptive directed-visit mode.</summary>
+  public RootAdaptModeType RootAdaptMode = RootAdaptModeType.Disabled;
+
+  /// <summary>Fraction of the search budget (nodes or time) that must have elapsed before the rule may fire.</summary>
+  public float RootAdaptTriggerFraction = 0.6f;
+
+  /// <summary>Cap on directed visits per search as a fraction of the node budget (when the limit is in nodes).</summary>
+  public float RootAdaptMaxVisitsFraction = 0.2f;
+
+  /// <summary>Absolute cap on directed visits per search.</summary>
+  public int RootAdaptMaxVisits = 40_000;
+
+  /// <summary>Visits forced per pump (each pump is one quiescent point between batches).</summary>
+  public int RootAdaptVisitsPerPump = 256;
+
+  /// <summary>Margin (Q units) by which the forced move's value must exceed the best reliable sibling's to count as a flip.</summary>
+  public float RootAdaptMarginQ = 0.0f;
+
+  /// <summary>If true, directed visits that did not produce a flip are rolled back in N (recommended).</summary>
+  public bool RootAdaptRollback = true;
+
+  #endregion
 
   /// <summary>
   /// If true, edges along a completed graft path are marked stale so that a configured
@@ -241,6 +346,35 @@ public record ParamsProbeGraft
     if (Mode == ModeType.Disabled)
     {
       return;
+    }
+
+    if (RootVetoMode == RootVetoModeType.Active)
+    {
+      throw new Exception("ParamsProbeGraft.RootVetoMode Active is not implemented yet "
+                        + "(build it only if the Shadow measurement justifies it).");
+    }
+
+    if (RootVetoMode != RootVetoModeType.Disabled && !TargetIncludeSearchRoot)
+    {
+      throw new Exception("ParamsProbeGraft.RootVetoMode requires TargetIncludeSearchRoot "
+                        + "(the root is never probed otherwise, so no verdict can be formed).");
+    }
+
+    if (RootAdaptMode == RootAdaptModeType.Active)
+    {
+      if (RootVetoMode == RootVetoModeType.Disabled)
+      {
+        throw new Exception("ParamsProbeGraft.RootAdaptMode requires RootVetoMode != Disabled (the root verdict is its trigger).");
+      }
+      if (parent.Execution.SelectOperationParallelThresholdNumVisits != int.MaxValue)
+      {
+        throw new Exception("ParamsProbeGraft.RootAdaptMode requires Execution.SelectOperationParallelThresholdNumVisits == int.MaxValue "
+                          + "(forced visits through one child are not supported by the parallel select-descent path).");
+      }
+      if (RootAdaptTriggerFraction < 0 || RootAdaptTriggerFraction >= 1 || RootAdaptMaxVisitsFraction <= 0 || RootAdaptMaxVisits <= 0 || RootAdaptVisitsPerPump <= 0)
+      {
+        throw new Exception("ParamsProbeGraft.RootAdapt* settings out of range.");
+      }
     }
 
     if (string.IsNullOrEmpty(ProbeSourceID))

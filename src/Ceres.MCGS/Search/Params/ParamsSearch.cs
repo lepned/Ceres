@@ -796,6 +796,33 @@ public record ParamsSearch
   /// </summary>
   public PostBackupQModeType PostBackupQMode = PostBackupQModeType.Off;
 
+
+  /// <summary>
+  /// Detail level of the hybrid (probe/graft) statistics block written to the console at
+  /// the end of every search. Off by default so ordinary play and tournaments stay quiet.
+  ///
+  /// This is separate from ParamsProbeGraft.EnableStatsSummary, which controls only the terse
+  /// single-line summary; when both are set the richer report here wins. Intended for research runs
+  /// where per-search hybrid behavior needs to be inspected directly rather than aggregated.
+  /// </summary>
+  public enum HybridStatsDumpType
+  {
+    /// <summary>No hybrid statistics written.</summary>
+    Off,
+
+    /// <summary>One dense line per search.</summary>
+    Compact,
+
+    /// <summary>Multi-line block per search: probe throughput, triggers, grafts, causal impact, cost.</summary>
+    Full
+  }
+
+  /// <summary>
+  /// If and how hybrid probe/graft statistics are dumped to the console at the end of
+  /// each search. Default Off. See HybridStatsDumpType.
+  /// </summary>
+  public HybridStatsDumpType DumpHybridSearchStats = HybridStatsDumpType.Off;
+
   /// <summary>
   /// Maximum number of parent-node Q recomputes performed per batch when
   /// PostBackupQMode == StaleDrain. Bounds per-batch cost and is the cycle-termination guarantee.
