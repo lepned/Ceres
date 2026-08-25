@@ -155,6 +155,12 @@ public partial class MCGSManager : IDisposable
   public ProbeGraft.ProbeGraftCoordinator ProbeGraft;
 
   /// <summary>
+  /// Probe source pre-resolved by the owning engine (per-engine farm lifetime); when null the
+  /// coordinator resolves ParamsProbeGraft.ProbeSourceID from the registry itself.
+  /// </summary>
+  public readonly Ceres.Chess.Probing.IProbeSource ResolvedProbeSource;
+
+  /// <summary>
   /// Per-search statistics of the refutation-grafting feature (null when disabled).
   /// </summary>
   public ProbeGraft.ProbeGraftStats ProbeGraftStats => ProbeGraft?.Stats;
@@ -303,8 +309,10 @@ public partial class MCGSManager : IDisposable
                      List<MGMove> searchMovesTablebaseRestricted,
                      bool engineIsWhite,
                      SearchLimit fixedSearchLimit = null,
-                     EncodedPositionBatchFlat[] reusableNNBatches = null)
+                     EncodedPositionBatchFlat[] reusableNNBatches = null,
+                     Ceres.Chess.Probing.IProbeSource resolvedProbeSource = null)
   {
+    ResolvedProbeSource = resolvedProbeSource;
     // Ensure engine initialization is performed (thread-safe, only runs once)
     MCGSEngineInitialization.BaseInitialize();
 
@@ -432,17 +440,21 @@ public partial class MCGSManager : IDisposable
       //evaluatorTBPly1 = new LeafEvaluatorSyzygyPly1(evaluatorTB, Manager.ForceNoTablebaseTerminals);
     }
 
-    // PICKET M1 refutation grafting: create the per-search coordinator when enabled
-    // (resolves the probe source from the registry and begins its session; an unknown
-    // ProbeSourceID throws here - fail fast at search start, never silently).
+    // Probe coordinator (grafts / probe stamps / root adapt): create the per-search coordinator
+    // when any consumer is enabled (resolves the probe source from the registry and begins its
+    // session; an unknown ProbeSourceID throws here - fail fast at search start, never silently).
     // Deliberately the LAST fallible step of construction: the coordinator's BeginSession
     // must not be left stranded (never EndSession'd) by a later constructor exception,
     // since the probe source may be a shared instance reused across searches.
     if (paramsSearch.ProbeGraft != null
-     && paramsSearch.ProbeGraft.Mode != ParamsProbeGraft.ModeType.Disabled)
+     && paramsSearch.ProbeGraft.AnyConsumerEnabled)
     {
       ProbeGraft = new ProbeGraft.ProbeGraftCoordinator(this);
     }
+
+    // Probe stamp projection weight lives on the Graph (set at search start by MCGSSearch);
+    // the cp-weight table lives on the coordinator. Nothing process-wide (a static raced between
+    // concurrently searching engines with different configurations).
 
     //    LeafEvaluatorSyzygyPly1 evaluatorTBPly1;
 

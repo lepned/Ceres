@@ -43,6 +43,25 @@ public sealed record ProbeRequest
   /// or default if the requester wants an untargeted best-move probe.</summary>
   public MGMove DominantMove { get; init; }
 
+  /// <summary>
+  /// When set, the prober searches ONLY this root move (UCI searchmoves semantics) with the full
+  /// NodeBudget: the result's BestMove is this move, BestScoreCp its score, PV its line, and
+  /// DominantMoveScoreCp / RefutationPV repeat the score and the line after the move so the
+  /// requester can consume it as a favourite verification. Default = unrestricted probe.
+  /// (The dual-probe advocate's favourite monitor uses this; DominantMove is ignored when set.)
+  /// </summary>
+  public MGMove RestrictToMove { get; init; }
+
+  /// <summary>
+  /// When true the prober additionally delivers an INTERIM ProbeResult (IsInterim = true,
+  /// Completed = true) after every completed iteration of its search, through the same callback,
+  /// before the usual final result (which is Completed = false when the search was cancelled).
+  /// Requesters that set this must expect several callbacks per request; other requesters keep the
+  /// exactly-one-callback contract. Used with an effectively unbounded NodeBudget by the continuous
+  /// advocate searches, which are ended by their CancellationToken.
+  /// </summary>
+  public bool ReportInterim { get; init; }
+
   /// <summary>Approximate search effort in prober nodes.</summary>
   public required int NodeBudget { get; init; }
 

@@ -80,6 +80,58 @@ public unsafe partial class Graph : IDisposable
   public readonly GraphStore Store;
 
   /// <summary>
+  /// Probe-stamp projection weight for THIS graph's searches (K = kappa x n0 pseudo-visits;
+  /// 0 = the projection is the identity). Set from ParamsSelect.TPS_ProbeStampKappa at every
+  /// search start (MCGSSearch); a per-graph field rather than a process-wide static so that
+  /// engines with different configurations can search concurrently in one process (the static
+  /// raced: a baseline engine's search start turned the stamp term off for a concurrently
+  /// searching stamp engine -- found 2026-08-23 in the first head-to-head tournament).
+  /// </summary>
+  public float ProbeStampKappa;
+
+  /// <summary>
+  /// Optional attention directives for THIS graph's searches (null = feature inert): a small
+  /// immutable snapshot of (parent, child) pairs whose selection score receives a fading
+  /// exploration bonus (see ProbeAttentionEntry and ParamsSelect.AttentionBonusEpsilon).
+  /// Writers must swap the snapshot only while the graph is quiescent (between searches) or
+  /// under the backup gate; select threads read the volatile reference without locking.
+  /// Cleared on graph rewrite (node indices change) so a stale snapshot can never misdirect.
+  /// </summary>
+  volatile ProbeAttentionEntry[] attentionEntries;
+
+  /// <summary>
+  /// Current attention snapshot (null when none). See attentionEntries.
+  /// </summary>
+  public ProbeAttentionEntry[] AttentionEntries => attentionEntries;
+
+  /// <summary>
+  /// Atomically replaces the attention snapshot (null or empty clears it). The array is cloned
+  /// so callers cannot mutate a published snapshot. Entries are validated defensively: the
+  /// select hot path trusts W/K without checks.
+  /// </summary>
+  public void SetAttentionEntries(ProbeAttentionEntry[] entries)
+  {
+    if (entries == null || entries.Length == 0)
+    {
+      attentionEntries = null;
+      return;
+    }
+    if (entries.Length > 64)
+    {
+      throw new ArgumentException($"attention snapshot too large ({entries.Length} > 64)");
+    }
+    foreach (ProbeAttentionEntry e in entries)
+    {
+      if (e.ParentNodeIndex < 1 || e.ChildNodeIndex < 1
+       || !(e.W >= 0 && e.W <= 1) || !(e.K > 0))
+      {
+        throw new ArgumentException($"invalid attention entry {e}");
+      }
+    }
+    attentionEntries = (ProbeAttentionEntry[])entries.Clone();
+  }
+
+  /// <summary>
   /// Cached pointer to first (unused reserved) node.
   /// </summary>
   internal readonly GNodeStruct* NodesBasePtr;
@@ -1349,7 +1401,7 @@ public unsafe partial class Graph : IDisposable
         if (refreshStaleEdges && refEdge.IsStale)
         {
           GNode childNode = new GNode(node.Graph, refEdge.ChildNodeIndex);
-          refEdge.QChild = childNode.Q;
+          refEdge.QChild = Ceres.MCGS.Search.ProbeGraft.ProbeStamps.ProjectChildQ(childNode, childNode.Q);
           refEdge.IsStale = false;
         }
 

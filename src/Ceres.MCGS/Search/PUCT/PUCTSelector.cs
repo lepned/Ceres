@@ -57,6 +57,12 @@ public static class PUCTSelector
   [ThreadStatic] static float[] quncScoreBonusFloat;
   [ThreadStatic] static float[] quncUMultiplierFloat;
 
+  /// <summary>
+  /// Thread-local score-bonus array for the attention directives (Graph.AttentionEntries),
+  /// used only when the QUnc bonus array is not already materialized for this call.
+  /// </summary>
+  [ThreadStatic] static float[] attentionBonusFloat;
+
 
   /// <summary>
   /// Narrows the first numToProcess entries of a (double) per-child adjustment array into a
@@ -318,6 +324,45 @@ public static class PUCTSelector
       float[] quncScoreBonusF = NarrowAdjustments(quncScoreBonus, ref quncScoreBonusFloat, numToProcess, 0f);
       float[] quncUMultiplierF = NarrowAdjustments(quncUMultiplier, ref quncUMultiplierFloat, numToProcess, 1f);
 
+      // Attention directives (ADVOCATE): fading additive selection bonuses on specific
+      // (parent, child) edges, merged through the same per-child score-bonus channel the QUnc
+      // methods use (a lone non-null bonus array routes through the QUnc kernel with a neutral
+      // U multiplier, i.e. score += bonus). Inert unless AttentionBonusEpsilon > 0 and this node
+      // is a flagged parent; gated on refreshStaleEdges (like quncContext) so probe-harvest
+      // descents stay stock.
+      bool attentionApplied = false;
+      float attentionEps = paramsSelect.AttentionBonusEpsilon;
+      if (attentionEps > 0 && refreshStaleEdges && numTargetVisits > 0
+          && !nodeRef.CheckmateKnownToExistAmongChildren)
+      {
+        ProbeAttentionEntry[] attention = graph.AttentionEntries;
+        if (attention != null)
+        {
+          int parentIndex = node.Index.Index;
+          for (int e = 0; e < attention.Length; e++)
+          {
+            if (attention[e].ParentNodeIndex != parentIndex)
+            {
+              continue;
+            }
+            int slot = IndexOfExpandedChild(node, attention[e].ChildNodeIndex,
+                                            Math.Min(numToProcess, nodeRef.NumEdgesExpanded));
+            if (slot < 0)
+            {
+              continue;
+            }
+            if (quncScoreBonusF == null)
+            {
+              quncScoreBonusF = attentionBonusFloat ??= new float[PUCTScoreCalcVector.MAX_CHILDREN];
+              Array.Clear(quncScoreBonusF);
+            }
+            float k = attention[e].K;
+            quncScoreBonusF[slot] += attentionEps * attention[e].W * k / (stats.N.Span[slot] + k);
+            attentionApplied = true;
+          }
+        }
+      }
+
       numVisitsAccepted = PUCTScoreCalcVector.ScoreCalcMulti(paramsSelect,
                                                               node.IsSearchRoot, nodeRef.N,
                                                               parentNumInFlight,
@@ -339,9 +384,12 @@ public static class PUCTSelector
       //     qWhenNoChildrenComposite is non-null exactly when per-child FPU was built above.
       // Leaving a hole (an unexpanded slot before another that got a visit) corrupts memory
       // in Graph.InitializeNewEdge, so the fixup must run for every per-child path.  It is
-      // cheap and only relocates visits when an actual hole is present.
+      // cheap and only relocates visits when an actual hole is present.  The attention bonus
+      // is also a per-child adjustment, so it runs the same fixup (insurance: its targets are
+      // always expanded edges, but a bonus can still reorder visits among unexpanded slots
+      // indirectly).
       if (numTargetVisits > 0
-          && qWhenNoChildrenComposite != null)
+          && (qWhenNoChildrenComposite != null || attentionApplied))
       {
         FillInSequentialVisitHoles(childVisitCounts, ref node.NodeRef, numToProcess);
       }
@@ -353,6 +401,24 @@ public static class PUCTSelector
                                      (nToUse * (double)nodeRef.V) + -gatherStats.SumWVisited,
                                      (nToUse * (double)nodeRef.DrawP) + gatherStats.SumDVisited,
                                      numVisitsAccepted);
+  }
+
+
+  /// <summary>
+  /// Returns the slot of the expanded child edge whose child node has the given index,
+  /// or -1 if none. Used by the attention directives, which identify the child by node
+  /// index because edge slots can be permuted between searches (move ordering phases).
+  /// </summary>
+  static int IndexOfExpandedChild(GNode node, int childNodeIndex, int numSlots)
+  {
+    for (int i = 0; i < numSlots; i++)
+    {
+      if (node.ChildEdgeAtIndex(i).ChildNodeIndex.Index == childNodeIndex)
+      {
+        return i;
+      }
+    }
+    return -1;
   }
 
 

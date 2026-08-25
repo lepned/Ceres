@@ -105,6 +105,66 @@ public sealed class ProbeGraftStats
   /// <summary>Campaigns whose flipped move was still the move chosen (top-N) at end of search.</summary>
   public long NumRootAdaptFlipsHeld;
 
+  /// <summary>Advocate (AdvocateMode): Dissenter probes / agreements / engagements (margin met),
+  /// attention entries placed, trace visits, campaigns started / flipped / rolled back, targets retired.</summary>
+  public long NumAdvocateProbes;
+  public long NumAdvocateAgreements;
+  public long NumAdvocateBelowGate;
+  public long NumAdvocateEngagements;
+  public long NumAdvocateEntries;
+  public long NumAdvocateTraceVisits;
+  public long NumAdvocateCampaigns;
+  public long NumAdvocateCampaignFlips;
+  public long NumAdvocateCampaignRollbacks;
+  public long NumAdvocateCampaignVisits;
+  public long NumAdvocateRetired;
+  /// <summary>Advocate engagement conversion, counted per SEARCH (distinct moves), not per verdict: searches
+  /// with at least one engagement; of those, searches whose final root move (top-N; the root move rule may
+  /// still pick on Q, the same caveat as NumRootAdaptFlipsHeld) was the Dissenter's move of the LAST
+  /// engagement, and searches whose final move left the favourite that engagement argued against.</summary>
+  public long NumAdvocateEngagedMoves;
+  public long NumAdvocateConversions;
+  public long NumAdvocateFavAbandoned;
+  /// <summary>Advocate transient solo window (directed visits under overlapped iterators): windows granted,
+  /// pumps whose directed work was deferred while waiting for the peer to park, and total ms the window was
+  /// held (the search runs single-iterator while held -- the direct cost figure).</summary>
+  public long NumAdvocateSoloWindows;
+  public long NumAdvocateSoloDeferred;
+  public double AdvocateSoloHeldMs;
+  /// <summary>Dual-probe advocate: root-slot probes, favourite-slot probes, refutation-only alarms
+  /// (favourite scored AdvocateMarginCp below the root search's view of it).</summary>
+  public long NumAdvocateRootProbes;
+  public long NumAdvocateFavProbes;
+  public long NumAdvocateRefutationAlarms;
+  /// <summary>Continuous dual-probe advocate: root-slot runs (one per move) and the depth each slot
+  /// reached when its run ended (root / favourite sums, for averages). In the continuous form
+  /// NumAdvocateRootProbes / NumAdvocateFavProbes count completed ITERATIONS.</summary>
+  public long NumAdvocateSlotRuns;
+  public long AdvocateRootDepthSum;
+  public long AdvocateFavDepthSum;
+
+  /// <summary>AB stamps (ProbeStampMode): flags, confirms submitted / rejected, stamps applied / cleared, ancestors moved by recomputes, root top-Q changes.</summary>
+  public long NumStampFlags;
+  public long NumStampConfirmsSubmitted;
+  public long NumStampConfirmsRejected;
+  public long NumStamps;
+  public long NumStampsCleared;
+  public long NumStampsStaleN;
+  public long NumStampsWeightedOut;
+  public long NumStampAncestorsMoved;
+  public long NumStampRootTopChanges;
+  public double TimeStampRecomputeMs;
+
+  /// <summary>
+  /// In-gate stamp drains (Route 4, ProbeGraftCoordinator.DrainInBackupGate): drains performed;
+  /// deferred because the other iterator held the pump lock; stopped by the per-batch apply
+  /// budget with results still pending; and the longest single in-gate drain.
+  /// </summary>
+  public long NumGateDrains;
+  public long NumGateDrainsSkippedBusy;
+  public long NumGateDrainsBudgetBound;
+  public double MaxGateDrainMs;
+
   /// <summary>
   /// Aborts broken down by ProbeGraftScheduler.AbortReason (indexed by the enum value).
   /// The PathDropped total above is a roll-up of every reason except MoveNotFound; this array
@@ -330,6 +390,7 @@ public sealed class ProbeGraftStats
   }
 
 
+  /// <summary>One line breaking graft aborts down by AbortReason (identifies the dominant failure mode).</summary>
   public string AbortBreakdownLine()
   {
     long total = NumGraftsAbortedMoveNotFound + NumGraftsAbortedPathDropped;
@@ -359,6 +420,7 @@ public sealed class ProbeGraftStats
   }
 
 
+  /// <summary>One line with the probes/triggers histogram by node depth below the search root.</summary>
   public string DepthHistogramLine()
   {
     StringBuilder builder = new();
@@ -429,6 +491,43 @@ public sealed class ProbeGraftStats
     NumRootAdaptRollbacks += other.NumRootAdaptRollbacks;
     NumRootAdaptVisits += other.NumRootAdaptVisits;
     NumRootAdaptFlipsHeld += other.NumRootAdaptFlipsHeld;
+    NumAdvocateProbes += other.NumAdvocateProbes;
+    NumAdvocateAgreements += other.NumAdvocateAgreements;
+    NumAdvocateBelowGate += other.NumAdvocateBelowGate;
+    NumAdvocateEngagements += other.NumAdvocateEngagements;
+    NumAdvocateEntries += other.NumAdvocateEntries;
+    NumAdvocateTraceVisits += other.NumAdvocateTraceVisits;
+    NumAdvocateCampaigns += other.NumAdvocateCampaigns;
+    NumAdvocateCampaignFlips += other.NumAdvocateCampaignFlips;
+    NumAdvocateCampaignRollbacks += other.NumAdvocateCampaignRollbacks;
+    NumAdvocateCampaignVisits += other.NumAdvocateCampaignVisits;
+    NumAdvocateRetired += other.NumAdvocateRetired;
+    NumAdvocateEngagedMoves += other.NumAdvocateEngagedMoves;
+    NumAdvocateConversions += other.NumAdvocateConversions;
+    NumAdvocateFavAbandoned += other.NumAdvocateFavAbandoned;
+    NumAdvocateSoloWindows += other.NumAdvocateSoloWindows;
+    NumAdvocateSoloDeferred += other.NumAdvocateSoloDeferred;
+    AdvocateSoloHeldMs += other.AdvocateSoloHeldMs;
+    NumAdvocateRootProbes += other.NumAdvocateRootProbes;
+    NumAdvocateFavProbes += other.NumAdvocateFavProbes;
+    NumAdvocateRefutationAlarms += other.NumAdvocateRefutationAlarms;
+    NumAdvocateSlotRuns += other.NumAdvocateSlotRuns;
+    AdvocateRootDepthSum += other.AdvocateRootDepthSum;
+    AdvocateFavDepthSum += other.AdvocateFavDepthSum;
+    NumStampFlags += other.NumStampFlags;
+    NumStampConfirmsSubmitted += other.NumStampConfirmsSubmitted;
+    NumStampConfirmsRejected += other.NumStampConfirmsRejected;
+    NumStamps += other.NumStamps;
+    NumStampsCleared += other.NumStampsCleared;
+    NumStampsStaleN += other.NumStampsStaleN;
+    NumStampsWeightedOut += other.NumStampsWeightedOut;
+    NumStampAncestorsMoved += other.NumStampAncestorsMoved;
+    NumStampRootTopChanges += other.NumStampRootTopChanges;
+    TimeStampRecomputeMs += other.TimeStampRecomputeMs;
+    NumGateDrains += other.NumGateDrains;
+    NumGateDrainsSkippedBusy += other.NumGateDrainsSkippedBusy;
+    NumGateDrainsBudgetBound += other.NumGateDrainsBudgetBound;
+    MaxGateDrainMs = Math.Max(MaxGateDrainMs, other.MaxGateDrainMs);
     for (int i = 0; i < NUM_ABORT_REASONS; i++)
     {
       NumGraftsAbortedByReason[i] += other.NumGraftsAbortedByReason[i];
@@ -559,6 +658,7 @@ public sealed class ProbeGraftStats
   }
 
 
+  /// <summary>Renders the process-wide aggregate built by AccumulateGlobal (multi-search harnesses).</summary>
   public static string GlobalSummaryLine()
   {
     (ProbeGraftStats stats, int numSearches, long numEvals) = GlobalSnapshot();
@@ -596,6 +696,16 @@ public sealed class ProbeGraftStats
     NumRootAdaptRollbacks = 0;
     NumRootAdaptVisits = 0;
     NumRootAdaptFlipsHeld = 0;
+    NumAdvocateProbes = 0; NumAdvocateAgreements = 0; NumAdvocateBelowGate = 0; NumAdvocateEngagements = 0; NumAdvocateEntries = 0;
+    NumAdvocateTraceVisits = 0; NumAdvocateCampaigns = 0; NumAdvocateCampaignFlips = 0; NumAdvocateCampaignRollbacks = 0;
+    NumAdvocateCampaignVisits = 0; NumAdvocateRetired = 0;
+    NumAdvocateEngagedMoves = 0; NumAdvocateConversions = 0; NumAdvocateFavAbandoned = 0;
+    NumAdvocateSoloWindows = 0; NumAdvocateSoloDeferred = 0; AdvocateSoloHeldMs = 0;
+    NumAdvocateRootProbes = 0; NumAdvocateFavProbes = 0; NumAdvocateRefutationAlarms = 0;
+    NumAdvocateSlotRuns = 0; AdvocateRootDepthSum = 0; AdvocateFavDepthSum = 0;
+    NumStampFlags = 0; NumStampConfirmsSubmitted = 0; NumStampConfirmsRejected = 0; NumStamps = 0; NumStampsCleared = 0;
+    NumStampsStaleN = 0; NumStampsWeightedOut = 0; NumStampAncestorsMoved = 0; NumStampRootTopChanges = 0; TimeStampRecomputeMs = 0;
+    NumGateDrains = 0; NumGateDrainsSkippedBusy = 0; NumGateDrainsBudgetBound = 0; MaxGateDrainMs = 0;
     Array.Clear(NumGraftsAbortedByReason);
     NumGraftsPausedBudget = 0;
     NumGraftPliesApplied = 0;
@@ -632,20 +742,21 @@ public sealed class ProbeGraftStats
   /// </summary>
   /// <param name="mode"></param>
   /// <param name="numEvalsThisSearch"></param>
+  /// <param name="consumerLabel">suffix naming the non-graft consumers active (e.g. "+stamps")</param>
   /// <returns></returns>
-  public string SummaryLine(ParamsProbeGraft.ModeType mode, int numEvalsThisSearch)
+  public string SummaryLine(ParamsProbeGraft.ModeType mode, int numEvalsThisSearch, string consumerLabel = null)
   {
     double graftEvalPct = numEvalsThisSearch > 0 ? 100.0 * NumGraftNNEvals / numEvalsThisSearch : 0;
     double probeLatAvg = NumProbesCompleted > 0 ? ProbeLatencySumMs / NumProbesCompleted : 0;
 
-    string line = $"[ProbeGraft] mode={mode} probes: sub={NumProbesSubmitted} done={NumProbesCompleted} "
+    string line = $"[ProbeGraft] mode={mode}{consumerLabel} probes: sub={NumProbesSubmitted} rejected={NumProbesRejectedBySource} done={NumProbesCompleted} "
                 + $"agree={NumProbesAgreed} stale={NumResultsStale} | triggers: ref={NumTriggersRefutation} disc={NumTriggersDiscovery} "
                 + $"grafts: start={NumGraftsStarted} done={NumGraftsCompleted} term={NumGraftsEndedTerminal} "
                 + $"abort={NumGraftsAbortedMoveNotFound + NumGraftsAbortedPathDropped} "
                 + $"(mnf={NumGraftsAbortedMoveNotFound} pd={NumGraftsAbortedPathDropped} pause={NumGraftsPausedBudget}) "
                 + $"plies={NumGraftPliesApplied} "
                 + $"evals={NumGraftNNEvals} ({graftEvalPct:F1}% of {numEvalsThisSearch / 1000.0:F1}k) nudges={NumPriorNudgesApplied} "
-                + $"| pump={TimePumpTotalMs:F1}ms (drain={TimeDrainMs:F1} graft={TimeGraftAdvanceMs:F1} sweep={TimeTargetSweepMs:F1}) "
+                + $"| pump={TimePumpTotalMs:F1}ms (drain={TimeDrainMs:F1} graft={TimeGraftAdvanceMs:F1} sweep={TimeTargetSweepMs:F1} n={NumTargetSweeps} sel={NumTargetsSelected} newNodes={NumDistinctNodesProbed}) "
                 + $"probeLatAvg={probeLatAvg:F0}ms | impact: dQmax={MaxAbsAnchorQDeltaAtEnd:F3} "
                 + $"movedGT.03={NumAnchorsQMovedOverThreshold} rootFlips={NumRootBestMoveChangesAfterGraft}";
 
@@ -653,6 +764,33 @@ public sealed class ProbeGraftStats
     {
       line += $" | rootadapt: verdicts={NumRootProbeVerdicts} trig={NumRootAdaptTriggers} flips={NumRootAdaptFlips} "
             + $"held={NumRootAdaptFlipsHeld} rollback={NumRootAdaptRollbacks} visits={NumRootAdaptVisits}";
+    }
+
+    if (NumAdvocateProbes > 0)
+    {
+      line += $" | advocate: probes={NumAdvocateProbes} agree={NumAdvocateAgreements} belowGate={NumAdvocateBelowGate} "
+            + $"engaged={NumAdvocateEngagements} entries={NumAdvocateEntries} trace={NumAdvocateTraceVisits} retired={NumAdvocateRetired} "
+            + $"campaigns={NumAdvocateCampaigns} flips={NumAdvocateCampaignFlips} rollback={NumAdvocateCampaignRollbacks} visits={NumAdvocateCampaignVisits} "
+            + $"engagedMoves={NumAdvocateEngagedMoves} conv={NumAdvocateConversions} favLeft={NumAdvocateFavAbandoned}";
+      if (NumAdvocateSoloWindows > 0 || NumAdvocateSoloDeferred > 0)
+      {
+        line += $" solo={NumAdvocateSoloWindows} deferred={NumAdvocateSoloDeferred} held={AdvocateSoloHeldMs:F0}ms";
+      }
+      if (NumAdvocateRootProbes > 0 || NumAdvocateFavProbes > 0)
+      {
+        line += $" dual: root={NumAdvocateRootProbes} fav={NumAdvocateFavProbes} refAlarms={NumAdvocateRefutationAlarms}";
+      }
+      if (NumAdvocateSlotRuns > 0)
+      {
+        line += $" cont: runs={NumAdvocateSlotRuns} depthAvg root={(double)AdvocateRootDepthSum / NumAdvocateSlotRuns:F1} fav={(double)AdvocateFavDepthSum / NumAdvocateSlotRuns:F1}";
+      }
+    }
+
+    if (NumStampFlags > 0 || NumStamps > 0)
+    {
+      line += $" | stamps: flags={NumStampFlags} confirms={NumStampConfirmsSubmitted} rej={NumStampConfirmsRejected} stamped={NumStamps} "
+            + $"cleared={NumStampsCleared} staleN={NumStampsStaleN} wOut={NumStampsWeightedOut} ancMoved={NumStampAncestorsMoved} rootTop={NumStampRootTopChanges} recompute={TimeStampRecomputeMs:F1}ms"
+            + $" gate={NumGateDrains}/{NumGateDrainsSkippedBusy}/{NumGateDrainsBudgetBound}/{MaxGateDrainMs:F1}ms";
     }
 
     if (mode == ParamsProbeGraft.ModeType.Shadow)
@@ -710,6 +848,19 @@ public sealed class ProbeGraftStats
     writer.WriteLine("MaxAbsAnchorQDeltaAtEnd       : " + MaxAbsAnchorQDeltaAtEnd.ToString("F4"));
     writer.WriteLine("NumAnchorsQMovedOverThreshold : " + NumAnchorsQMovedOverThreshold);
     writer.WriteLine("NumRootBestMoveChangesAfterGraft : " + NumRootBestMoveChangesAfterGraft);
+    writer.WriteLine("NumAdvocateEngagements        : " + NumAdvocateEngagements);
+    writer.WriteLine("NumAdvocateEngagedMoves       : " + NumAdvocateEngagedMoves);
+    writer.WriteLine("NumAdvocateConversions        : " + NumAdvocateConversions);
+    writer.WriteLine("NumAdvocateFavAbandoned       : " + NumAdvocateFavAbandoned);
+    writer.WriteLine("NumAdvocateSoloWindows        : " + NumAdvocateSoloWindows);
+    writer.WriteLine("NumAdvocateSoloDeferred       : " + NumAdvocateSoloDeferred);
+    writer.WriteLine("AdvocateSoloHeldMs            : " + AdvocateSoloHeldMs.ToString("F1"));
+    writer.WriteLine("NumAdvocateRootProbes         : " + NumAdvocateRootProbes);
+    writer.WriteLine("NumAdvocateFavProbes          : " + NumAdvocateFavProbes);
+    writer.WriteLine("NumAdvocateRefutationAlarms   : " + NumAdvocateRefutationAlarms);
+    writer.WriteLine("NumAdvocateSlotRuns           : " + NumAdvocateSlotRuns);
+    writer.WriteLine("AdvocateRootDepthSum          : " + AdvocateRootDepthSum);
+    writer.WriteLine("AdvocateFavDepthSum           : " + AdvocateFavDepthSum);
     writer.WriteLine("ShadowNumEvents               : " + ShadowNumEvents);
     writer.WriteLine("ShadowNumConfirmedBySearch    : " + ShadowNumConfirmedBySearch);
     writer.WriteLine("ShadowNumUnresolved           : " + ShadowNumUnresolved);

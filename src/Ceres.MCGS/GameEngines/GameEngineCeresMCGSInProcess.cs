@@ -1045,6 +1045,8 @@ public class GameEngineCeresMCGSInProcess : GameEngine
     Search?.Manager.Dispose();
     Search = new MCGSSearch(infoLogger);
 
+    ResolveProbeSourceIfNeeded();
+    Search.ResolvedProbeSource = resolvedProbeSource;
     Search.Search(Evaluators, reuseGraph, SelectWorkerPools, PathVisitPools, ReusableNNBatches,
                   SelectParams, SearchParams, GameLimitManager,
                   curPositionAndMoves, searchLimit, verbose, lastSearchStartTime,
@@ -1098,6 +1100,30 @@ public class GameEngineCeresMCGSInProcess : GameEngine
 
 
   /// <summary>
+  /// Probe source (ParamsProbeGraft.ProbeSourceID) resolved ONCE PER ENGINE and reused by every
+  /// search of this engine's games, so that a registry factory returning fresh instances yields
+  /// one probe farm (workers, queue, transposition table) per engine: concurrent games share
+  /// nothing. Disposed with the engine (see CeresAlphaBetaProbeSource.InstanceFactory).
+  /// </summary>
+  Ceres.Chess.Probing.IProbeSource resolvedProbeSource;
+
+  void ResolveProbeSourceIfNeeded()
+  {
+    if (resolvedProbeSource != null
+     || SearchParams?.ProbeGraft == null
+     || !SearchParams.ProbeGraft.AnyConsumerEnabled
+     || string.IsNullOrEmpty(SearchParams.ProbeGraft.ProbeSourceID))
+    {
+      return;
+    }
+    if (!Ceres.MCGS.Search.ProbeGraft.ProbeSourceRegistry.TryCreate(SearchParams.ProbeGraft.ProbeSourceID, out resolvedProbeSource))
+    {
+      throw new Exception($"ParamsProbeGraft.ProbeSourceID '{SearchParams.ProbeGraft.ProbeSourceID}' is not registered with ProbeSourceRegistry.");
+    }
+  }
+
+
+  /// <summary>
   /// Diposes underlying search engine.
   /// </summary>
   public override void Dispose()
@@ -1117,6 +1143,9 @@ public class GameEngineCeresMCGSInProcess : GameEngine
     Search?.Manager.Engine.Graph.Dispose();
     Search?.Manager?.Dispose();
     Search = null;
+
+    (resolvedProbeSource as IDisposable)?.Dispose();   // this engine's own probe farm
+    resolvedProbeSource = null;
     Evaluators?.Dispose();
     Evaluators = null;
     SelectWorkerPools[0]?.Dispose();

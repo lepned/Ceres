@@ -502,6 +502,7 @@ public partial class MCGSEngine
 
     numVisitsInFlight = 0;
     startedOverlapping = false;
+    Coordinator.ResetSolo();
 
     int firstIteratorID = 0;
     int secondIteratorID = 1;

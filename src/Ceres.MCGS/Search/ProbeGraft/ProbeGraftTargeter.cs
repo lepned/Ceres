@@ -20,8 +20,10 @@ using Ceres.Chess;
 using Ceres.Chess.MoveGen;
 using Ceres.MCGS.Graphs.GEdges;
 using Ceres.MCGS.Graphs.GNodes;
+using Ceres.MCGS.Graphs;
 using Ceres.MCGS.Search.Coordination;
 using Ceres.MCGS.Search.Params;
+using Ceres.MCGS.Search.Paths;
 
 #endregion
 
@@ -74,6 +76,15 @@ public sealed class ProbeGraftTargetSnapshot
   /// move choice (NaN in VisitCount mode). Smaller is more decision-relevant.
   /// </summary>
   public double RequiredDelta = double.NaN;
+
+  /// <summary>Probe stamps: this request is the confirmation probe of an earlier flag.</summary>
+  public bool IsConfirm;
+
+  /// <summary>Probe stamps: the first probe's disagreement d = A - Q (set on the confirm request).</summary>
+  public double FirstD;
+
+  /// <summary>Probe stamps: node budget of this probe (ratio-scaled; x multiplier for confirms).</summary>
+  public int ProbeNodes;
 }
 
 
@@ -103,8 +114,18 @@ internal sealed class ProbeGraftTargeter
 {
   readonly ParamsProbeGraft Params;
 
-  /// <summary>Per-node ledger: node N as of the last accepted probe submission.</summary>
-  readonly Dictionary<int, int> lastProbeN = new();
+  /// <summary>
+  /// The per-node ledger "node N as of the last accepted probe submission" lives in the node
+  /// itself (GNodeStruct.ProbedN, log-coded) so that it survives across moves under graph reuse;
+  /// this counts the nodes first probed during this search.
+  /// </summary>
+  int numDistinctNodesProbed;
+
+  /// <summary>Paths rejected by the incremental collector because their visit chain was not root-anchored/consistent.</summary>
+  internal int NumPathsInconsistent;
+
+  /// <summary>Graph of the most recent sweep/collect (for ledger writes by node index).</summary>
+  Graph graph;
 
   /// <summary>Scratch collections reused across sweeps.</summary>
   readonly List<ProbeGraftTargetSnapshot> candidates = new();
@@ -112,7 +133,11 @@ internal sealed class ProbeGraftTargeter
   readonly HashSet<int> onStack = new();
   readonly List<MGMove> pathScratch = new();
 
+  /// <summary>Scratch for the incremental (per-batch path) collection: one path's visits, leaf to root.</summary>
+  readonly List<(int NodeIndex, GEdge Edge, MGPosition Pos)> pathVisitsScratch = new();
 
+
+  /// <summary>Constructor (one per coordinator/search; parms are the owning search's ProbeGraft params).</summary>
   internal ProbeGraftTargeter(ParamsProbeGraft parms)
   {
     Params = parms;
@@ -243,6 +268,7 @@ internal sealed class ProbeGraftTargeter
     onStack.Clear();
     pathScratch.Clear();
 
+    graph = engine.Graph;
     GNode root = engine.SearchRootNode;
     int rootN = root.N;
     int nCut = Math.Max(Params.TargetNCutAbs, (int)(Params.TargetCutFraction * rootN));
@@ -269,13 +295,204 @@ internal sealed class ProbeGraftTargeter
   /// </summary>
   /// <param name="snapshot"></param>
   internal void RecordProbeSubmitted(ProbeGraftTargetSnapshot snapshot)
-    => lastProbeN[snapshot.NodeIndex] = snapshot.N;
+  {
+    GNode node = graph[snapshot.NodeIndex];
+    ref GNodeStruct nodeRef = ref node.NodeRef;
+    if (nodeRef.ProbedN == 0)
+    {
+      numDistinctNodesProbed++;
+    }
+    nodeRef.ProbedN = ProbeStamps.EncodeN0(snapshot.N);
+  }
 
 
   /// <summary>
-  /// Number of distinct graph nodes probed at least once during this search.
+  /// Number of distinct graph nodes first probed during this search (nodes carrying a ProbedN
+  /// record from an earlier move's search are not counted again).
   /// </summary>
-  internal int NumDistinctNodesProbed => lastProbeN.Count;
+  internal int NumDistinctNodesProbed => numDistinctNodesProbed;
+
+
+  /// <summary>
+  /// Re-probe backoff against the node's persistent ledger: true when the node was probed before
+  /// and its N has not yet grown by the required factor since.
+  /// </summary>
+  bool ProbedTooRecently(in GNodeStruct nodeRef, int depth)
+  {
+    byte code = nodeRef.ProbedN;
+    if (code == 0)
+    {
+      return false;
+    }
+    float growthFactorRequired = depth <= Params.ReprobeShallowMaxDepth
+                               ? Math.Min(Params.ReprobeNGrowthFactorShallow, Params.ReprobeNGrowthFactor)
+                               : Params.ReprobeNGrowthFactor;
+    return nodeRef.N < (long)(ProbeStamps.DecodeN0(code) * growthFactorRequired);
+  }
+
+
+  /// <summary>
+  /// Incremental stamp-mode targeting (ParamsProbeGraft.ProbeStampIncrementalTargeting): instead of
+  /// a periodic walk of the whole graph, examines only the nodes on the paths the iterator just
+  /// backed up (the batch's PathsSet, intact at the quiescent pump) and collects those that have
+  /// crossed the probe threshold: N in [nCut, ProbeStampMaxN], never probed or grown by the
+  /// re-probe factor since (GNodeStruct.ProbedN), evaluated, non-terminal, not the search root.
+  /// A node crosses nCut exactly on a visit that lies on one of these paths, so nothing is missed
+  /// that the periodic sweep would have found; a node never visited again is never probed, which
+  /// is the intended economy (attention follows the search). Each node is taken once per call;
+  /// the move path is the path's own (a valid path from the search root). Candidates are returned
+  /// sorted by N descending (larger subtrees first), as the sweep does.
+  /// </summary>
+  internal List<ProbeGraftTargetSnapshot> CollectFromPaths(MCGSIterator iterator, int maxCandidates = int.MaxValue)
+  {
+    candidates.Clear();
+    visited.Clear();
+
+    MCGSEngine engine = iterator.Engine;
+    graph = engine.Graph;
+    GNode root = engine.SearchRootNode;
+    int nCut = Math.Max(Params.TargetNCutAbs, (int)(Params.TargetCutFraction * root.N));
+    int nMax = Params.ProbeStampMaxN;
+    int rootIndex = root.Index.Index;
+
+    foreach (MCGSPath path in iterator.PathsSet.Paths)
+    {
+      if (candidates.Count >= maxCandidates)
+      {
+        break;   // no more can be submitted this pass (prober saturated); the rest are seen again when revisited
+      }
+
+      // Ordinary batch paths carry no root slot: slot k (root-to-leaf order) is the node at depth
+      // k + 1, its ParentChildEdge leading from the node at depth k (the search root for k = 0).
+      // The engine's root-initialization path (one slot, IsRootInitializationPath) and inner-node
+      // rollouts (a different root) are skipped.
+      if (path == null || path.NumVisitsInPath < 1 || path.IsRootInitializationPath || !path.InnerSearchStartNode.IsNull)
+      {
+        continue;
+      }
+
+      // Pass 1 (cheap, no position copies): does this path hold any threshold-crossing node?
+      bool anyCandidate = false;
+      int depthFromLeaf = 0;
+      int numVisits = path.NumVisitsInPath;
+      foreach (MCGSPathVisitMember member in path.PathVisitsLeafToRoot)
+      {
+        ref readonly MCGSPathVisit visit = ref member.PathVisitRef;
+        int depth = numVisits - depthFromLeaf;
+        depthFromLeaf++;
+        if (visit.IsRootInitializationPath || visit.ParentChildEdge.Type != GEdgeStruct.EdgeType.ChildEdge)
+        {
+          continue;
+        }
+        GNode node = visit.ParentChildEdge.ChildNode;
+        if (node.IsNull)
+        {
+          continue;
+        }
+        ref readonly GNodeStruct nodeRef = ref node.NodeRef;
+        int n = nodeRef.N;
+        if (n < nCut || n > nMax || node.Index.Index == rootIndex || visited.Contains(node.Index.Index))
+        {
+          continue;
+        }
+        if (ProbedTooRecently(in nodeRef, depth))
+        {
+          continue;
+        }
+        anyCandidate = true;
+        break;
+      }
+      if (!anyCandidate)
+      {
+        continue;
+      }
+
+      // Pass 2: materialize the path root-to-leaf (positions come free from the visits) and
+      // snapshot every qualifying node with its move path.
+      pathVisitsScratch.Clear();
+      foreach (MCGSPathVisitMember member in path.PathVisitsLeafToRoot)
+      {
+        ref readonly MCGSPathVisit visit = ref member.PathVisitRef;
+        int nodeIndex = visit.ParentChildEdge.Type == GEdgeStruct.EdgeType.ChildEdge && !visit.ParentChildEdge.ChildNodeIndex.IsNull
+                      ? visit.ParentChildEdge.ChildNodeIndex.Index : -1;
+        pathVisitsScratch.Add((nodeIndex, visit.ParentChildEdge, visit.ChildPosition));
+      }
+      pathVisitsScratch.Add((rootIndex, default, engine.SearchRootPosMG));
+      pathVisitsScratch.Reverse();   // now index 0 is the search root
+
+      pathScratch.Clear();
+      if (pathVisitsScratch[0].NodeIndex != rootIndex)
+      {
+        NumPathsInconsistent++;
+        if (NumPathsInconsistent <= 3) Console.WriteLine($"[ProbeGraft-inc] path does not start at the search root: first={pathVisitsScratch[0].NodeIndex} root={rootIndex} visits={pathVisitsScratch.Count}/{path.NumVisitsInPath}");
+        continue;
+      }
+      for (int i = 1; i < pathVisitsScratch.Count; i++)
+      {
+        (int nodeIndex, GEdge edge, MGPosition pos) = pathVisitsScratch[i];
+        if (nodeIndex < 0)
+        {
+          break;   // path left the graph (should not happen after backup); stop here
+        }
+        if (edge.ParentNode.Index.Index != pathVisitsScratch[i - 1].NodeIndex)
+        {
+          NumPathsInconsistent++;
+          if (NumPathsInconsistent <= 3) Console.WriteLine($"[ProbeGraft-inc] edge parent mismatch at slot {i}: edgeParent={edge.ParentNode.Index.Index} prev={pathVisitsScratch[i - 1].NodeIndex} root={rootIndex} visits={pathVisitsScratch.Count}/{path.NumVisitsInPath}");
+          break;
+        }
+        MGPosition parentPos = pathVisitsScratch[i - 1].Pos;
+        MGMove move = edge.MoveMGFromPos(in parentPos);
+        pathScratch.Add(move);
+
+        if (nodeIndex == rootIndex || !visited.Add(nodeIndex))
+        {
+          continue;
+        }
+        GNode node = graph[nodeIndex];
+        ref readonly GNodeStruct nodeRef = ref node.NodeRef;
+        int n = nodeRef.N;
+        if (n < nCut || n > nMax || ProbedTooRecently(in nodeRef, i))
+        {
+          continue;
+        }
+        bool eligible = node.IsEvaluated
+                     && n > 0
+                     && !node.Terminal.IsTerminal()
+                     && node.NumPolicyMoves > 0
+                     && !node.IsSearchRoot;
+        if (!eligible)
+        {
+          continue;
+        }
+
+        if (candidates.Count >= maxCandidates)
+        {
+          break;
+        }
+        candidates.Add(new ProbeGraftTargetSnapshot()
+        {
+          NodeIndex = nodeIndex,
+          N = n,
+          Q = node.Q,
+          Depth = i,
+          DominantChildIndex = -1,
+          DominantVisitFraction = 0,
+          DominantMove = default,
+          DominantFractionGateHeld = false,
+          MovesFromRoot = pathScratch.ToArray(),
+          Priority = n,
+          RequiredDelta = double.NaN,
+        });
+      }
+    }
+
+    if (candidates.Count > 1)
+    {
+      candidates.Sort((a, b) => a.Priority != b.Priority ? b.Priority.CompareTo(a.Priority)
+                                                         : a.Depth.CompareTo(b.Depth));
+    }
+    return candidates;
+  }
 
 
   /// <summary>
@@ -351,13 +568,8 @@ internal sealed class ProbeGraftTargeter
     // Nodes near the root carry the most decision leverage, so they use the (smaller) shallow
     // re-probe spacing: the geometric rule alone allows only O(log N) probes per node, which
     // saturates their coverage long before probe capacity is exhausted.
-    float growthFactorRequired = depth <= Params.ReprobeShallowMaxDepth
-                               ? Math.Min(Params.ReprobeNGrowthFactorShallow, Params.ReprobeNGrowthFactor)
-                               : Params.ReprobeNGrowthFactor;
-
     int nodeIdx = node.Index.Index;
-    if (lastProbeN.TryGetValue(nodeIdx, out int probedAtN)
-     && node.N < (long)(probedAtN * growthFactorRequired))
+    if (ProbedTooRecently(in node.NodeRef, depth))
     {
       return; // probed too recently relative to visit growth
     }
@@ -400,6 +612,15 @@ internal sealed class ProbeGraftTargeter
     else
     {
       priority = gateHeld ? node.N : 0;
+    }
+
+    if (Params.ProbeStampMode == ParamsProbeGraft.ProbeStampModeType.Active)
+    {
+      if (node.N > Params.ProbeStampMaxN)
+      {
+        return;   // the ratio principle: above the cap the probe is a peer, not an oracle
+      }
+      priority = node.N;   // no dominant-child gate for value stamps; larger subtrees first
     }
 
     ProbeGraftTargetSnapshot snapshot = new()

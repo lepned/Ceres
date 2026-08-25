@@ -28,13 +28,19 @@ namespace Ceres.Chess.Probing;
 /// </summary>
 public sealed record ProbeResult
 {
+  /// <summary>Matches the ProbeRequest.RequestID this result answers.</summary>
   public required long RequestID { get; init; }
 
+  /// <summary>The requester's token from the ProbeRequest, echoed verbatim (correlation).</summary>
   public required object RequesterToken { get; init; }
 
   /// <summary>If the probe completed normally (false: cancelled, errored, or budget-degenerate;
   /// all other fields except RequestID/RequesterToken are then undefined).</summary>
   public required bool Completed { get; init; }
+
+  /// <summary>True for an interim report (one completed prober iteration) of a request that set
+  /// ProbeRequest.ReportInterim; the final result of the request follows later.</summary>
+  public bool IsInterim { get; init; }
 
   /// <summary>Prober's best move from the probed position.</summary>
   public MGMove BestMove { get; init; }

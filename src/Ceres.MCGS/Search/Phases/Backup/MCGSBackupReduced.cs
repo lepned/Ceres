@@ -310,7 +310,8 @@ public partial class MCGSBackup
     if (haveProcessedLeaf)
     {
       GNode childNode = visitEdge.ChildNode;
-      strategy.BackupToEdge(visitEdge, numVisitsAccepted, childNode.Q, childNode.D, visitEdge.ChildNodeHasDrawKnownToExist);
+      strategy.BackupToEdge(visitEdge, numVisitsAccepted, ProbeGraft.ProbeStamps.ProjectChildQ(childNode, childNode.Q),
+                            childNode.D, visitEdge.ChildNodeHasDrawKnownToExist);
       return;
     }
 

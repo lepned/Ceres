@@ -282,6 +282,9 @@ public static unsafe class GraphRewriter
     Debug.Assert(!newRootIndex.IsNull);
     Debug.Assert(newRootIndex.Index > 0 && newRootIndex.Index < graph.NodesStore.NumTotalNodes);
 
+    // Attention directives are indexed by node index and do not survive a rewrite (P12: bounded persistence).
+    graph.SetAttentionEntries(null);
+
     // Set rewriting flag to bypass lock assertions during exclusive graph access.
     graph.Store.IsRewriting = true;
     RewriteResult rewriteStats = MakeChildNewRootCore(graph, newRootIndex, newPriorMoves,
@@ -314,6 +317,9 @@ public static unsafe class GraphRewriter
 
     Debug.Assert(!newRootIndex.IsNull);
     Debug.Assert(newRootIndex.Index > 0 && newRootIndex.Index < graph.NodesStore.NumTotalNodes);
+
+    // Attention directives are indexed by node index and do not survive a rewrite (P12: bounded persistence).
+    graph.SetAttentionEntries(null);
 
     graph.Store.IsRewriting = true;
     RewriteResult result = MakeChildNewRootSelectiveCore(graph, newRootIndex, newPriorMoves,
@@ -2317,6 +2323,8 @@ public static unsafe class GraphRewriter
       {
         double qPure = w / nodeRef2.N;
         nodeRef2.Q = qPure;
+        nodeRef2.ProbeStampN = 0;   // probe stamps do not survive a root move (P12: bounded persistence)
+        nodeRef2.ProbeStampQ = 0;
         nodeRef2.D = dSum / nodeRef2.N;
         nodeRef2.SiblingsQFrac = 0;
         nodeRef2.SiblingsQ = 0;

@@ -323,46 +323,72 @@ public partial class MCGSIterator : IDisposable
   private void DoRunLoop(Func<int> getBatchSizeFunc, int hardMaxRootN)
   {
     int numRetries = 0;
-    while (Engine.ShouldContinue())
+    Func<bool> shouldContinue = Engine.ShouldContinue;
+    PhaseCoordinator coordinator = Engine.Coordinator;
+    coordinator.LoopEntered(IteratorID);
+    try
     {
-      int batchSize = getBatchSizeFunc();
-      if (batchSize <= 0)
+      while (Engine.ShouldContinue())
       {
-        // TODO: verify this is ok, why does it happen?
-        return;
-      }
-
-      if (ENABLE_LOGGING)
-      {
-        LogWrite(()=> $"Starting batch {batchSequenceNum} with size {batchSize}, rootN={Engine.SearchRootNode.N}, inFlight={Engine.numVisitsInFlight}");
-      }
-
-      Interlocked.Add(ref Engine.numVisitsInFlight, batchSize);
-
-      int startN = Engine.SearchRootNode.N;
-
-      RunOnce(batchSize, hardMaxRootN);
-      int numVisitsAdded = Engine.SearchRootNode.N - startN;
-
-      if (numVisitsAdded == 0)
-      {
-        numRetries += 1;
-        if (numRetries > 3)
+        // Transient solo window (PhaseCoordinator, SWARM doc XI.8.1): park HERE -- outside every gate and
+        // backup-order turn, with no visits in flight on this lane -- while another iterator runs directed
+        // visits against the quiescent graph. Returns false when the search stopped during the park.
+        if (!coordinator.ParkIfSoloRequested(IteratorID, shouldContinue))
         {
-          if (!haveWarnedTooManyRetries)
-          {
-            ConsoleUtils.WriteLineColored(ConsoleColor.Yellow, $"Iterator {IteratorID} exiting after {numRetries} retries with no visits added");
-          }
-          haveWarnedTooManyRetries = true;
           return;
         }
+
+        int batchSize = getBatchSizeFunc();
+        if (batchSize <= 0)
+        {
+          // TODO: verify this is ok, why does it happen?
+          return;
+        }
+
+        if (ENABLE_LOGGING)
+        {
+          LogWrite(()=> $"Starting batch {batchSequenceNum} with size {batchSize}, rootN={Engine.SearchRootNode.N}, inFlight={Engine.numVisitsInFlight}");
+        }
+
+        Interlocked.Add(ref Engine.numVisitsInFlight, batchSize);
+
+        int startN = Engine.SearchRootNode.N;
+
+        int numVisitsAdded;
+        try
+        {
+          RunOnce(batchSize, hardMaxRootN);
+          numVisitsAdded = Engine.SearchRootNode.N - startN;
+        }
+        finally
+        {
+          // Always undo the in-flight reservation (the retry exit below used to leak it, which
+          // under-sizes the other iterator's batches for the rest of the search).
+          Interlocked.Add(ref Engine.numVisitsInFlight, -batchSize);
+        }
+
+        if (numVisitsAdded == 0)
+        {
+          numRetries += 1;
+          if (numRetries > 3)
+          {
+            if (!haveWarnedTooManyRetries)
+            {
+              ConsoleUtils.WriteLineColored(ConsoleColor.Yellow, $"Iterator {IteratorID} exiting after {numRetries} retries with no visits added");
+            }
+            haveWarnedTooManyRetries = true;
+            return;
+          }
+        }
+        else
+        {
+          numRetries = 0;
+        }
       }
-      else
-      {
-        numRetries = 0;
-      }      
-      
-      Interlocked.Add(ref Engine.numVisitsInFlight, -batchSize);
+    }
+    finally
+    {
+      coordinator.LoopExited(IteratorID);
     }
   }
 
@@ -547,6 +573,13 @@ public partial class MCGSIterator : IDisposable
       ConsoleUtils.WriteLineColored(ConsoleColor.Yellow, "Validated graph " + Engine.SearchRootNode.N);
     }
 
+    // Probe-stamp drain (Route 4): apply completed external-probe results to the graph here,
+    // while this iterator still holds the select/backup exclusion lock (the other iterator can
+    // only be in its NN evaluate phase). Issues no visits and enters no gate; bounded per batch.
+    // Runs BEFORE the optional recompute pass below so a StaleDrain pass sees the stale marks
+    // the stamp recompute leaves on ancestors it skips.
+    Manager.ProbeGraft?.DrainInBackupGate(this);
+
     // Optionally perform a full bottom-up recomputation of all node Q values
     // (experimental, enabled via ParamsSearch.TestFlag). This is done here while we still
     // hold the backup lock and the graph is quiescent (no other iterator is concurrently
@@ -579,17 +612,14 @@ public partial class MCGSIterator : IDisposable
     // a nested batch's EnterBackupOrder waits on this batch's ExitBackupOrder.)
     Engine.PostBatchHook?.Invoke(this);
 
-    // Pump the PICKET M1 graft coordinator (if enabled) at this same quiescent
-    // point, after the external hook so that hook consumers still observe this batch's
-    // intact PathsSet (the pump's RunProbeSpecs calls reset it).
-    // Restricted to iterator 0 (always the first iterator, see MCGSEngine.RunLoop): the
-    // coordinator holds unsynchronized per-search state and must only ever be entered from
-    // one thread. This is a no-op today because ParamsProbeGraft.Validate forbids
-    // DualOverlappedIterators, but it keeps the single-pump-thread invariant explicit.
-    if (IteratorID == 0)
-    {
-      Manager.ProbeGraft?.PumpAtQuiescentPoint(this);
-    }
+    // Pump the probe coordinator (if enabled) at this same point, after the external hook so
+    // that hook consumers still observe this batch's intact PathsSet (the legacy pump's
+    // RunProbeSpecs calls reset it). Called from EVERY iterator: the coordinator serializes its
+    // state internally (pumpLock) and runs the incremental stamp targeting over THIS iterator's
+    // PathsSet, while the legacy directed-visit consumers (which need the single-iterator
+    // quiescent graph; ParamsProbeGraft.Validate keeps DualOverlappedIterators off for them)
+    // run for iterator 0 only. The stamp drain itself ran inside the gate (DrainInBackupGate).
+    Manager.ProbeGraft?.PumpAtQuiescentPoint(this);
 
     LogFlush();
 

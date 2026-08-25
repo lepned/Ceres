@@ -1032,7 +1032,8 @@ public class MCGSSelect
 
     // Stochastic/warmup redescent override probability (0 = disabled; see IsTranspositionSufficientN).
     float redescentStochasticProbability = paramsSearch.RedescentStochasticProbability;
-    bool parallelEnabled = paramsSearch.Execution.SelectOperationParallelThresholdNumVisits < int.MaxValue;
+    bool parallelEnabled = paramsSearch.Execution.SelectOperationParallelThresholdNumVisits < int.MaxValue
+                        && !iterator.ForceSerialSelect;   // probe/forced descents stay serial (RunProbeSpecs)
     int THRESHOLD_PARALLEL = ParallelThresholdToUse;
 
     // Multipass (parallel-launch) scanning is only useful when enough visits flow
