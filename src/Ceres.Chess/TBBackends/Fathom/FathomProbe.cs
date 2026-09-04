@@ -44,6 +44,7 @@ using System.Data;
 using System.Diagnostics;
 using System.IO;
 using System.IO.MemoryMappedFiles;
+using System.Runtime.CompilerServices;
 using System.Text;
 using Ceres.Base.Misc;
 using Ceres.Base.OperatingSystem;
@@ -1946,15 +1947,62 @@ namespace Ceres.Chess.TBBackends.Fathom
     }
 
 
+    /// <summary>
+    /// Per-thread stack of move lists, indexed by probe recursion depth.
+    ///
+    /// The probe routines are strictly stack disciplined: the list a frame holds stays
+    /// live only within that frame, and every callee is passed depth + 1. Reusing the
+    /// lists makes probing allocation-free in steady state - previously each
+    /// gen_captures / gen_moves / gen_legal allocated a TBMoveList plus its
+    /// TB_MAX_MOVES ushort array, which in endgames is one probe per unexpanded child
+    /// plus a further allocation per probe_ab recursion level.
+    /// </summary>
+    [ThreadStatic]
+    private static TBMoveList[] moveListStack;
+
+    const int MOVE_LIST_STACK_INITIAL_DEPTH = 16;
+
+    /// <summary>
+    /// Returns the move list reserved for a given probe recursion depth, creating it
+    /// (and growing the stack) the first time this thread reaches that depth.
+    /// Contents are undefined on return - the generators clear the list before filling it.
+    /// </summary>
+    private static TBMoveList MoveListAtDepth(int depth)
+    {
+      TBMoveList[] stack = moveListStack;
+      if (stack == null || depth >= stack.Length)
+      {
+        stack = GrowMoveListStack(depth);
+      }
+
+      return stack[depth] ??= new TBMoveList();
+    }
+
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static TBMoveList[] GrowMoveListStack(int depth)
+    {
+      TBMoveList[] existing = moveListStack;
+      int newLength = Math.Max(MOVE_LIST_STACK_INITIAL_DEPTH,
+                               Math.Max(depth + 1, 2 * (existing == null ? 0 : existing.Length)));
+
+      TBMoveList[] newStack = new TBMoveList[newLength];
+      existing?.CopyTo(newStack, 0); // retain the lists already built at shallower depths
+
+      return moveListStack = newStack;
+    }
+
+
     // probe_ab() is not called for positions with en passant captures.
-    int probe_ab(in FathomPos pos, int alpha, int beta, ref int success)
+    int probe_ab(in FathomPos pos, int alpha, int beta, ref int success, int depth)
     {
       Debug.Assert(pos.EnPassant == 0);
 
 
       // Generate (at least) all legal captures including (under)promotions.
       // It is OK to generate more, as long as they are filtered out below.
-      TBMoveList moves = gen_captures(in pos);
+      TBMoveList moves = MoveListAtDepth(depth);
+      gen_captures(in pos, moves);
       for (int i = 0; i < moves.NumMoves; i++)
       {
         FathomPos pos1 = default;
@@ -1969,7 +2017,7 @@ namespace Ceres.Chess.TBBackends.Fathom
           continue; // illegal move
         }
 
-        int vr = -probe_ab(in pos1, -beta, -alpha, ref success);
+        int vr = -probe_ab(in pos1, -beta, -alpha, ref success, depth + 1);
 
         if (success == 0) return 0;
 
@@ -2004,12 +2052,16 @@ namespace Ceres.Chess.TBBackends.Fathom
     //  0 : draw
     //  1 : win, but draw under 50-move rule
     //  2 : win
-    internal unsafe int probe_wdl(in FathomPos pos, out int success)
+    internal unsafe int probe_wdl(in FathomPos pos, out int success) => probe_wdl(in pos, out success, 0);
+
+
+    private unsafe int probe_wdl(in FathomPos pos, out int success, int depth)
     {
       success = 1;
 
       // Generate (at least) all legal captures including (under)promotions.
-      TBMoveList moves = gen_captures(in pos);
+      TBMoveList moves = MoveListAtDepth(depth);
+      gen_captures(in pos, moves);
       int bestCap = -3, bestEp = -3;
 
       // We do capture resolution, letting bestCap keep track of the best
@@ -2026,7 +2078,7 @@ namespace Ceres.Chess.TBBackends.Fathom
           continue; // illegal move
         }
 
-        int vx = -probe_ab(in pos1, -2, -bestCap, ref success);
+        int vx = -probe_ab(in pos1, -2, -bestCap, ref success, depth + 1);
         if (success == 0) return 0;
         if (vx > bestCap)
         {
@@ -2079,13 +2131,14 @@ namespace Ceres.Chess.TBBackends.Fathom
       // Now handle the stalemate case.
       if (bestEp > -3 && v == 0)
       {
-        TBMoveList moves1 = gen_moves(in pos);
+        // The capture list is dead once the loop above completes, so refill it in place.
+        gen_moves(in pos, moves);
 
         // Check for stalemate in the position with ep captures.
         bool foundMove = false;
-        for (int i = 0; i < moves1.NumMoves; i++)
+        for (int i = 0; i < moves.NumMoves; i++)
         {
-          ushort move = moves1.Moves[i];
+          ushort move = moves.Moves[i];
 
           if (!is_en_passant(pos, move) && legal_move(pos, move))
           {
@@ -2138,9 +2191,12 @@ namespace Ceres.Chess.TBBackends.Fathom
     // In short, if a move is available resulting in dtz + 50-move-counter <= 99,
     // then do not accept moves leading to dtz + 50-move-counter == 100.
     //
-    internal int probe_dtz(in FathomPos pos, out int success)
+    internal int probe_dtz(in FathomPos pos, out int success) => probe_dtz(in pos, out success, 0);
+
+
+    private int probe_dtz(in FathomPos pos, out int success, int depth)
     {
-      int wdl = probe_wdl(pos, out success);
+      int wdl = probe_wdl(pos, out success, depth + 1);
       if (success == 0)
       {
         return 0;
@@ -2168,7 +2224,8 @@ namespace Ceres.Chess.TBBackends.Fathom
 
         // 6 seconds for 20mm move generations?
         {
-          moves = gen_legal(in pos);
+          moves = MoveListAtDepth(depth);
+          gen_legal(in pos, moves);
         }
 
         for (int i = 0; i < moves.NumMoves; i++)
@@ -2184,7 +2241,7 @@ namespace Ceres.Chess.TBBackends.Fathom
             continue; // not legal
           }
 
-          int v = -probe_wdl(in pos1, out success);
+          int v = -probe_wdl(in pos1, out success, depth + 1);
           if (success == 0)
           {
             return 0;
@@ -2221,7 +2278,8 @@ namespace Ceres.Chess.TBBackends.Fathom
         best = wdl_to_dtz[wdl + 2];
 
         // If wdl < 0, we still have to generate all moves.
-        moves = gen_moves(in pos);
+        moves = MoveListAtDepth(depth);
+        gen_moves(in pos, moves);
       }
 
       for (int i = 0; i < moves.NumMoves; i++)
@@ -2239,9 +2297,9 @@ namespace Ceres.Chess.TBBackends.Fathom
           // move was not legal
           continue;
         }
-        int v = -probe_dtz(in pos1, out success);
+        int v = -probe_dtz(in pos1, out success, depth + 1);
         // Check for the case of mate in 1
-        if (v == 1 && is_mate(in pos1))
+        if (v == 1 && is_mate(in pos1, MoveListAtDepth(depth + 1)))
           best = 1;
         else if (wdl > 0)
         {
@@ -2279,14 +2337,15 @@ namespace Ceres.Chess.TBBackends.Fathom
       int v, success;
 
       // Probe, rank and score each move.
-      TBMoveList moves = gen_legal(in pos);
+      TBMoveList moves = MoveListAtDepth(0);
+      gen_legal(in pos, moves);
       FathomPos pos1 = default;
       for (int i = 0; i < moves.NumMoves; i++)
       {
         TbRootMove m = new TbRootMove();
         m.move = moves.Moves[i];
         do_move(ref pos1, in pos, m.move);
-        v = -probe_wdl(in pos1, out success);
+        v = -probe_wdl(in pos1, out success, 1);
 
         if (success == 0)
         {
@@ -2319,7 +2378,8 @@ namespace Ceres.Chess.TBBackends.Fathom
       int bound = useRule50 ? 900 : 1;
 
       // Probe, rank and score each move.
-      TBMoveList rootMoves = gen_legal(in pos);
+      TBMoveList rootMoves = MoveListAtDepth(0);
+      gen_legal(in pos, rootMoves);
       FathomPos pos1 = default;
       for (int i = 0; i < rootMoves.NumMoves; i++)
       {
@@ -2331,19 +2391,19 @@ namespace Ceres.Chess.TBBackends.Fathom
         if (pos1.Rule50 == 0)
         {
           // If the move resets the 50-move counter, dtz is -101/-1/0/1/101.
-          v = -probe_wdl(in pos1, out success);
+          v = -probe_wdl(in pos1, out success, 1);
           Debug.Assert(v < 3);
           v = wdl_to_dtz[v + 2];
         }
         else
         {
           // Otherwise, take dtz for the new position and correct by 1 ply.
-          v = -probe_dtz(in pos1, out success);
+          v = -probe_dtz(in pos1, out success, 1);
           if (v > 0) v++;
           else if (v < 0) v--;
         }
         // Make sure that a mating move gets value 1.
-        if (v == 2 && is_mate(in pos1))
+        if (v == 2 && is_mate(in pos1, MoveListAtDepth(1)))
         {
           v = 1;
         }
@@ -2385,7 +2445,8 @@ namespace Ceres.Chess.TBBackends.Fathom
         return false;
       }
 
-      TBMoveList moves = gen_moves(pos);
+      TBMoveList moves = new TBMoveList();
+      gen_moves(pos, moves);
       for (int i = 0; i < moves.NumMoves; i++)
       {
         FathomPos pos1 = default;
@@ -2404,7 +2465,7 @@ namespace Ceres.Chess.TBBackends.Fathom
       score = default;
 
       int success = 0;
-      int dtz = probe_dtz(pos, out success);
+      int dtz = probe_dtz(pos, out success, 0);
       if (success == 0)
       {
         if (!succeedWithIncompleteDTZInfo)
@@ -2413,7 +2474,7 @@ namespace Ceres.Chess.TBBackends.Fathom
         }
         else
         {
-          int wdlProbe = -probe_wdl(in pos, out success);
+          int wdlProbe = -probe_wdl(in pos, out success, 0);
           if (success == 0)
           {
             return 0; // total failure, also not available in WDL
@@ -2427,7 +2488,8 @@ namespace Ceres.Chess.TBBackends.Fathom
       }
 
       Span<short> scores = stackalloc short[MAX_MOVES];
-      TBMoveList moves0 = gen_moves(in pos);
+      TBMoveList moves0 = MoveListAtDepth(0);
+      gen_moves(in pos, moves0);
 
       int num_draw = 0;
       int j = 0;
@@ -2440,7 +2502,7 @@ namespace Ceres.Chess.TBBackends.Fathom
           continue;
         }
         int v = 0;
-        if (dtz > 0 && is_mate(in pos1))
+        if (dtz > 0 && is_mate(in pos1, MoveListAtDepth(1)))
         {
           v = 1;
         }
@@ -2448,7 +2510,7 @@ namespace Ceres.Chess.TBBackends.Fathom
         {
           if (pos1.Rule50 != 0)
           {
-            v = -probe_dtz(in pos1, out success);
+            v = -probe_dtz(in pos1, out success, 1);
             if (v > 0)
             {
               v++;
@@ -2460,7 +2522,7 @@ namespace Ceres.Chess.TBBackends.Fathom
           }
           else
           {
-            v = -probe_wdl(in pos1, out success);
+            v = -probe_wdl(in pos1, out success, 1);
             v = wdl_to_dtz[v + 2];
           }
         }
@@ -2480,7 +2542,7 @@ namespace Ceres.Chess.TBBackends.Fathom
 
             // DTZ failed, we can't definitively determine (because we don't know if 50 move rule will cause draw).
             // But since requested to return incomplete information, use a WDL probe as best guess for WDL status.
-            v = -probe_wdl(in pos1, out success);
+            v = -probe_wdl(in pos1, out success, 1);
             if (success == 0)
             {
               res = TB_SET_DTZ(res, ISyzygyEvaluatorEngine.DTZ_IF_DTZ_INDETERMINATE_WDL_UNKNOWN);
