@@ -235,28 +235,6 @@ public partial class MCGSBackup
 
 
   /// <summary>
-  /// Issues processor prefetch memory hint for child edge of parentNode at indexInParent.
-  /// </summary>
-  /// <param name="parentNode"></param>
-  /// <param name="indexInParent"></param>
-  private static void PrefetchChild(GNode parentNode, int indexInParent)
-  {
-    // Possibly start memory prefetch of parent edge.
-    if (MCGSParamsFixed.PrefetchCacheLevel != Prefetcher.CacheLevel.None)
-    {
-      Span<GEdgeHeaderStruct> parentsChildEdgeHeaders = parentNode.EdgeHeadersSpan;
-      unsafe
-      {
-        void* nodePtr = Unsafe.AsPointer(ref parentNode.EdgeStructAtIndexRef(parentsChildEdgeHeaders[indexInParent].EdgeStoreBlockIndex, indexInParent));
-        Prefetcher.PrefetchLevel1(nodePtr);
-
-        Debug.Assert(parentNode.ChildEdgeAtIndex(indexInParent).edgeStructPtr == nodePtr);
-      }
-    }
-  }
-
-
-  /// <summary>
   /// Determines the best/most appropriate backup mode to use
   /// given current search state.
   /// </summary>

@@ -132,12 +132,6 @@ public partial class MCGSBackup
           return;
         }
 
-        // Possibly initiate prefetch of our parent (for speed)
-        if (!parentNode.IsSearchRoot)
-        {
-          PrefetchChild(parentNode, visitPathRef.IndexOfChildInParent);
-        }
-
         // STEP 1: capture the W previously contributed upward by this edge before this update.
         int visitEdgeN = visitEdge.N;
         double priorEdgeW = visitEdgeN == 0 ? 0 : visitEdgeN * visitEdge.Q;
