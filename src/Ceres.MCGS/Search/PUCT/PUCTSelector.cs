@@ -32,7 +32,7 @@ using Ceres.MCGS.Search.Strategies;
 
 namespace Ceres.MCGS.Search.PUCT;
 
-public static class PUCTSelector
+public static partial class PUCTSelector
 {
   /// <summary>
   /// Internal class that holds the spans in which the child statistics are gathered.
@@ -43,12 +43,6 @@ public static class PUCTSelector
   /// Thread-local buffer for qWhenNoChildrenComposite to avoid per-call allocations.
   /// </summary>
   [ThreadStatic] static float[] qWhenNoChildrenBuffer;
-
-  /// <summary>
-  /// Thread-local double buffer receiving the RPO solver's output before it is narrowed into
-  /// qWhenNoChildrenBuffer (the solver and its shared helpers work in double).
-  /// </summary>
-  [ThreadStatic] static double[] rpoResultBuffer;
 
   /// <summary>
   /// Thread-local float copies of the (double) Q-uncertainty adjustment arrays, needed because
@@ -99,7 +93,6 @@ public static class PUCTSelector
     GatheredChildStats stats = gatherStats;
     return stats ?? (gatherStats = new GatheredChildStats());
   }
-
 
 
   /// <summary>
@@ -419,97 +412,6 @@ public static class PUCTSelector
       }
     }
     return -1;
-  }
-
-
-  /// <summary>
-  /// Per-child FPU computed via the unified RegularizedPolicyOptimum primitive.
-  /// Imputes parent-perspective Q for every child from the policy prior and any
-  /// observed q's, using the KL direction selected by ParamsSelect.RPOFPURegularization
-  /// (default ForwardKLSoftmax, matching legacy Boltzmann behavior).
-  ///
-  /// Anchor selection (forward-KL only; reverse-KL ignores the anchor mode):
-  ///   - If the top-policy child (index 0) is visited:
-  ///       MatchChild anchor with index 0, value = node.Q.
-  ///       Note: this preserves a legacy quirk where the anchor index is taken to
-  ///       be 0 (the top-policy child) regardless of which visited child has the
-  ///       most informative Q.  See earlier dead code computing 'bestIndex' for
-  ///       context.  Bug-for-bug preserved by request.
-  ///   - Otherwise (top-policy child unvisited):
-  ///       MatchValue anchor with value = node.Q, so E_mu[q_fill] = node.Q.
-  /// </summary>
-  private static float[] ApplyRPOImputedFPU(ParamsSelect paramsSelect, GNode node, GatheredChildStats stats, int numToProcess)
-  {
-    ReadOnlySpan<float> pSpan = stats.P.Span;
-    ReadOnlySpan<float> nSpan = stats.N.Span;
-    ReadOnlySpan<float> wSpan = stats.W.Span;
-
-    int numExpanded = node.NumEdgesExpanded;
-
-    // Build mu (normalization happens inside Solve), and q with NaN for unvisited children.
-    Span<double> mu = stackalloc double[numToProcess];
-    Span<double> qIn = stackalloc double[numToProcess];
-    for (int i = 0; i < numToProcess; i++)
-    {
-      mu[i] = pSpan[i];
-      qIn[i] = (i < numExpanded && nSpan[i] > 0) ? -wSpan[i] / nSpan[i] : double.NaN;
-    }
-
-    // Anchor VALUE is dispatched by FPU_QAnchorType (default ParentQ = node.Q,
-    // matching legacy behavior).  Anchor MODE selection (MatchChild vs MatchValue) is
-    // independent of the value and stays based on whether child 0 is visited - this
-    // affects only the q calibration formula's intercept, not the value being matched.
-    // The reverse-KL path ignores the anchor entirely (must be None there).
-    RPORegularization regularization = paramsSelect.RPOFPURegularization;
-    double anchorValue = RPOImputation.ComputeImputationAnchor(paramsSelect.FPU_QAnchorType, node, qIn, numToProcess);
-    RPOAnchor anchor = regularization == RPORegularization.ReverseKL
-      ? RPOAnchor.None
-      : (nSpan[0] > 0
-          ? new RPOAnchor(RPOAnchorMode.MatchChild, 0, anchorValue)
-          : new RPOAnchor(RPOAnchorMode.MatchValue, -1, anchorValue));
-
-    double lambda = paramsSelect.PolicyImputationTau;
-    RPOOptions opts = new(bisectionIterations: 12,
-                          bisectionResidualTol: 1e-6,
-                          clampQ: true,
-                          minPriorProbability: 0.0);
-
-    // The solver works in double (shared with the CB-GPUCT prior); its output is narrowed into
-    // the float buffer the score kernel loads from.
-    double[] solved = rpoResultBuffer ??= new double[PUCTScoreCalcVector.MAX_CHILDREN];
-    Span<double> resultSpan = solved.AsSpan(0, numToProcess);
-
-    RegularizedPolicyOptimum.Solve(mu, qIn, lambda, anchor, regularization,
-                                   yOut: default,
-                                   qFillOut: resultSpan,
-                                   out double _,
-                                   options: opts,
-                                   nanFallbackQ: node.Q);
-
-    // Cap Q values for unexpanded children to not exceed defaultFPU + 0.20.
-    double defaultFPU = paramsSelect.CalcQWhenNoChildren(node.IsSearchRoot, node.Q, stats.SumPVisited);
-    double maxQ = 0.20 + defaultFPU;
-    for (int i = numExpanded; i < numToProcess; i++)
-    {
-      double thisResult = solved[i] + paramsSelect.RPOFPUValue;
-      thisResult = Math.Clamp(thisResult, -1, 1);
-      solved[i] = thisResult > maxQ ? maxQ : thisResult;
-    }
-
-    float[] result = qWhenNoChildrenBuffer ??= new float[PUCTScoreCalcVector.MAX_CHILDREN];
-    for (int i = 0; i < numToProcess; i++)
-    {
-      result[i] = (float)solved[i];
-    }
-
-    if (FPUDumpDiagnostics.DEBUG_DUMP_FPU_CALCS)
-    {
-      FPUDumpDiagnostics.DumpFPURPO(node, pSpan, nSpan, wSpan, resultSpan,
-                                    numToProcess, numExpanded,
-                                    lambda, regularization, anchor, defaultFPU);
-    }
-
-    return result;
   }
 
 
