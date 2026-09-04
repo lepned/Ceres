@@ -59,6 +59,15 @@ public partial class MCGSBackup
   private int nextPathIndex;
 
   /// <summary>
+  /// Number of paths a backup worker claims per interlocked update.
+  ///
+  /// Claiming in chunks amortizes the atomic over several paths instead of paying it once
+  /// per path per worker. Kept small so that the tail of a batch cannot leave one worker
+  /// holding a long chunk while every other worker sits idle.
+  /// </summary>
+  private const int PATH_CLAIM_CHUNK = 8;
+
+  /// <summary>
   /// Cached value of ParamsSearch.TrackLeafValueVolatility
   /// (avoids re-traversing the property chain for every backed up path).
   /// </summary>
@@ -188,8 +197,12 @@ public partial class MCGSBackup
 
 
   /// <summary>
-  /// Worker loop for multi-threaded reduction backup; claims successive paths
+  /// Worker loop for multi-threaded reduction backup; claims successive chunks of paths
   /// from cachedPathsBuffer until all numPaths have been claimed.
+  ///
+  /// Backup order is immaterial: BackupReduced serializes each level under the parent's
+  /// NodeLockBlock and the path which drives a visit's counter to zero merges the
+  /// accumulated contributions of the others, so any interleaving yields the same result.
   /// </summary>
   /// <param name="numPaths"></param>
   /// <param name="strategy"></param>
@@ -200,13 +213,23 @@ public partial class MCGSBackup
   {
     while (true)
     {
-      int pathIndex = Interlocked.Increment(ref nextPathIndex) - 1;
-      if (pathIndex >= numPaths)
+      // Claim [chunkStart, chunkEnd), the block this add just reserved for this worker.
+      int chunkEnd = Interlocked.Add(ref nextPathIndex, PATH_CLAIM_CHUNK);
+      int chunkStart = chunkEnd - PATH_CLAIM_CHUNK;
+      if (chunkStart >= numPaths)
       {
         return;
       }
 
-      BackupReduced(strategy, cachedPathsBuffer[pathIndex], iterator.IteratorID);
+      if (chunkEnd > numPaths)
+      {
+        chunkEnd = numPaths; // final chunk, partially past the end of the batch
+      }
+
+      for (int pathIndex = chunkStart; pathIndex < chunkEnd; pathIndex++)
+      {
+        BackupReduced(strategy, cachedPathsBuffer[pathIndex], iterator.IteratorID);
+      }
     }
   }
 
