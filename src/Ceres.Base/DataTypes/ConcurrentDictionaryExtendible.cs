@@ -17,7 +17,6 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Numerics;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Threading;
@@ -74,7 +73,6 @@ public class ConcurrentDictionaryExtendible<TKey, TValue> : IConcurrentDictionar
   /// Returns the index within a bucket of the entry matching hashCode and key, or -1 if absent.
   /// Scans the hash array (vectorized where available) and compares keys only where a hash matched.
   /// </summary>
-  [MethodImpl(MethodImplOptions.AggressiveInlining)]
   static int FindIndex(int[] hashes, Entry[] entries, int count, int hashCode, TKey key)
   {
     int i = 0;
@@ -120,7 +118,6 @@ public class ConcurrentDictionaryExtendible<TKey, TValue> : IConcurrentDictionar
   /// Returns the smallest power-of-2 capacity that can hold <paramref name="count"/> entries,
   /// clamped to [INITIAL_BUCKET_CAPACITY .. BUCKET_CAPACITY].
   /// </summary>
-  [MethodImpl(MethodImplOptions.AggressiveInlining)]
   static int RightSizeCapacity(int count)
   {
     int cap = RoundUpPowerOf2(System.Math.Max(count, INITIAL_BUCKET_CAPACITY));
@@ -336,7 +333,6 @@ public class ConcurrentDictionaryExtendible<TKey, TValue> : IConcurrentDictionar
   /// <summary>
   /// Gets the bucket for a given hash code by masking with current directory size.
   /// </summary>
-  [MethodImpl(MethodImplOptions.AggressiveInlining)]
   Bucket GetBucket(int hashCode)
   {
     Bucket[] dir = Volatile.Read(ref directory);
