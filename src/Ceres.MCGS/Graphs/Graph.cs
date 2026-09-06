@@ -165,6 +165,15 @@ public unsafe partial class Graph : IDisposable
   internal IConcurrentDictionary<PosHash96MultisetFinalized, int> transpositionPositionAndSequence;
 
   /// <summary>
+  /// If the 96-bit position+sequence dictionary above exists for this graph.
+  ///
+  /// It is absent in MCTS mode (no graph at all) and in the single-dictionary PositionEquivalence
+  /// mode, where dedup runs entirely through the 64-bit standalone dictionary. Callers use this
+  /// to skip computing a key that nothing would look up.
+  /// </summary>
+  internal bool HasPositionAndSequenceDictionary => transpositionPositionAndSequence != null;
+
+  /// <summary>
   /// Dictionary mapping hash to NodeIndexSetIndex (reference to set of nodes with same standalone hash).
   /// </summary>
   public IConcurrentDictionary<PosHash64WithMove50AndReps, GNodeIndexSetIndex> transpositionsPosStandalone;
@@ -1367,7 +1376,9 @@ public unsafe partial class Graph : IDisposable
     Span<float> nInFlightAdjusted = stats.NInFlightAdjusted.Span;
     Span<float> p = stats.P.Span;
     Span<float> w = stats.W.Span;
-    Span<float> uv = stats.UV.Span;
+    // Only bound when their consumer is enabled; see GatheredChildStats.GATHER_UNCERTAINTY.
+    Span<float> uv = GatheredChildStats.GATHER_UNCERTAINTY ? stats.UV.Span : default;
+    Span<float> up = GatheredChildStats.GATHER_UNCERTAINTY ? stats.UP.Span : default;
 #if ACTION_ENABLED
     Span<float> a = stats.A.Span;
 #endif
@@ -1410,8 +1421,13 @@ public unsafe partial class Graph : IDisposable
 #if ACTION_ENABLED
         a[i] = (float)childEdgeHeaders[i].ActionV; // Read from header (survives expansion; edge struct has no storage)
 #endif
-        // Extract value uncertainty with fill-in if missing
-        uv[i] = (float)refEdge.UncertaintyV;
+        if (GatheredChildStats.GATHER_UNCERTAINTY)
+        {
+          // N.B. UP is filled here as well. It never was before, so the (disabled) consumer
+          //      would have read zeros for policy uncertainty had it been switched on.
+          uv[i] = refEdge.UncertaintyV;
+          up[i] = refEdge.UncertaintyP;
+        }
 
         // W is accumulated in double and narrowed once: Q is double and N can be large, so forming
         // the product in float first would lose more than the final rounding does.
@@ -1436,7 +1452,11 @@ public unsafe partial class Graph : IDisposable
 #if ACTION_ENABLED
         a[i] = (float)childEdgeHeaders[i].ActionV;
 #endif
-        uv[i] = 0;
+        if (GatheredChildStats.GATHER_UNCERTAINTY)
+        {
+          uv[i] = 0;
+          up[i] = 0;
+        }
         w[i] = 0;
         nInFlightAdjusted[i] = 0;
         sumVisitedThisChild = 0;

@@ -1300,13 +1300,17 @@ public class MCGSSelect
         ? PosHash96MultisetRunning.EpochStartFinalized(info.childPositionHash96)
         : path.RunningHash.Finalized(info.childPositionHash96);
     }
-    else
+    else if (path.Graph.HasPositionAndSequenceDictionary)
     {
       // Replace hash code with standalone hash so all edges map to a shared node.
       // Use extra available slot with another hash to reduce hash collision probability.
       int extraHash = HashCode.Combine(info.childPos.A, info.childPos.B, info.childPos.C, info.childPos.D);
       info.childPositionAndSequenceHashFinalized = new PosHash96MultisetFinalized((uint)extraHash, info.childPositionHash64.Hash);
     }
+    // Otherwise left default. The sole consumer of this field (Graph.AddEdgeToNewOrExistingNode)
+    // reads it only to key the 96-bit position+sequence dictionary, so with no such dictionary the
+    // hash was computed per child and then discarded. Testing for the dictionary rather than for
+    // the mode keeps this correct should SINGLE_DICTIONARY_POSITION_MODE ever be turned back off.
 
     // Update repetition count in position (including considering prehistory)
     info.positionDuplicate = path.HashFoundInHistoryOrPrehistory(info.childPositionHash64);
