@@ -1327,8 +1327,20 @@ extern "C"
     // honor the ONNX/QDQ types exactly (like ORT) instead of re-deriving precisions and
     // discarding dequant scales on outlier tensors (which corrupts the value head).
     // No precision flags / calibrator / pins apply — the Q/DQ nodes drive everything.
-    const bool stronglyTyped = OnnxNeedsStrongTyping(onnxBlob.data(), onnxBlob.size())
-                               || opts->useInt8 || opts->useFP8;
+    // 2026-09-09: INT8=true REQUIRES a QDQ graph. It used to be a strong-typing trigger on its
+    // own, which on a plain FP16 graph silently produced a strongly-typed FP16 engine with the
+    // FP32 norm/softmax pins dropped (the pre-norm overflow case) instead of INT8. Now the
+    // Q/DQ detection decides the build and INT8 without Q/DQ is refused up front; the implicit
+    // .calib calibrator path below is thereby retired (unreachable, kept for reference).
+    const bool onnxQDQ = OnnxNeedsStrongTyping(onnxBlob.data(), onnxBlob.size());
+    if (opts->useInt8 && !onnxQDQ)
+    {
+      SetError("INT8=true but the ONNX carries no QuantizeLinear/DequantizeLinear nodes: INT8 serving needs an "
+               "explicit-quantization (QDQ) graph (CeresTrain scripts/qdq_export.py --precision int8, then "
+               "qdq_to_fp16.py). The implicit .calib calibrator path is retired. Drop INT8=true to build this file in FP16.");
+      return nullptr;
+    }
+    const bool stronglyTyped = onnxQDQ || opts->useFP8;
     const uint32_t netFlags = stronglyTyped
       ? (1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED)) : 0U;
     if (stronglyTyped)
@@ -3691,8 +3703,16 @@ extern "C"
     // honor the ONNX/QDQ types exactly (like ORT) instead of re-deriving precisions and
     // discarding dequant scales on outlier tensors (which corrupts the value head).
     // (ORT-simulated INT8 preserves value 100%; standard TRT build collapses it.)
-    const bool stronglyTyped = OnnxNeedsStrongTyping(onnxBlob.data(), onnxBlob.size())
-                               || opts->useInt8 || opts->useFP8;
+    // 2026-09-09: INT8=true REQUIRES a QDQ graph (see the single-profile path for the rationale).
+    const bool onnxQDQ = OnnxNeedsStrongTyping(onnxBlob.data(), onnxBlob.size());
+    if (opts->useInt8 && !onnxQDQ)
+    {
+      SetError("INT8=true but the ONNX carries no QuantizeLinear/DequantizeLinear nodes: INT8 serving needs an "
+               "explicit-quantization (QDQ) graph (CeresTrain scripts/qdq_export.py --precision int8, then "
+               "qdq_to_fp16.py). The implicit .calib calibrator path is retired. Drop INT8=true to build this file in FP16.");
+      return -20;
+    }
+    const bool stronglyTyped = onnxQDQ || opts->useFP8;
     const uint32_t netFlags = stronglyTyped
       ? (1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED)) : 0U;
     if (stronglyTyped)

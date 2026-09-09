@@ -412,19 +412,14 @@ public class NNEvaluatorTensorRT : NNEvaluator
 
     if (forceInt8)
     {
-      // INT8 + FP16 mixed precision: TRT's INT8 calibrator picks per-tensor
-      // INT8 ranges from the loaded cache and selects layer precision
-      // accordingly (INT8 where ranges are good, FP16 elsewhere). Requires a
-      // TRT calibration cache at "<onnxPath>.calib" — the C++ wrapper reads
-      // it and fails the build with a clear error if missing.
-      //
-      // Keep FP32 norm/softmax markers ON — measured behavior with them off
-      // in Ceres' multi-profile build is much worse than expected (puzzle
-      // accuracy collapses to ~0.5%). With them on we land at ~37% pol acc,
-      // still below int8_validate.py's 99.69% top-1 baseline but at least
-      // runnable. The single-profile script doesn't need the markers because
-      // it's a different code path entirely. Diagnosis WIP — see TODO.
-      // options.UseInt8 = 1;  // TEMP-DISABLED: wrapper DLL update unpushed; restore after pushing UseInt8 field on TensorRTBuildOptions.
+      // INT8 = explicit-quantization (QDQ) ONNX. The C++ wrapper detects the Q/DQ nodes and
+      // builds a STRONGLY-TYPED network (precision from the ONNX types: INT8 GEMMs where the
+      // graph says so, FP16 elsewhere; no calibrator, no FP32 norm/softmax pins), and refuses
+      // INT8=true on a graph WITHOUT Q/DQ nodes with a clear error. UseInt8 additionally keys
+      // the engine cache so INT8 and FP16 engines of the same file never collide.
+      // (2026-09-09: restored — it had been TEMP-DISABLED while the wrapper DLL lacked the
+      // field, and the flag was decorative since; the Q/DQ auto-detection did the work.)
+      options.UseInt8 = 1;
       options.UseFP16 = 1;
       options.UseBF16 = 0;
     }
@@ -453,7 +448,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
 
     options.Validate();
 
-    Console.WriteLine($"  Build options: FP16={options.UseFP16}, BF16={options.UseBF16}, /* INT8=TEMP-DISABLED, */ FP32PostAttentionNorm={options.FP32PostAttentionNorm}, FP32Softmax={options.FP32Softmax}, FP32AllNorms={options.FP32AllNorms}, UseCUDAGraphs={options.UseCudaGraphs}");
+    Console.WriteLine($"  Build options: FP16={options.UseFP16}, BF16={options.UseBF16}, INT8={options.UseInt8}, FP32PostAttentionNorm={options.FP32PostAttentionNorm}, FP32Softmax={options.FP32Softmax}, FP32AllNorms={options.FP32AllNorms}, UseCUDAGraphs={options.UseCudaGraphs}");
 
     const int MIN_BATCH_SIZE_PER_GPU = 6;
 
