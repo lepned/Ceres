@@ -1403,17 +1403,42 @@ public unsafe partial class Graph : IDisposable
     int numEdgesExpanded = node.NumEdgesExpanded;
     bool isIteratorIDZero = iteratorID == 0;
 
+    // Prefetch the edge blocks the loop below will read. Their block indices are in the
+    // header block (already loaded), so these misses can all be outstanding at once rather
+    // than one at a time. The up-front burst is capped to stay within the line fill buffer
+    // capacity; beyond the cap the loop below falls back to prefetching one block ahead.
+    // (Block 0 is normally already in flight, see MCGSParamsFixed.PREFETCH_SELECT_FIRST_EDGE_BLOCK,
+    // in which case its prefetch here is a cache hit.)
+    const bool PREFETCH = MCGSParamsFixed.PrefetchCacheLevel != Prefetcher.CacheLevel.None;
+    int numExpandedToRead = Math.Min(numEdgesExpanded, maxIndex + 1);
+    int upfrontBound = 0;
+    if (PREFETCH && MCGSParamsFixed.PREFETCH_GATHER_ALL_EDGE_BLOCKS)
+    {
+      const int MAX_UPFRONT_EDGES = 8 * GEdgeStore.NUM_EDGES_PER_BLOCK; // 8 blocks, at most 16 cache lines
+      upfrontBound = Math.Min(numExpandedToRead, MAX_UPFRONT_EDGES);
+      for (int i = 0; i < upfrontBound; i += GEdgeStore.NUM_EDGES_PER_BLOCK)
+      {
+        byte* block = (byte*)Unsafe.AsPointer(ref node.EdgeStructAtIndexRef(childEdgeHeaders[i].EdgeStoreBlockIndex, 0));
+        Prefetcher.PrefetchLevel1(block);
+        if (i + 2 < numExpandedToRead)
+        {
+          Prefetcher.PrefetchLevel1(block + 64); // second cache line of the block (edges 2 and 3)
+        }
+      }
+    }
+
     for (int i = 0; i <= maxIndex; i++)
     {
-      // Possibly start prefetching edge data future child blocks
+      // Possibly start prefetching the edge block one block ahead (only beyond the up-front window above).
       const int NUM_BLOCKS_PREFETCH_AHEAD = 1;
       int prefetchI = i + NUM_BLOCKS_PREFETCH_AHEAD * GEdgeStore.NUM_EDGES_PER_BLOCK;
-      if (MCGSParamsFixed.PrefetchCacheLevel != Prefetcher.CacheLevel.None
-        && prefetchI % GEdgeStore.NUM_EDGES_PER_BLOCK == 0
-       && prefetchI < numEdgesExpanded)
+      if (PREFETCH
+       && prefetchI % GEdgeStore.NUM_EDGES_PER_BLOCK == 0
+       && prefetchI >= upfrontBound
+       && prefetchI < numExpandedToRead)
       {
-        void* nodePtr = Unsafe.AsPointer(ref node.EdgeStructAtIndexRef(childEdgeHeaders[prefetchI].EdgeStoreBlockIndex, 0));
-        Prefetcher.PrefetchLevel1(nodePtr);
+        void* blockPtr = Unsafe.AsPointer(ref node.EdgeStructAtIndexRef(childEdgeHeaders[prefetchI].EdgeStoreBlockIndex, 0));
+        Prefetcher.PrefetchLevel1(blockPtr);
       }
 
 
