@@ -18,6 +18,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Threading;
+using Ceres.Base.Threading;
 using Ceres.Base.DataTypes;
 using Ceres.Base.Math;
 using Ceres.Base.Misc;
@@ -119,7 +120,10 @@ public partial class MCGSIterator : IDisposable
   /// </summary>
   internal bool DisableTranspositionSufficiencyStop = false;
 
-  internal int numAllocatedPaths = 0;
+  /// <summary>
+  /// Number of paths allocated so far in the current batch (see AllocatedPath).
+  /// </summary>
+  internal PaddedInt32 numAllocatedPaths;
 
   /// <summary>
   /// Per-iterator pool of MGMoveList snapshots, reused across batches to avoid the per-new-node
@@ -132,7 +136,10 @@ public partial class MCGSIterator : IDisposable
   /// </summary>
   readonly MGMoveList[] moveListSnapshotPool;
 
-  internal int numMoveListSnapshotsAllocated = 0;
+  /// <summary>
+  /// Number of move list snapshots allocated so far in the current batch (see AllocatedMoveListSnapshot).
+  /// </summary>
+  internal PaddedInt32 numMoveListSnapshotsAllocated;
 
   const bool ENABLE_LOGGING = false;
   private static readonly TextWriter iteratorLogWriter
@@ -157,7 +164,7 @@ public partial class MCGSIterator : IDisposable
   /// <returns></returns>
   internal MCGSPath AllocatedPath(int? initialNumSlots = null)
   {
-    int pathIndex = Interlocked.Increment(ref numAllocatedPaths) - 1;
+    int pathIndex = Interlocked.Increment(ref numAllocatedPaths.Value) - 1;
     
     MCGSPath thisPath;   
     if (paths[pathIndex] == null)
@@ -185,7 +192,7 @@ public partial class MCGSIterator : IDisposable
   /// </summary>
   internal MGMoveList AllocatedMoveListSnapshot(MGMoveList source)
   {
-    int index = Interlocked.Increment(ref numMoveListSnapshotsAllocated) - 1;
+    int index = Interlocked.Increment(ref numMoveListSnapshotsAllocated.Value) - 1;
 
     MGMoveList list = moveListSnapshotPool[index];
     if (list == null)
@@ -200,8 +207,8 @@ public partial class MCGSIterator : IDisposable
 
   internal void ResetPaths()
   {
-    numAllocatedPaths = 0;
-    numMoveListSnapshotsAllocated = 0;
+    numAllocatedPaths.Value = 0;
+    numMoveListSnapshotsAllocated.Value = 0;
   }
 
 
@@ -872,11 +879,11 @@ public partial class MCGSIterator : IDisposable
          && numNNPathsBeyondPriorAlignmentPoint != 0 // not already aligned
          && numNNPathsBeyondPriorAlignmentPoint <= (nnBatchSizeAlignmentTarget / 2)// not already half the way to next alignment point
          && rootN > nnBatchSizeAlignmentTarget * 5 // graph size large relative to possible increment in batch size 
-         && numAllocatedPaths < Engine.Manager.ParamsSearch.Execution.MaxBatchSize - nnBatchSizeAlignmentTarget * 2) // not close to max batch size
+         && numAllocatedPaths.Value < Engine.Manager.ParamsSearch.Execution.MaxBatchSize - nnBatchSizeAlignmentTarget * 2) // not close to max batch size
         {
           int numFiller = (int)MathUtils.RoundedUp(numNNPaths, nnBatchSizeAlignmentTarget) - numNNPaths;
           numFiller = numFiller + numFiller / 3; // take a chance of over-requesting because typically some significant fraction of selected will be non-NN paths
-          int newBatchSizeTarget = numAllocatedPaths + numFiller;
+          int newBatchSizeTarget = numAllocatedPaths.Value + numFiller;
           RunSelectionPhase(newBatchSizeTarget);
         }
       }
@@ -970,7 +977,7 @@ public partial class MCGSIterator : IDisposable
     numVisitsToRequest = Math.Min(numVisitsToRequest, positionsBeforeHardBatchLimit);
 
     // Respect maximum batch size (in terms of allocated paths).
-    numVisitsToRequest = Math.Min(numVisitsToRequest, Engine.Manager.ParamsSearch.Execution.MaxBatchSize - numAllocatedPaths);
+    numVisitsToRequest = Math.Min(numVisitsToRequest, Engine.Manager.ParamsSearch.Execution.MaxBatchSize - numAllocatedPaths.Value);
 
     if (numVisitsToRequest <= 0)
     {
@@ -984,7 +991,7 @@ public partial class MCGSIterator : IDisposable
     PathsSet.NNEvalSlotLimit = capacity;
     try
     {
-      RunSelectionPhase(numAllocatedPaths + numVisitsToRequest);
+      RunSelectionPhase(numAllocatedPaths.Value + numVisitsToRequest);
     }
     finally
     {

@@ -341,7 +341,7 @@ public static unsafe class GraphRewriter
   {
     int numNodes = graph.NodesStore.NumTotalNodes;
     int edgeHeaderBlocksBefore = graph.EdgeHeadersStore.NextFreeBlockIndex;
-    int edgeBlocksBefore = graph.EdgesStore.nextFreeBlockIndex;
+    int edgeBlocksBefore = graph.EdgesStore.nextFreeBlockIndex.Value;
 
     // Compute edge-N threshold targeting the desired retention.
     int threshold = ComputeEdgeNThresholdForTargetRetention(graph, numNodes, targetRetentionFraction);
@@ -429,7 +429,7 @@ public static unsafe class GraphRewriter
                                t7 - t6a, t8 - t7, phase6aTime, phase6bTime, t8c - t8, t9 - t8c);
     return new RewriteResult(numNodes, graph.NodesStore.NumTotalNodes,
                              edgeHeaderBlocksBefore, graph.EdgeHeadersStore.NextFreeBlockIndex,
-                             edgeBlocksBefore, graph.EdgesStore.nextFreeBlockIndex,
+                             edgeBlocksBefore, graph.EdgesStore.nextFreeBlockIndex.Value,
                              t9 - t0, timings, memBefore, memAfter, numDeferred,
                              Outcome: RewriteOutcome.RewrittenSelective, RetentionFraction: retentionFraction);
   }
@@ -553,7 +553,7 @@ public static unsafe class GraphRewriter
 
     int numNodes = graph.NodesStore.NumTotalNodes;
     int edgeHeaderBlocksBefore = graph.EdgeHeadersStore.NextFreeBlockIndex;
-    int edgeBlocksBefore = graph.EdgesStore.nextFreeBlockIndex;
+    int edgeBlocksBefore = graph.EdgesStore.nextFreeBlockIndex.Value;
 
     // DIAGNOSTIC: Check for pre-existing Q corruption before any rewrite phase.
     if (VALIDATE_INLINE)
@@ -784,7 +784,7 @@ public static unsafe class GraphRewriter
                                t7 - t6a, t8 - t7, phase6aTime, phase6bTime, t8c - t8, t9 - t8c);
     return new RewriteResult(numNodes, graph.NodesStore.NumTotalNodes,
                              edgeHeaderBlocksBefore, graph.EdgeHeadersStore.NextFreeBlockIndex,
-                             edgeBlocksBefore, graph.EdgesStore.nextFreeBlockIndex,
+                             edgeBlocksBefore, graph.EdgesStore.nextFreeBlockIndex.Value,
                              t9 - t0, timings, memBefore, memAfter, numDeferred);
   }
 
@@ -1209,7 +1209,7 @@ public static unsafe class GraphRewriter
     }
 
     // Update the store's next free index.
-    graph.NodesStore.nextFreeIndex = nextFree;
+    graph.NodesStore.nextFreeIndex.Value = nextFree;
 
     // Handle state vectors if present.
     if (graph.Store.HasState && graph.Store.AllStateVectors != null)
@@ -1473,8 +1473,8 @@ public static unsafe class GraphRewriter
     // Bulk-zero freed edge blocks to prevent stale data when space is reused.
     // MemoryBufferOSStore is MemoryBufferOS<GEdgeStructBlocked> where each element
     // is already one block of NUM_EDGES_PER_BLOCK edges, so index in block units directly.
-    int oldNextFreeEdgeBlock = edgesStore.nextFreeBlockIndex;
-    edgesStore.nextFreeBlockIndex = nextFreeEdgeBlock;
+    int oldNextFreeEdgeBlock = edgesStore.nextFreeBlockIndex.Value;
+    edgesStore.nextFreeBlockIndex.Value = nextFreeEdgeBlock;
 
     long edgeClearStart = (long)nextFreeEdgeBlock;
     long edgeClearItems = (long)(oldNextFreeEdgeBlock - nextFreeEdgeBlock);
@@ -2717,7 +2717,7 @@ public static unsafe class GraphRewriter
     int numTotalRetained = numRetained + 1;
 
     // Reset NodeIndexSetStore.
-    graph.NodeIndexSetStore.nextFreeIndex = GNodeIndexSetStore.FIRST_ALLOCATED_INDEX;
+    graph.NodeIndexSetStore.nextFreeIndex.Value = GNodeIndexSetStore.FIRST_ALLOCATED_INDEX;
 
     // Reuse the dictionaries already present on the graph instead of allocating fresh ones. Clearing
     // in place retains their (already-grown) directory + bucket arrays, so the refill below does zero

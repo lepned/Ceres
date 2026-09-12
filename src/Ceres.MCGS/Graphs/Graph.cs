@@ -22,6 +22,7 @@ using System.Threading;
 using Ceres.Base.DataTypes;
 using Ceres.Base.Misc;
 using Ceres.Base.OperatingSystem;
+using Ceres.Base.Threading;
 using Ceres.Chess;
 using Ceres.Chess.MoveGen;
 using Ceres.Chess.Positions;
@@ -137,6 +138,22 @@ public unsafe partial class Graph : IDisposable
   internal readonly GNodeStruct* NodesBasePtr;
 
   /// <summary>
+  /// Cached pointer to the first edge block in the edge store
+  /// (each block holds GEdgeStore.NUM_EDGES_PER_BLOCK edges).
+  /// The underlying MemoryBufferOS reserves its full virtual range once and only
+  /// commits pages incrementally, so this address is fixed for the life of the store,
+  /// and the store is never replaced for a live Graph.
+  /// </summary>
+  internal readonly GEdgeStructBlocked* EdgeBlocksBasePtr;
+
+  /// <summary>
+  /// Cached pointer to the first edge header in the edge headers store
+  /// (headers are allocated in blocks of GEdgeHeadersStore.NUM_EDGE_HEADERS_PER_BLOCK).
+  /// Fixed for the life of the store (see EdgeBlocksBasePtr).
+  /// </summary>
+  internal readonly GEdgeHeaderStruct* EdgeHeadersBasePtr;
+
+  /// <summary>
   /// Boolean flag used for ad-hoc diagnostics/testing.
   /// </summary>
   public readonly bool TestFlag;
@@ -204,7 +221,21 @@ public unsafe partial class Graph : IDisposable
         transpositionsPosStandalone.Count);
 
 
-  public int NumLinksToExistingNodes;
+  /// <summary>
+  /// Count of edges created which linked to an already existing (transposition) node.
+  /// Kept on its own cache line: it is incremented from the parallel select workers
+  /// while those same workers read the cached base pointers on this object.
+  /// </summary>
+  PaddedInt32 numLinksToExistingNodes;
+
+  /// <summary>
+  /// Count of edges created which linked to an already existing (transposition) node.
+  /// </summary>
+  public int NumLinksToExistingNodes
+  {
+    get => numLinksToExistingNodes.Value;
+    set => numLinksToExistingNodes.Value = value;
+  }
 
   /// <summary>
   /// Stress-test knob: when the environment variable CERES_CHAOS_NONBLOCK contains '1',
@@ -243,11 +274,6 @@ public unsafe partial class Graph : IDisposable
 
 
   #region Local copies of store references (cache here for performance)
-
-  /// <summary>
-  // Reference to raw GEdgeHeaderStruct array cached here for fast access.
-  /// </summary>
-  readonly MemoryBufferOS<GEdgeHeaderStruct> edgeHeaderBufferOS;
 
   /// <summary>
   /// Underlying storage for tree nodes.
@@ -289,11 +315,7 @@ public unsafe partial class Graph : IDisposable
   #endregion
 
   public GEdgeHeaderStruct ChildEdgeHeaderAtIndex(int nodeBlockIndexIntoEdgeHeaderStore, int childIndex)
-  {
-    // TODO: simplify!
-    long offsetEdgeHeader = GEdgeHeadersStore.NUM_EDGE_HEADERS_PER_BLOCK * nodeBlockIndexIntoEdgeHeaderStore + childIndex;
-    return edgeHeaderBufferOS[offsetEdgeHeader];
-  }
+    => EdgeHeadersBasePtr[GEdgeHeadersStore.NUM_EDGE_HEADERS_PER_BLOCK * nodeBlockIndexIntoEdgeHeaderStore + childIndex];
 
 
   /// <summary>
@@ -331,6 +353,8 @@ public unsafe partial class Graph : IDisposable
     Store = new GraphStore(maxNodes, hasAction, hasState, graphEnabled, coalescedMode, tryEnableLargePages, priorHistory, maintainSiblingSets);
 
     NodesBasePtr = (GNodeStruct*)Unsafe.AsPointer(ref Store.NodesStore.nodes[0]);
+    EdgeBlocksBasePtr = (GEdgeStructBlocked*)Store.EdgesStore.RawMemory;
+    EdgeHeadersBasePtr = (GEdgeHeaderStruct*)Store.EdgeHeadersStore.RawMemory;
     NodesRootNodePtr = (GNodeStruct*)Unsafe.AsPointer(ref Store.NodesStore.nodes[GraphStore.ROOT_NODE_INDEX]);
     GraphRootNode = this[GraphStore.ROOT_NODE_INDEX];
     NodesWithOneVisitMayHaveDifferentQ = nodesWithOneVisitMayHaveDifferentQ;
@@ -346,7 +370,6 @@ public unsafe partial class Graph : IDisposable
     EdgeHeadersStore = Store.EdgeHeadersStore;
     EdgesStore = Store.EdgesStore;
     ParentsStore = Store.ParentsStore;
-    edgeHeaderBufferOS = Store.EdgeHeadersStore.Entries;
     NodeIndexSetStore = Store.NodeIndexSetStore;
   }
 
@@ -1065,7 +1088,7 @@ public unsafe partial class Graph : IDisposable
       }
       else
       {
-        NumLinksToExistingNodes++;
+        Interlocked.Increment(ref numLinksToExistingNodes.Value);
       }
     }
     else if (!wasCollision)
@@ -1189,13 +1212,7 @@ public unsafe partial class Graph : IDisposable
     // Rewrite the GEdgeHeaderStruct to point to this block
     edgeHeaderStructsSpan[indexOfChildInParent].SetAsExpandedToEdgeBlock(edgesStartBlockIndex);
 
-#if VERY_UNSAFE
-    ref GEdgeStructBlocked refBlock = ref Store.EdgesStore.edgeStoreMemoryBuffer[edgesStartBlockIndex];
-    return ref Unsafe.Add(ref Unsafe.As<GEdgeStructBlocked, GEdgeStruct>(ref refBlock), edgesIndexInBlock);
-#else
-    Span<GEdgeStruct> edgeSpanThisBlock = Store.EdgesStore.SpanAtBlockIndex(edgesStartBlockIndex);
-    return ref edgeSpanThisBlock[edgesIndexInBlock];
-#endif
+    return ref ((GEdgeStruct*)(EdgeBlocksBasePtr + edgesStartBlockIndex))[edgesIndexInBlock];
   }
 
 

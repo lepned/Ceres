@@ -145,7 +145,7 @@ public partial class MCGSBackup
     }
     nextPathIndex = 0;
 
-    int numBackupThreads = MaxConcurrentThreadsForPaths(iterator.numAllocatedPaths);
+    int numBackupThreads = MaxConcurrentThreadsForPaths(iterator.numAllocatedPaths.Value);
 
     if (numBackupThreads == 1)
     {
