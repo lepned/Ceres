@@ -118,7 +118,28 @@ namespace Ceres.Chess.TBBackends.Fathom
         v.Free();
       }
       allocatedPairsData.Clear();
+
+      // Unmap and close the tablebase files opened by open_tb. Nothing else holds a managed
+      // reference to them, and the AcquirePointer taken there must be released before the
+      // view is disposed. Table entries hold raw pointers into these views, so this is safe
+      // only because the caller (FathomTB.Release) is discarding the whole probe.
+      lock (mappedTableFiles)
+      {
+        foreach ((MemoryMappedFile file, MemoryMappedViewAccessor view) in mappedTableFiles)
+        {
+          view.SafeMemoryMappedViewHandle.ReleasePointer();
+          view.Dispose();
+          file.Dispose();
+        }
+        mappedTableFiles.Clear();
+      }
     }
+
+
+    /// <summary>
+    /// Tablebase files memory mapped by open_tb, retained so tb_free can release them.
+    /// </summary>
+    readonly List<(MemoryMappedFile File, MemoryMappedViewAccessor View)> mappedTableFiles = new();
 
     static readonly object initStaticsObj = new();
 
@@ -215,8 +236,16 @@ namespace Ceres.Chess.TBBackends.Fathom
     LOCK_INIT(tbMutex);
 #endif
 
-      int tbNumPiece;
-      int tbNumPawn = 0;
+      // Reset the table-population counters. These are static (read externally as
+      // FathomProbe.numWdl/numDtz) and were previously shadowed here by same-named locals,
+      // so they carried over from any earlier probe: on reinitialization the file counts
+      // were reported cumulatively and tbNumPiece/tbNumPawn kept climbing until they ran
+      // past the ends of pieceEntry/pawnEntry. Only one probe exists at a time
+      // (FathomTB holds a single static instance), so resetting here is safe.
+      tbNumPiece = 0;
+      tbNumPawn = 0;
+      numWdl = numDtm = numDtz = 0;
+
       TB_MaxCardinality = TB_MaxCardinalityDTM = 0;
 
 
@@ -1187,11 +1216,6 @@ namespace Ceres.Chess.TBBackends.Fathom
       MemoryMappedFile mmf;
       MemoryMappedViewAccessor mmView;
 
-      // TODO: release these files somewhere!
-      //mmView.Dispose();
-      //mmf.Dispose();
-
-
       mmf = MemoryMappedFile.CreateFromFile(fn, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
 
       mmView = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
@@ -1205,6 +1229,15 @@ namespace Ceres.Chess.TBBackends.Fathom
       {
         byte* ptr = default;
         mmView.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
+
+        // Retain the mapping so tb_free can unmap it; the returned pointer stays valid
+        // until then. Distinct tables initialize concurrently (each under its own
+        // per-entry lock), so the append must be synchronized.
+        lock (mappedTableFiles)
+        {
+          mappedTableFiles.Add((mmf, mmView));
+        }
+
         return ptr;
       }
 
