@@ -63,8 +63,6 @@ public class GEdgeStore
 
   /// <summary>
   /// Keep track of index of next available block.
-  /// Padded onto its own cache line: it is bumped (Interlocked) by every thread that allocates an
-  /// edge block and must not invalidate the line holding the read-mostly fields of this object.
   /// </summary>
   internal PaddedInt32 nextFreeBlockIndex = new() { Value = 1 }; // never allocate index 0 (null node)
 
