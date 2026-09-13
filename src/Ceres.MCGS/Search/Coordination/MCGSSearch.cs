@@ -131,6 +131,13 @@ public partial class MCGSSearch
   /// <param name="fixedSearchLimit"></param>
   /// <param name="gameStartingTimeLimitSeconds">starting time control of the current game (seconds),
   /// or null if unknown/not time-based; used only to resolve the default move overhead</param>
+  /// <summary>
+  /// Optional pre-resolved probe source (set by the owning engine so the farm's lifetime is
+  /// per engine, not per search); when null the coordinator resolves ProbeSourceID itself.
+  /// </summary>
+  public Ceres.Chess.Probing.IProbeSource ResolvedProbeSource;
+
+
   public void Search(NNEvaluatorSet nnEvaluators,
                      Graph graphToPossiblyReuse,
                      WorkerPool<ExtendPathsWorkerInfo>[] selectWorkerPools,
@@ -291,7 +298,8 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
                   gameMoveHistory, isFirstMoveOfGame,
                   forceNoTablebaseTerminals,
                   searchMovesTablebaseRestricted, priorMoves.FinalPosition.IsWhite,
-                  fixedSearchLimit, reusableNNBatches)
+                  fixedSearchLimit, reusableNNBatches,
+                  resolvedProbeSource: ResolvedProbeSource)
     {
       LastGameLimitInputs = gameLimitsInputs,
       LastGameLimitOutputs = gameLimitsOutputs
@@ -414,6 +422,11 @@ As a workaround, EvaluatorSygyzy will just return as if no hit.
       // (the one-shot PossiblyInitializeForOpponentGraphReuse will not re-run for this new graph).
       graphToUse.ReuseGraphProvider = priorReuseGraphProvider;
     }
+
+    // Per-graph (= per-engine) probe-stamp weight: see Graph.ProbeStampKappa. Set here, after the
+    // graph is definitively bound (PrepareGraphToUse may return null for an abandoned reuse, in
+    // which case a fresh graph was constructed just above).
+    graphToUse.ProbeStampKappa = paramsSelect.TPS_ProbeStampKappa;
 
     Manager.Engine = new MCGSEngine(Manager, selectWorkerPools, graphToUse, searchRootPathFromGraphRoot == null ? []
                                                                                               : [.. searchRootPathFromGraphRoot],

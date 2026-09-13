@@ -14,6 +14,7 @@
 #region Using directives
 
 using System;
+using System.Numerics.Tensors;
 using System.Threading.Tasks;
 using System.Runtime.CompilerServices;
 
@@ -399,6 +400,12 @@ namespace Ceres.Chess.NNEvaluators.CUDA
           Span<byte> valuesSource = batch.PosPlaneValues.Span;
           Span<float> valuesDest = Evaluator.inputOutput.InputBoardValues.AsSpan();
 
+          // Widen the plane values (byte) into the float input buffer for this whole range at once.
+          int valuesStart = rangeStart * NNBackendInputOutput.NUM_INPUT_PLANES;
+          int valuesCount = (rangeEnd - rangeStart) * NNBackendInputOutput.NUM_INPUT_PLANES;
+          TensorPrimitives.ConvertChecked<byte, float>(valuesSource.Slice(valuesStart, valuesCount),
+                                                       valuesDest.Slice(valuesStart, valuesCount));
+
           for (int i = rangeStart; i < rangeEnd; i++)
           {
             // Determine legal move list
@@ -450,14 +457,6 @@ namespace Ceres.Chess.NNEvaluators.CUDA
                 moveIndicesSpan[baseOffsetMoves + m] = (short)moveVal.IndexNeuralNet;
               }
             }
-
-            int baseOffset = i * NNBackendInputOutput.NUM_INPUT_PLANES;
-            for (int j = 0; j < NNBackendInputOutput.NUM_INPUT_PLANES; j++)
-            {
-              int offset = baseOffset + j;
-              valuesDest[offset] = valuesSource[offset];
-            }
-
           }
         });
     }
