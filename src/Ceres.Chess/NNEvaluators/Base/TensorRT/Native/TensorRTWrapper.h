@@ -38,27 +38,36 @@ extern "C"
   // Opaque handle to a TensorRT engine + context pair
   typedef void* TRT_EngineHandle;
 
-  // Build options for TensorRT engine
+  // Build options for TensorRT engine.
+  //
+  // Every engine is built as a STRONGLY-TYPED network (TensorRT 11 removed weak typing, and this
+  // wrapper builds that way on TensorRT 10 as well): precision comes exclusively from the dtypes
+  // in the ONNX file -- FP16 with explicit fp32 Cast islands around norms/softmax, or INT8/FP8
+  // through embedded QuantizeLinear/DequantizeLinear nodes. The fields marked IGNORED below no
+  // longer change the engine; they are kept, at their original offsets, so the struct stays
+  // binary-compatible with the C# TensorRTBuildOptions (LayoutKind.Sequential, int32 each).
+  // When an IGNORED field is set the wrapper logs one line at build time saying so (useFP16 excepted:
+  // it is the default and matches the FP16 export).
   struct TRT_BuildOptions
   {
     int32_t builderOptimizationLevel;  // 0-5, default 3
     int32_t tilingOptimizationLevel;   // -1 to use default, 0-5 otherwise
     int32_t useSpinWait;               // 1 = true (default), 0 = false
     int32_t useCudaGraphs;             // 1 = true, 0 = false (default)
-    int32_t useFP16;                   // 1 = true (default), 0 = false
-    int32_t useBF16;                   // 1 = true, 0 = false (default)
-    int32_t useFP8;                    // 1 = true, 0 = false (default)
-    int32_t useBest;                   // 1 = true, 0 = false (default) - use best precision
+    int32_t useFP16;                   // IGNORED for precision (the ONNX is FP16-typed already); still part of the engine-cache key
+    int32_t useBF16;                   // IGNORED (no BF16 builder flag; a BF16 engine needs a BF16-typed ONNX); still part of the cache key
+    int32_t useFP8;                    // Label/cache key only: FP8 comes from FP8 Q/DQ nodes in the ONNX (no builder flag)
+    int32_t useBest;                   // IGNORED (no precision-constraint flags); still part of the cache key
     int32_t minBatchSize;              // Min batch size for optimization profile (0 = use batchSize)
     int32_t optBatchSize;              // Optimal batch size for optimization profile (0 = use batchSize)
     int32_t maxBatchSize;              // Max batch size for optimization profile (0 = use batchSize)
-    int32_t fp32PostAttentionNorm;     // 1 = force FP32 for post-attention norm (ln1) layers, 0 = false (default)
-    int32_t fp32PostAttentionNormStrict; // 1 = stricter filter: only main encoder ln1, exclude smolgen ln1
-    int32_t fp32SmolgenNorm;           // 1 = only smolgen-related ln1 inside attention (the critical layers)
-    int32_t fp32Softmax;               // 1 = force FP32 for all Softmax layers, 0 = false (default)
-    int32_t fp32AllNorms;              // 1 = force FP32 for ALL norm chains (not just residual stream), 0 = false (default)
+    int32_t fp32PostAttentionNorm;     // IGNORED: fp32 norms are Cast islands in the ONNX export (not hashed)
+    int32_t fp32PostAttentionNormStrict; // IGNORED (not hashed)
+    int32_t fp32SmolgenNorm;           // IGNORED (not hashed)
+    int32_t fp32Softmax;               // IGNORED: fp32 softmax is a Cast island in the ONNX export (not hashed)
+    int32_t fp32AllNorms;              // IGNORED (not hashed)
     int32_t refittable;                // 1 = enable refit support (kREFIT_IDENTICAL), 0 = false (default)
-    int32_t useInt8;                   // 1 = enable INT8 + FP16 mixed precision, requires <onnxPath>.calib alongside the ONNX
+    int32_t useInt8;                   // 1 = INT8 export expected: the ONNX MUST carry INT8 Q/DQ nodes (build is refused otherwise); keys the cache
   };
 
   // Initialize build options with defaults
@@ -94,8 +103,12 @@ extern "C"
   TRT_API int32_t TRT_SaveEngine(TRT_EngineHandle handle, const char* enginePath);
 
   // Generate cache filename for given parameters. Caller must free returned string with TRT_FreeString.
-  // Format: {basename}_b{min}-{opt}-{max}_{gpuid}_trt{version}_{optionshash}.engine
+  // Format: {basename}_b{min}-{opt}-{max}_{gpuid}_trt{version}_st{onnxhash}_{optionshash}.engine
   // gpuid format: sm{major}{minor}_{smCount}sm (e.g., sm90_132sm for H100)
+  // st{onnxhash}: "strongly typed" marker + fingerprint of the ONNX content (size, first and last
+  // 1 MB), so a re-exported ONNX under the same name never reuses a stale engine and no engine
+  // cached by the former weakly-typed builds (names without this segment) is ever picked up.
+  // The multi-profile variant uses {basename}_mp{b1-b2-..}_{gpuid}_trt{version}_st{onnxhash}_{optionshash}.engine.
   TRT_API char* TRT_GenerateCacheFilename(const char* onnxPath, int32_t batchSize,
     const TRT_BuildOptions* options);
 

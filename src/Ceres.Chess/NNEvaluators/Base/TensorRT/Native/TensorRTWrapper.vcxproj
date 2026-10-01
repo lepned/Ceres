@@ -51,9 +51,12 @@
 
   <!-- Environment Variables for TensorRT and CUDA paths -->
   <!-- Set these environment variables or modify the paths below -->
+  <!-- NvInferMajor: major version of the TensorRT runtime libraries (nvinfer_<N>.lib /
+       nvonnxparser_<N>.lib): 10 for TensorRT 10.x, 11 for TensorRT 11.x. -->
   <PropertyGroup>
-    <CUDA_PATH Condition="'$(CUDA_PATH)'==''">C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.0</CUDA_PATH>
-    <TENSORRT_PATH Condition="'$(TENSORRT_PATH)'==''">C:\TensorRT-10.0</TENSORRT_PATH>
+    <CUDA_PATH Condition="'$(CUDA_PATH)'==''">C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9</CUDA_PATH>
+    <TENSORRT_PATH Condition="'$(TENSORRT_PATH)'==''">C:\Dev\TensorRT-10.15.1.29</TENSORRT_PATH>
+    <NvInferMajor Condition="'$(NvInferMajor)'==''">10</NvInferMajor>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -84,7 +87,7 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>$(CUDA_PATH)\lib\x64;$(TENSORRT_PATH)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>nvinfer.lib;nvonnxparser.lib;cudart.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>nvinfer_$(NvInferMajor).lib;nvonnxparser_$(NvInferMajor).lib;cudart.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -107,7 +110,7 @@
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>$(CUDA_PATH)\lib\x64;$(TENSORRT_PATH)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>nvinfer.lib;nvonnxparser.lib;cudart.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>nvinfer_$(NvInferMajor).lib;nvonnxparser_$(NvInferMajor).lib;cudart.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
 

@@ -21,10 +21,6 @@
 #include <cstdlib>
 #include <cstdint>
 #include <atomic>
-#include <unordered_map>
-#include <unordered_set>
-#include <utility>
-#include <algorithm>
 
 // Platform-specific includes for file stat
 #ifdef _WIN32
@@ -485,72 +481,6 @@ extern "C"
 
 } // end extern "C" (temporarily, for C++ helper functions below)
 
-// INT8 calibrator that ONLY reads a pre-computed calibration cache file
-// (typically produced offline by CeresTrain's scripts/int8_validate.py or
-// any IInt8EntropyCalibrator2-compatible tool). Never runs actual calibration
-// at engine-build time — getBatch() returns nullptr immediately, so TRT must
-// satisfy the calibration from the cache alone.
-//
-// File convention: "<onnxPath>.calib" next to the model file.
-// Format: TRT's IInt8EntropyCalibrator2 text format, e.g. emitted by
-//   IInt8EntropyCalibrator2::writeCalibrationCache(...).
-class CalibFromCacheFile : public nvinfer1::IInt8EntropyCalibrator2
-{
-public:
-  CalibFromCacheFile(const std::string& onnxPath)
-    : cachePath_(onnxPath + ".calib")
-  {
-    std::ifstream f(cachePath_, std::ios::binary);
-    if (f.good())
-    {
-      f.seekg(0, std::ios::end);
-      std::streamsize size = f.tellg();
-      f.seekg(0, std::ios::beg);
-      cache_.resize(static_cast<size_t>(size));
-      f.read(cache_.data(), size);
-      fprintf(stderr, "[TensorRT INT8] Loaded calibration cache: %s (%zu bytes)\n",
-              cachePath_.c_str(), cache_.size());
-    }
-  }
-
-  bool hasCache() const { return !cache_.empty(); }
-  const std::string& cachePath() const { return cachePath_; }
-
-  // Required IInt8Calibrator overrides.
-  // Returns the calibration-time batch size (must match what produced the
-  // cache file). The CeresTrain scripts/int8_validate.py uses batch=64; we
-  // hard-code that here so TRT's cache-vs-current-engine compatibility check
-  // passes. If a future calibration uses a different batch, this constant
-  // needs to match.
-  int32_t getBatchSize() const noexcept override { return 64; }
-
-  bool getBatch(void* /*bindings*/[], const char* /*names*/[], int32_t /*nbBindings*/) noexcept override
-  {
-    // No live calibration — return false immediately so TRT uses the cache.
-    return false;
-  }
-
-  const void* readCalibrationCache(size_t& length) noexcept override
-  {
-    if (cache_.empty())
-    {
-      length = 0;
-      return nullptr;
-    }
-    length = cache_.size();
-    return cache_.data();
-  }
-
-  void writeCalibrationCache(const void* /*cache*/, size_t /*length*/) noexcept override
-  {
-    // No-op: never rewrite the cache from runtime (this is deployment mode).
-  }
-
-private:
-  std::string cachePath_;
-  std::vector<char> cache_;
-};
-
 // Helper: print colored console message
 static void PrintColored(const char* color, const char* message)
 {
@@ -567,741 +497,8 @@ static void PrintGreen(const char* message)
   PrintColored("\033[32m", message);
 }
 
-// Helper: check if a layer name matches any normalization naming convention.
-static bool HasNormName(const char* layerName)
-{
-  std::string name(layerName);
-  return name.find("rms_norm") != std::string::npos
-    || name.find("ln1") != std::string::npos
-    || name.find("/ln2/") != std::string::npos
-    || name.find("qkvLN") != std::string::npos
-    || name.find("embedding_norm") != std::string::npos
-    || name.find("trunk_end_norm") != std::string::npos
-    || name.find("LayerNorm") != std::string::npos
-    || name.find("layer_norm") != std::string::npos
-    || name.find("rmsnorm") != std::string::npos;
-}
-
-// Check if a layer type performs actual computation (not just data/shape).
-static bool IsComputeLayerType(nvinfer1::LayerType type)
-{
-  return type == nvinfer1::LayerType::kELEMENTWISE
-    || type == nvinfer1::LayerType::kREDUCE
-    || type == nvinfer1::LayerType::kUNARY
-    || type == nvinfer1::LayerType::kNORMALIZATION;
-}
-
-// ---------------------------------------------------------------------------
-// Structural detection of decomposed RMSNorm chains (naming-independent).
-//
-// CeresTrain's ONNX exporter (save_model.py, _RMSNormPrimitive) lowers every
-// RMSNorm to primitive ops so the graph stays fused-op-free at opset < 23, and
-// casts the mean-of-squares reduction to fp32 to avoid fp16 overflow. Exported
-// via the TorchDynamo path, the resulting nodes carry GENERIC aten-op names
-// (node_pow_*, node_mean*, node_Sqrt_*, node_rsqrt_*, node_mul_*, node__to_copy*)
-// rather than module-scoped names -- so the substring tests in HasNormName no
-// longer see any norm token, the old name-based detection matches 0 layers, and
-// the reduction is left in fp16 (inf/NaN -> garbage accuracy). See the "Marked
-// 0/N layers as FP32" symptom.
-//
-// Rather than chase node names, detect each RMSNorm by its op signature, which is
-// stable regardless of naming:
-//
-//   X --(Cast fp32)--> Pow(2) --> ReduceMean --> Add(eps) --> Sqrt --> Reciprocal
-//        --> Mul(x32 * rsqrt) --(Cast fp16)--> Mul(* weight) --> ...
-//
-// The ReduceMean (kREDUCE) whose producer is the elementwise square is the anchor;
-// every RMSNorm has exactly one and the transformer body has no other reductions.
-// We collect the fp32-critical math span (square .. Mul(*rsqrt), stopping at the
-// fp16 downcast Cast) and classify the norm by walking back through the fp32 Cast
-// to the tensor being normalized:
-//   producer is a residual/skip Add  -> Residual (post-attention / FFN norm, marked broad)
-//   producer is a Reshape (per-head) -> QKV      (small dim, left fp16 unless scoped)
-//   producer is another elementwise  -> Smolgen  (attention ln1)
-//   anything else (e.g. embedding)   -> Other
-enum class DecomposedNormKind { Residual, QKV, Smolgen, Other };
-
-struct DecomposedNormChain
-{
-  DecomposedNormKind kind;
-  std::vector<int32_t> layers;   // compute layers to force to fp32
-};
-
-// Layers that are pure fp16<->fp32 conversions inserted around the norm math. The
-// backward walk skips these to reach the real producer; the forward collection stops
-// at them (the fp16 downcast marks the end of the fp32 span).
-static bool IsCastLikeLayer(const nvinfer1::ILayer* layer)
-{
-  if (layer->getType() == nvinfer1::LayerType::kCAST)
-    return true;
-  std::string n(layer->getName());
-  return n.find("to_copy") != std::string::npos
-    || n.find("castHelper") != std::string::npos
-    || n.find("ONNXTRT_") != std::string::npos;
-}
-
-// True if a name carries any token specific to the decomposed-RMSNorm op cluster.
-// Used only to corroborate a reduction as a norm when the producer's layer type is
-// unexpected; matching is deliberately narrow to avoid false positives.
-static bool ContainsNormOpToken(const char* name)
-{
-  std::string n(name);
-  return n.find("rms") != std::string::npos
-    || n.find("norm") != std::string::npos
-    || n.find("pow") != std::string::npos
-    || n.find("mean") != std::string::npos
-    || n.find("Sqrt") != std::string::npos
-    || n.find("rsqrt") != std::string::npos;
-}
-
-static std::vector<DecomposedNormChain> AnalyzeDecomposedRMSNorms(
-  const nvinfer1::INetworkDefinition* network, int32_t totalLayers)
-{
-  // producer: output tensor name -> producing layer index
-  std::unordered_map<std::string, int32_t> tensorProducer;
-  // consumers: input tensor name  -> consuming layer indices
-  std::unordered_map<std::string, std::vector<int32_t>> tensorConsumers;
-  for (int32_t i = 0; i < totalLayers; ++i)
-  {
-    auto* layer = network->getLayer(i);
-    for (int32_t j = 0; j < layer->getNbOutputs(); ++j)
-    {
-      auto* t = layer->getOutput(j);
-      if (t && t->getName())
-        tensorProducer[t->getName()] = i;
-    }
-    for (int32_t j = 0; j < layer->getNbInputs(); ++j)
-    {
-      auto* t = layer->getInput(j);
-      if (t && t->getName())
-        tensorConsumers[t->getName()].push_back(i);
-    }
-  }
-
-  auto producerOf = [&](const nvinfer1::ILayer* layer, int32_t inputIdx) -> int32_t
-  {
-    if (inputIdx >= layer->getNbInputs())
-      return -1;
-    auto* t = layer->getInput(inputIdx);
-    if (!t || !t->getName())
-      return -1;
-    auto it = tensorProducer.find(t->getName());
-    return it == tensorProducer.end() ? -1 : it->second;
-  };
-  // Follow input(0) backwards, skipping cast-like layers, to the real producer index.
-  auto realProducerOf = [&](int32_t layerIdx) -> int32_t
-  {
-    int32_t p = producerOf(network->getLayer(layerIdx), 0);
-    for (int guard = 0; p >= 0 && guard < 6; ++guard)
-    {
-      if (!IsCastLikeLayer(network->getLayer(p)))
-        break;
-      p = producerOf(network->getLayer(p), 0);
-    }
-    return p;
-  };
-
-  std::vector<DecomposedNormChain> chains;
-
-  for (int32_t i = 0; i < totalLayers; ++i)
-  {
-    auto* reduce = network->getLayer(i);
-    if (reduce->getType() != nvinfer1::LayerType::kREDUCE)
-      continue;
-
-    // Confirm this reduction is the mean-of-squares of an RMSNorm: its (cast-skipped)
-    // producer must be the elementwise square. This excludes any unrelated mean/sum.
-    int32_t sqIdx = realProducerOf(i);
-    if (sqIdx < 0)
-      continue;
-    auto* square = network->getLayer(sqIdx);
-    bool squareIsElementwise = (square->getType() == nvinfer1::LayerType::kELEMENTWISE);
-    if (!squareIsElementwise
-      && !ContainsNormOpToken(square->getName())
-      && !ContainsNormOpToken(reduce->getName()))
-      continue;
-
-    // Classify by the tensor being normalized: the square's (cast-skipped) input.
-    DecomposedNormKind kind = DecomposedNormKind::Other;
-    int32_t srcIdx = realProducerOf(sqIdx);
-    if (srcIdx >= 0)
-    {
-      auto* src = network->getLayer(srcIdx);
-      std::string sn(src->getName());
-      const bool srcIsAdd = (src->getType() == nvinfer1::LayerType::kELEMENTWISE)
-        && (sn.find("add") != std::string::npos
-          || sn.find("Add") != std::string::npos
-          || sn.find("skip") != std::string::npos);
-      const bool srcIsShuffle = (src->getType() == nvinfer1::LayerType::kSHUFFLE)
-        || sn.find("view") != std::string::npos
-        || sn.find("reshape") != std::string::npos
-        || sn.find("Reshape") != std::string::npos;
-      if (srcIsAdd)
-        kind = DecomposedNormKind::Residual;         // residual/skip stream norm
-      else if (srcIsShuffle)
-        kind = DecomposedNormKind::QKV;              // per-head q/k/v norm
-      else if (src->getType() == nvinfer1::LayerType::kELEMENTWISE)
-        kind = DecomposedNormKind::Smolgen;          // smolgen attention ln1
-      // else: embedding norm (fed by activation) etc. -> Other
-    }
-
-    // Collect the fp32-critical math span: the square + reduce, then forward through the
-    // norm's elementwise/unary chain (Add eps -> Sqrt -> Reciprocal -> Mul(*rsqrt)).
-    // Restrict to compute layer types and stop at the fp16 downcast Cast (and never
-    // cross a MatMul/Shuffle) so we cannot run into the next block's residual add.
-    std::unordered_set<int32_t> chainSet;
-    chainSet.insert(sqIdx);
-    chainSet.insert(i);
-    std::vector<int32_t> frontier = { i };
-    for (int depth = 0; depth < 8 && !frontier.empty(); ++depth)
-    {
-      std::vector<int32_t> next;
-      for (int32_t li : frontier)
-      {
-        auto* L = network->getLayer(li);
-        for (int32_t j = 0; j < L->getNbOutputs(); ++j)
-        {
-          auto* t = L->getOutput(j);
-          if (!t || !t->getName())
-            continue;
-          auto cit = tensorConsumers.find(t->getName());
-          if (cit == tensorConsumers.end())
-            continue;
-          for (int32_t ci : cit->second)
-          {
-            if (chainSet.count(ci))
-              continue;
-            auto ct = network->getLayer(ci)->getType();
-            if (ct == nvinfer1::LayerType::kELEMENTWISE
-              || ct == nvinfer1::LayerType::kUNARY
-              || ct == nvinfer1::LayerType::kREDUCE)
-            {
-              chainSet.insert(ci);
-              next.push_back(ci);
-            }
-            // kCAST / kSHUFFLE / kMATRIX_MULTIPLY / ...: boundary, do not cross.
-          }
-        }
-      }
-      frontier.swap(next);
-    }
-
-    DecomposedNormChain chain;
-    chain.kind = kind;
-    chain.layers.assign(chainSet.begin(), chainSet.end());
-    chains.push_back(std::move(chain));
-  }
-
-  return chains;
-}
-
-// Build set of residual-stream normalization layer indices.
-// For native kNORMALIZATION layers: mark only those fed by a residual Add.
-// For decomposed norms: find entry points on the residual stream, propagate
-// through the chain, but only mark compute layers (skip kCONSTANT, etc.).
-static std::unordered_set<int32_t> FindResidualStreamNormLayers(
-  const nvinfer1::INetworkDefinition* network, int32_t totalLayers)
-{
-  // Build producer map: tensor name -> producing layer index
-  std::unordered_map<std::string, int32_t> tensorProducer;
-  for (int32_t i = 0; i < totalLayers; ++i)
-  {
-    auto* layer = network->getLayer(i);
-    for (int32_t j = 0; j < layer->getNbOutputs(); ++j)
-    {
-      auto* tensor = layer->getOutput(j);
-      if (tensor && tensor->getName())
-      {
-        tensorProducer[tensor->getName()] = i;
-      }
-    }
-  }
-
-  // Count native kNORMALIZATION layers
-  int nativeNormCount = 0;
-  for (int32_t i = 0; i < totalLayers; ++i)
-  {
-    if (network->getLayer(i)->getType() == nvinfer1::LayerType::kNORMALIZATION)
-      nativeNormCount++;
-  }
-
-  std::unordered_set<int32_t> residualNormLayers;
-
-  if (nativeNormCount > 0)
-  {
-    // Path A: native kNORMALIZATION layers exist - mark only those on residual stream
-    for (int32_t i = 0; i < totalLayers; ++i)
-    {
-      auto* layer = network->getLayer(i);
-      if (layer->getType() != nvinfer1::LayerType::kNORMALIZATION)
-        continue;
-
-      auto* inputTensor = layer->getInput(0);
-      if (!inputTensor || !inputTensor->getName())
-        continue;
-
-      auto it = tensorProducer.find(inputTensor->getName());
-      if (it == tensorProducer.end())
-        continue;
-
-      auto* producer = network->getLayer(it->second);
-      for (int depth = 0; depth < 5; ++depth)
-      {
-        std::string rpName(producer->getName());
-        if (rpName.find("ONNXTRT_") != std::string::npos
-          || rpName.find("castHelper") != std::string::npos)
-        {
-          auto* rpInput = producer->getInput(0);
-          if (rpInput && rpInput->getName())
-          {
-            auto rpIt = tensorProducer.find(rpInput->getName());
-            if (rpIt != tensorProducer.end())
-            {
-              producer = network->getLayer(rpIt->second);
-              continue;
-            }
-          }
-        }
-        break;
-      }
-
-      std::string realName(producer->getName());
-      bool isResidualAdd = (producer->getType() == nvinfer1::LayerType::kELEMENTWISE)
-        && (realName.find("add") != std::string::npos
-          || realName.find("Add") != std::string::npos
-          || realName.find("skip") != std::string::npos);
-
-      if (isResidualAdd)
-      {
-        residualNormLayers.insert(i);
-      }
-    }
-    fprintf(stderr, "[TensorRT] Found %d native kNORMALIZATION layers, %d on residual stream\n",
-      nativeNormCount, (int)residualNormLayers.size());
-  }
-  else
-  {
-    // Path B: decomposed norms. Prefer structural detection (handles the generic
-    // aten-op node names emitted by the TorchDynamo exporter, where HasNormName sees
-    // nothing). Only the residual-stream norms are marked here; smolgen norms come
-    // from the separate fp32AllNorms(scope=3) pass, and per-head QKV norms are left
-    // in fp16 (small reduction dim, no overflow).
-    auto decomposed = AnalyzeDecomposedRMSNorms(network, totalLayers);
-    if (!decomposed.empty())
-    {
-      int nRes = 0, nQKV = 0, nSmol = 0, nOther = 0;
-      for (const auto& c : decomposed)
-      {
-        switch (c.kind)
-        {
-        case DecomposedNormKind::Residual: nRes++;   break;
-        case DecomposedNormKind::QKV:      nQKV++;    break;
-        case DecomposedNormKind::Smolgen:  nSmol++;   break;
-        default:                           nOther++;  break;
-        }
-      }
-      // Safety: if classification found no residual norms at all (structure differs
-      // from what we expect) fall back to marking every detected norm chain -- upcasting
-      // extra norms only costs a little speed, but missing one corrupts accuracy.
-      const bool markAll = (nRes == 0);
-      for (const auto& c : decomposed)
-      {
-        if (markAll || c.kind == DecomposedNormKind::Residual)
-        {
-          for (int32_t li : c.layers)
-            residualNormLayers.insert(li);
-        }
-      }
-      fprintf(stderr, "[TensorRT] Decomposed norms (structural): %d residual + %d QKV + %d smolgen "
-        "+ %d other norms; marked %d compute layers on residual stream%s\n",
-        nRes, nQKV, nSmol, nOther, (int)residualNormLayers.size(),
-        markAll ? " (fallback: all norms, no residual class found)" : "");
-      return residualNormLayers;
-    }
-
-    // Legacy fallback: name-based detection for nets whose norm nodes carry
-    // module-scoped names (rms_norm.../ln1/...) recognized by HasNormName.
-    // Pass 1: find entry-point norm layers fed by residual Add
-    for (int32_t i = 0; i < totalLayers; ++i)
-    {
-      auto* layer = network->getLayer(i);
-      if (!HasNormName(layer->getName()))
-        continue;
-
-      auto* inputTensor = layer->getInput(0);
-      if (!inputTensor || !inputTensor->getName())
-        continue;
-
-      auto it = tensorProducer.find(inputTensor->getName());
-      if (it == tensorProducer.end())
-        continue;
-
-      auto* producer = network->getLayer(it->second);
-      bool producerIsNorm = HasNormName(producer->getName());
-      if (producerIsNorm)
-        continue;
-
-      auto* realProducer = producer;
-      for (int depth = 0; depth < 5; ++depth)
-      {
-        std::string rpName(realProducer->getName());
-        if (rpName.find("ONNXTRT_") != std::string::npos
-          || rpName.find("castHelper") != std::string::npos)
-        {
-          auto* rpInput = realProducer->getInput(0);
-          if (rpInput && rpInput->getName())
-          {
-            auto rpIt = tensorProducer.find(rpInput->getName());
-            if (rpIt != tensorProducer.end())
-            {
-              realProducer = network->getLayer(rpIt->second);
-              continue;
-            }
-          }
-        }
-        break;
-      }
-
-      std::string realName(realProducer->getName());
-      bool isResidualAdd = (realProducer->getType() == nvinfer1::LayerType::kELEMENTWISE)
-        && (realName.find("add") != std::string::npos
-          || realName.find("Add") != std::string::npos
-          || realName.find("skip") != std::string::npos);
-
-      if (isResidualAdd && IsComputeLayerType(layer->getType()))
-      {
-        residualNormLayers.insert(i);
-      }
-    }
-
-    int entryCount = (int)residualNormLayers.size();
-
-    // Pass 2: propagate through norm chain, only marking compute layers
-    bool changed = true;
-    while (changed)
-    {
-      changed = false;
-      for (int32_t i = 0; i < totalLayers; ++i)
-      {
-        if (residualNormLayers.count(i))
-          continue;
-        auto* layer = network->getLayer(i);
-        if (!HasNormName(layer->getName()))
-          continue;
-        if (!IsComputeLayerType(layer->getType()))
-          continue;
-
-        for (int32_t inp = 0; inp < layer->getNbInputs(); ++inp)
-        {
-          auto* inputTensor = layer->getInput(inp);
-          if (!inputTensor || !inputTensor->getName())
-            continue;
-          auto it = tensorProducer.find(inputTensor->getName());
-          if (it != tensorProducer.end() && residualNormLayers.count(it->second))
-          {
-            residualNormLayers.insert(i);
-            changed = true;
-            break;
-          }
-        }
-      }
-    }
-
-    fprintf(stderr, "[TensorRT] Decomposed norms: %d entry-point + %d chain = %d compute layers on residual stream\n",
-      entryCount, (int)residualNormLayers.size() - entryCount, (int)residualNormLayers.size());
-  }
-
-  return residualNormLayers;
-}
-
-
-// Build set of ALL normalization layer indices (not just residual stream).
-// Includes Q/K/V per-head norms, smolgen norms, and any other norm chains.
-// Norm scope values for fp32AllNorms:
-//   1 = all norms (Q/K/V + smolgen + residual + embedding)
-//   2 = Q/K/V per-head norms only (entry producer is kSHUFFLE from Reshape)
-//   3 = smolgen norms only (entry producer is non-residual kELEMENTWISE)
-//   4 = Q/K/V + smolgen (non-residual, excludes residual-stream norms)
-static std::unordered_set<int32_t> FindAllNormLayers(
-  const nvinfer1::INetworkDefinition* network, int32_t totalLayers, int32_t scope = 1)
-{
-  // Build producer map: tensor name -> producing layer index
-  std::unordered_map<std::string, int32_t> tensorProducer;
-  for (int32_t i = 0; i < totalLayers; ++i)
-  {
-    auto* layer = network->getLayer(i);
-    for (int32_t j = 0; j < layer->getNbOutputs(); ++j)
-    {
-      auto* tensor = layer->getOutput(j);
-      if (tensor && tensor->getName())
-      {
-        tensorProducer[tensor->getName()] = i;
-      }
-    }
-  }
-
-  // Count native kNORMALIZATION layers
-  int nativeNormCount = 0;
-  for (int32_t i = 0; i < totalLayers; ++i)
-  {
-    if (network->getLayer(i)->getType() == nvinfer1::LayerType::kNORMALIZATION)
-      nativeNormCount++;
-  }
-
-  std::unordered_set<int32_t> allNormLayers;
-
-  if (nativeNormCount > 0)
-  {
-    // Path A: native kNORMALIZATION - mark ALL of them (scope filtering not supported)
-    for (int32_t i = 0; i < totalLayers; ++i)
-    {
-      if (network->getLayer(i)->getType() == nvinfer1::LayerType::kNORMALIZATION)
-      {
-        allNormLayers.insert(i);
-      }
-    }
-    fprintf(stderr, "[TensorRT] AllNorms(scope=%d): %d native kNORMALIZATION layers\n",
-      scope, (int)allNormLayers.size());
-  }
-  else
-  {
-    // Path B: decomposed norms. Prefer structural detection (naming-independent) so the
-    // generic aten-op node names from the TorchDynamo exporter are handled. Select chains
-    // by scope, matching the legacy classification semantics below:
-    //   1 = all, 2 = QKV, 3 = smolgen, 4 = QKV+smolgen (residual is only ever in scope 1).
-    auto decomposed = AnalyzeDecomposedRMSNorms(network, totalLayers);
-    if (!decomposed.empty())
-    {
-      int cQKV = 0, cSmol = 0, cRes = 0, cOther = 0;
-      for (const auto& c : decomposed)
-      {
-        bool include = false;
-        switch (c.kind)
-        {
-        case DecomposedNormKind::QKV:      cQKV++;   include = (scope == 1 || scope == 2 || scope == 4); break;
-        case DecomposedNormKind::Smolgen:  cSmol++;  include = (scope == 1 || scope == 3 || scope == 4); break;
-        case DecomposedNormKind::Residual: cRes++;   include = (scope == 1); break;
-        default:                           cOther++; include = (scope == 1 || scope == 4); break;
-        }
-        if (include)
-        {
-          for (int32_t li : c.layers)
-            allNormLayers.insert(li);
-        }
-      }
-      fprintf(stderr, "[TensorRT] AllNorms(scope=%d) structural: %d QKV + %d smolgen + %d residual "
-        "+ %d other norms -> %d layers\n",
-        scope, cQKV, cSmol, cRes, cOther, (int)allNormLayers.size());
-      return allNormLayers;
-    }
-
-    // Legacy fallback: name/index-based detection for module-scoped rms_norm names.
-    // Pre-scan: find max sequential ONNX norm index to distinguish from TRT suffixes.
-    // ONNX norms are numbered 0,1,2,...,N-1 sequentially. TRT decomposition creates
-    // additional layers with large suffix numbers (typically > N).
-    // Collect all numbers from rms_norm layer names, find the longest sequential run from 0.
-    std::vector<int> allNormNumbers;
-    for (int32_t i = 0; i < totalLayers; ++i)
-    {
-      auto* layer = network->getLayer(i);
-      std::string name(layer->getName());
-      auto pos = name.find("rms_norm");
-      if (pos == std::string::npos)
-        continue;
-      size_t numStart = pos + 8;
-      if (numStart < name.size() && name[numStart] == '_')
-        numStart++;
-      std::string numStr;
-      while (numStart < name.size() && name[numStart] >= '0' && name[numStart] <= '9')
-        numStr += name[numStart++];
-      if (!numStr.empty())
-        allNormNumbers.push_back(std::stoi(numStr));
-      else
-        allNormNumbers.push_back(0); // bare "rms_norm" = ONNX index 0
-    }
-    // Find max ONNX index: largest N such that all of 0..N appear in the set.
-    std::unordered_set<int> normNumberSet(allNormNumbers.begin(), allNormNumbers.end());
-    int maxOnnxNormIdx = -1;
-    for (int n = 0; normNumberSet.count(n); ++n)
-      maxOnnxNormIdx = n;
-
-    int countQKV = 0, countSmolgen = 0, countResidual = 0, countOther = 0;
-
-    for (int32_t i = 0; i < totalLayers; ++i)
-    {
-      auto* layer = network->getLayer(i);
-      if (!HasNormName(layer->getName()))
-        continue;
-      if (!IsComputeLayerType(layer->getType()))
-        continue;
-
-      // Check if this is an entry point (producer is not a norm layer)
-      auto* inputTensor = layer->getInput(0);
-      if (!inputTensor || !inputTensor->getName())
-      {
-        countOther++;
-        if (scope == 1) allNormLayers.insert(i);
-        continue;
-      }
-      auto it = tensorProducer.find(inputTensor->getName());
-      if (it == tensorProducer.end())
-      {
-        countOther++;
-        if (scope == 1) allNormLayers.insert(i);
-        continue;
-      }
-      auto* producer = network->getLayer(it->second);
-      if (HasNormName(producer->getName()))
-        continue; // Not an entry point
-
-      // Classify entry point by producer type and norm index
-      auto prodType = producer->getType();
-      std::string prodName(producer->getName());
-      std::string entryName(layer->getName());
-
-      bool isResidualAdd = (prodType == nvinfer1::LayerType::kELEMENTWISE)
-        && (prodName.find("add") != std::string::npos
-          || prodName.find("Add") != std::string::npos
-          || prodName.find("skip") != std::string::npos);
-
-      // Extract ONNX norm index from TRT layer name.
-      // TRT names decomposed layers: "node_rms_norm[_N][_TRT_SUFFIX]"
-      // ONNX indices are sequential 0..maxOnnxNormIdx; anything beyond is a TRT suffix.
-      // Pattern: norms 0=embedding, then per block: 3 QKV + 2 smolgen + 2 residual
-      int normIdx = -1;
-      auto pos = entryName.find("rms_norm");
-      if (pos != std::string::npos)
-      {
-        size_t numStart = pos + 8; // skip "rms_norm"
-        if (numStart < entryName.size() && entryName[numStart] == '_')
-          numStart++;
-        std::string numStr;
-        while (numStart < entryName.size() && entryName[numStart] >= '0' && entryName[numStart] <= '9')
-          numStr += entryName[numStart++];
-        if (!numStr.empty())
-        {
-          int parsed = std::stoi(numStr);
-          normIdx = (parsed <= maxOnnxNormIdx) ? parsed : 0;
-        }
-        else
-        {
-          normIdx = 0; // "rms_norm" without number = index 0
-        }
-      }
-
-      // Classify by ONNX norm index within block structure
-      // Block 0: norm_0=embedding, norm_1-3=QKV, norm_4-5=smolgen, norm_6-7=residual
-      // Block b (b>=1): norm_{1+7b}-{3+7b}=QKV, norm_{4+7b}-{5+7b}=smolgen, norm_{6+7b}-{7+7b}=residual
-      bool isQKV = false;
-      bool isSmolgen = false;
-      if (normIdx >= 0)
-      {
-        if (normIdx == 0)
-        {
-          // Embedding norm - treat as "other"
-        }
-        else
-        {
-          int blockOffset = (normIdx - 1) % 7; // 0-6 within block
-          isQKV = (blockOffset >= 0 && blockOffset <= 2); // first 3 in block
-          isSmolgen = (blockOffset >= 3 && blockOffset <= 4); // next 2 in block
-          // blockOffset 5-6 are residual
-        }
-      }
-
-      bool include = false;
-      if (isResidualAdd || (!isQKV && !isSmolgen && normIdx >= 0 && ((normIdx - 1) % 7) >= 5))
-      {
-        countResidual++;
-        include = (scope == 1);
-      }
-      else if (isQKV)
-      {
-        countQKV++;
-        include = (scope == 1 || scope == 2 || scope == 4);
-      }
-      else if (isSmolgen)
-      {
-        countSmolgen++;
-        include = (scope == 1 || scope == 3 || scope == 4);
-      }
-      else
-      {
-        countOther++;
-        include = (scope == 1 || scope == 4);
-      }
-
-      if (include)
-      {
-        allNormLayers.insert(i);
-      }
-    }
-
-    int entryCount = (int)allNormLayers.size();
-
-    // Propagate through norm chains from selected entry points
-    bool changed = true;
-    while (changed)
-    {
-      changed = false;
-      for (int32_t i = 0; i < totalLayers; ++i)
-      {
-        if (allNormLayers.count(i))
-          continue;
-        auto* layer = network->getLayer(i);
-        if (!HasNormName(layer->getName()))
-          continue;
-        if (!IsComputeLayerType(layer->getType()))
-          continue;
-
-        for (int32_t inp = 0; inp < layer->getNbInputs(); ++inp)
-        {
-          auto* inputTensor = layer->getInput(inp);
-          if (!inputTensor || !inputTensor->getName())
-            continue;
-          auto it = tensorProducer.find(inputTensor->getName());
-          if (it != tensorProducer.end() && allNormLayers.count(it->second))
-          {
-            allNormLayers.insert(i);
-            changed = true;
-            break;
-          }
-        }
-      }
-    }
-
-    fprintf(stderr, "[TensorRT] AllNorms(scope=%d): entries: %d QKV + %d smolgen + %d residual + %d other, "
-      "%d selected + %d chain = %d layers\n",
-      scope, countQKV, countSmolgen, countResidual, countOther,
-      entryCount, (int)allNormLayers.size() - entryCount, (int)allNormLayers.size());
-  }
-
-  return allNormLayers;
-}
-
-
-// Helper: strict mode - only match main encoder post-attention ln1
-// Matches: /transformer_layer.X/ln1/...
-// Excludes: /transformer_layer.X/attention/ln1/... (smolgen related)
-// NOTE: This is LC0-specific and does NOT cover Ceres-style nets.
-static bool IsPostAttentionNormLayerStrict(const char* layerName)
-{
-  std::string name(layerName);
-  return name.find("/ln1/") != std::string::npos &&
-    name.find("/attention/ln1/") == std::string::npos;
-}
-
-// Helper: smolgen mode - only match smolgen-related ln1 inside attention
-// Matches: /transformer_layer.X/attention/ln1/...
-// NOTE: This is LC0-specific and does NOT cover Ceres-style nets.
-static bool IsSmolgenNormLayer(const char* layerName)
-{
-  std::string name(layerName);
-  return name.find("/attention/ln1/") != std::string::npos;
-}
-
 // Read an entire file into memory. Returns false on open/read failure. Used so the ONNX
-// bytes are read from disk exactly once and then reused for both strong-typing detection
+// bytes are read from disk exactly once and then reused for both Q/DQ detection
 // and the TensorRT parse (parser->parse) -- nets are single-file with embedded weights,
 // so there are no external-data sidecars whose resolution would require parseFromFile.
 static bool ReadEntireFile(const char* path, std::vector<char>& out)
@@ -1316,12 +513,84 @@ static bool ReadEntireFile(const char* path, std::vector<char>& out)
   return true;
 }
 
+// Cheap content fingerprint of an ONNX file for the engine-cache key: FNV-1a over the file
+// size, its first 1 MB and its last 1 MB. The head covers the graph structure (nodes come
+// first in the GraphProto) plus the start of the weight section, the tail the end of it, so a
+// re-export under the same file name (new weights, new graph, new fp32 islands) changes the
+// key without hashing hundreds of MB on every load. Returns 0 if the file cannot be read.
+static uint64_t ComputeOnnxContentHash(const char* onnxPath)
+{
+  constexpr uint64_t kFnvOffset = 0xcbf29ce484222325ULL;  // FNV-1a 64-bit offset basis
+  constexpr uint64_t kFnvPrime = 1099511628211ULL;
+  constexpr std::streamsize kWindow = 1 << 20;
+
+  std::ifstream in(onnxPath, std::ios::binary | std::ios::ate);
+  if (!in) return 0;
+  const std::streamsize size = in.tellg();
+  if (size <= 0) return 0;
+
+  uint64_t h = kFnvOffset;
+  auto mix = [&h, kFnvPrime](const char* p, std::streamsize n)
+  {
+    for (std::streamsize i = 0; i < n; ++i)
+    {
+      h ^= static_cast<uint8_t>(p[i]);
+      h *= kFnvPrime;
+    }
+  };
+  const uint64_t sizeBits = static_cast<uint64_t>(size);
+  for (int i = 0; i < 8; ++i)
+  {
+    h ^= static_cast<uint8_t>(sizeBits >> (8 * i));
+    h *= kFnvPrime;
+  }
+
+  const std::streamsize head = (size < kWindow) ? size : kWindow;
+  std::vector<char> buf(static_cast<size_t>(head));
+  in.seekg(0);
+  if (!in.read(buf.data(), head)) return 0;
+  mix(buf.data(), head);
+  if (size > kWindow)
+  {
+    in.seekg(size - kWindow);
+    if (!in.read(buf.data(), kWindow)) return 0;
+    mix(buf.data(), kWindow);
+  }
+  return h;
+}
+
+// Every engine is built STRONGLY TYPED (TensorRT 11 removed weak typing), so precision comes
+// from the ONNX dtypes alone. The legacy manual-precision options stay in TRT_BuildOptions only
+// to keep the struct binary-compatible with the C# side; say so once per build when any of
+// them is set, so a caller is not left believing it took effect.
+static void LogIgnoredPrecisionOptions(const TRT_BuildOptions* opts, const char* pathLabel)
+{
+  std::string ignored;
+  auto add = [&ignored](const char* name)
+  {
+    if (!ignored.empty()) ignored += ", ";
+    ignored += name;
+  };
+  if (opts->useBF16) add("useBF16");
+  if (opts->useBest) add("useBest");
+  if (opts->fp32PostAttentionNorm) add("fp32PostAttentionNorm");
+  if (opts->fp32PostAttentionNormStrict) add("fp32PostAttentionNormStrict");
+  if (opts->fp32SmolgenNorm) add("fp32SmolgenNorm");
+  if (opts->fp32Softmax) add("fp32Softmax");
+  if (opts->fp32AllNorms) add("fp32AllNorms");
+  if (!ignored.empty())
+  {
+    fprintf(stderr, "[TensorRT] %s: build option(s) %s ignored -- strongly-typed build, precision comes "
+      "from the ONNX types (fp32 islands / Q-DQ are baked into the exported graph).\n",
+      pathLabel, ignored.c_str());
+  }
+}
+
 // Helper: detect explicit quantization (QuantizeLinear) in an in-memory ONNX model buffer.
-// TensorRT only honors FP8/FP4 QuantizeLinear/DequantizeLinear in a STRONGLY-TYPED network
-// (INT8 works weakly typed, but FP8/FP4 scale layers are silently ignored otherwise). Such
-// models are therefore built strongly typed, which also means builder precision flags and
-// manual setPrecision norm/softmax marking are skipped -- FP32 norms/softmax must be baked
-// into the ONNX instead.
+// Used to refuse INT8=true on a graph that carries no Q/DQ nodes (which would otherwise
+// silently build an FP16 engine labelled INT8) and for the build log line. Precision itself
+// is never derived from this: the network is always strongly typed and the Q/DQ nodes (or the
+// fp32 Cast islands of a plain FP16 export) carry it.
 //
 // Rather than scanning every byte (which, for the common non-quantized model, means reading
 // the whole weight section just to prove a negative), this walks the ONNX protobuf wire
@@ -1329,15 +598,8 @@ static bool ReadEntireFile(const char* path, std::vector<char>& out)
 // GraphProto.node (field 1) -> NodeProto.op_type (field 4). Initializer/weight blobs are
 // skipped via their length prefixes, so cost is proportional to graph structure, not weight
 // size, and an op_type match cannot be spoofed by a tensor or metadata name.
-static bool OnnxNeedsStrongTyping(const void* data, size_t size)
+static bool OnnxHasQDQ(const void* data, size_t size)
 {
-  // Explicit override (escape hatch): CERES_TRT_STRONGLY_TYPED=0 forces off, =1 forces on.
-  if (const char* e = std::getenv("CERES_TRT_STRONGLY_TYPED"))
-  {
-    if (e[0] == '0') return false;
-    if (e[0] == '1') return true;
-  }
-
   struct Walker
   {
     const uint8_t* const end;
@@ -1475,7 +737,7 @@ extern "C"
       return nullptr;
     }
 
-    // Read the ONNX bytes once; reused for strong-typing detection and the parse below.
+    // Read the ONNX bytes once; reused for Q/DQ detection and the parse below.
     std::vector<char> onnxBlob;
     if (!ReadEntireFile(onnxPath, onnxBlob))
     {
@@ -1483,50 +745,44 @@ extern "C"
       return nullptr;
     }
 
-    // STRONGLY-TYPED network if either (a) the ONNX contains explicit QuantizeLinear
-    // (FP8/FP4 QDQ) nodes — TensorRT ignores FP8/FP4 QDQ scale layers in a weakly-typed
-    // network — or (b) the caller requests INT8/FP8 QDQ mode. Strongly typed makes TRT
-    // honor the ONNX/QDQ types exactly (like ORT) instead of re-deriving precisions and
-    // discarding dequant scales on outlier tensors (which corrupts the value head).
-    // No precision flags / calibrator / pins apply — the Q/DQ nodes drive everything.
-    // 2026-09-09: INT8=true REQUIRES a QDQ graph. It used to be a strong-typing trigger on its
-    // own, which on a plain FP16 graph silently produced a strongly-typed FP16 engine with the
-    // FP32 norm/softmax pins dropped (the pre-norm overflow case) instead of INT8. Now the
-    // Q/DQ detection decides the build and INT8 without Q/DQ is refused up front; the implicit
-    // .calib calibrator path below is thereby retired (unreachable, kept for reference).
-    const bool onnxQDQ = OnnxNeedsStrongTyping(onnxBlob.data(), onnxBlob.size());
+    // Always a STRONGLY-TYPED network (TensorRT 11 removed weak typing): every tensor keeps the
+    // dtype the ONNX declares, so precision is decided entirely by the export -- FP16 with the
+    // explicit fp32 Cast islands around norms/softmax, or INT8/FP8 through embedded Q/DQ nodes.
+    // No builder precision flags, no per-layer precision pins, no calibrator.
+    // INT8=true REQUIRES a Q/DQ graph: on a plain FP16 graph it would otherwise silently produce
+    // an FP16 engine labelled (and cache-keyed) INT8, so it is refused up front.
+    const bool onnxQDQ = OnnxHasQDQ(onnxBlob.data(), onnxBlob.size());
     if (opts->useInt8 && !onnxQDQ)
     {
       SetError("INT8=true but the ONNX carries no QuantizeLinear/DequantizeLinear nodes: INT8 serving needs an "
                "explicit-quantization (QDQ) graph (CeresTrain scripts/qdq_export.py --precision int8, then "
-               "qdq_to_fp16.py). The implicit .calib calibrator path is retired. Drop INT8=true to build this file in FP16.");
+               "qdq_to_fp16.py). Drop INT8=true to build this file from its own (FP16) types.");
       return nullptr;
     }
-    const bool stronglyTyped = onnxQDQ || opts->useFP8;
-    const uint32_t netFlags = stronglyTyped
-      ? (1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED)) : 0U;
-    if (stronglyTyped)
-      fprintf(stderr, "[TensorRT] STRONGLY-TYPED build (QDQ, single-profile): precision from ONNX "
-        "types; builder precision flags + setPrecision norm/softmax marking skipped.\n");
+    if (opts->useFP8 && !onnxQDQ)
+    {
+      SetError("FP8=true but the ONNX carries no Q/DQ nodes: a strongly-typed build takes its types from the "
+        "ONNX (FP16). FP8 needs an FP8-QDQ export.");
+      fprintf(stderr, "[TensorRT] %s\n", g_lastError.c_str());
+      return nullptr;
+    }
+    // Every network is strongly typed. TensorRT 11 has no other mode and warns if the flag is passed;
+    // TensorRT 10 needs the flag explicitly.
+#if NV_TENSORRT_MAJOR >= 11
+    const uint32_t netFlags = 0U;
+#else
+    const uint32_t netFlags = 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED);
+#endif
+    fprintf(stderr, "[TensorRT] STRONGLY-TYPED build (single-profile, %s): precision from the ONNX types; "
+      "no builder precision flags, layer pins or calibrator.\n",
+      onnxQDQ ? "Q/DQ graph" : "FP16 graph with fp32 islands");
+    LogIgnoredPrecisionOptions(opts, "single-profile");
     auto network = std::unique_ptr<nvinfer1::INetworkDefinition>(
       builder->createNetworkV2(netFlags));
     if (!network)
     {
       SetError("Failed to create network");
       return nullptr;
-    }
-    // Strongly-typed builds ignore builder precision flags and forbid setPrecision; neutralize
-    // the manual-precision options (FP8 + FP32 norms come from the ONNX itself).
-    // N.B. useInt8 is deliberately NOT neutralized: later code keys the engine-cache hash on it
-    //      and guards its calibrator paths with !stronglyTyped already.
-    TRT_BuildOptions optsStrong;
-    if (stronglyTyped)
-    {
-      optsStrong = *opts;
-      optsStrong.useBest = optsStrong.useFP16 = optsStrong.useBF16 = optsStrong.useFP8 = 0;
-      optsStrong.fp32PostAttentionNorm = optsStrong.fp32PostAttentionNormStrict = 0;
-      optsStrong.fp32SmolgenNorm = optsStrong.fp32Softmax = optsStrong.fp32AllNorms = 0;
-      opts = &optsStrong;
     }
 
     // Create ONNX parser
@@ -1573,73 +829,6 @@ extern "C"
         static_cast<nvinfer1::TilingOptimizationLevel>(opts->tilingOptimizationLevel));
     }
 
-    // Precision flags — illegal in strongly-typed mode (types from the ONNX).
-    if (!stronglyTyped)
-    {
-      if (opts->useBest)
-      {
-        config->setFlag(nvinfer1::BuilderFlag::kPREFER_PRECISION_CONSTRAINTS);
-      }
-      if (opts->useFP16)
-      {
-        config->setFlag(nvinfer1::BuilderFlag::kFP16);
-      }
-      if (opts->useBF16)
-      {
-        config->setFlag(nvinfer1::BuilderFlag::kBF16);
-      }
-      if (opts->useFP8)
-      {
-        config->setFlag(nvinfer1::BuilderFlag::kFP8);
-      }
-    }
-
-    // INT8. Two modes, auto-selected by inspecting the parsed network:
-    //  - Explicit quantization (QDQ): the ONNX already carries
-    //    QuantizeLinear/DequantizeLinear nodes (from CeresTrain
-    //    scripts/qdq_export.py). TRT honors those embedded scales directly, so
-    //    we only enable INT8 kernels — NO calibrator/cache needed. High-fidelity
-    //    path: MatMuls -> INT8, norms/softmax/value-head stay FP (validated
-    //    GREEN standalone: policy KLD ~0.017, WDL argmax 99.9%, +35% @batch256).
-    //  - Implicit calibration (legacy): no QDQ -> requires a pre-computed
-    //    "<onnxPath>.calib" IInt8EntropyCalibrator2 cache (int8_validate.py).
-    // Detect explicit quantization (QDQ) at FUNCTION scope so the FP32-pinning
-    // blocks below can skip themselves for QDQ graphs (kOBEY_PRECISION_CONSTRAINTS
-    // + setPrecision conflict with embedded Q/DQ scales).
-    bool hasQDQ = false;
-    for (int32_t li = 0; li < network->getNbLayers(); ++li)
-    {
-      auto lt = network->getLayer(li)->getType();
-      if (lt == nvinfer1::LayerType::kQUANTIZE || lt == nvinfer1::LayerType::kDEQUANTIZE)
-      {
-        hasQDQ = true;
-        break;
-      }
-    }
-    // Skipped in strongly-typed mode (QDQ types drive INT8/FP8; kINT8 is illegal).
-    std::unique_ptr<CalibFromCacheFile> int8Calib_single;
-    if (!stronglyTyped && opts->useInt8)
-    {
-      if (hasQDQ)
-      {
-        config->setFlag(nvinfer1::BuilderFlag::kINT8);
-        fprintf(stderr, "[TensorRT INT8] Explicit QDQ graph detected -> INT8 kernels enabled, no calibrator.\n");
-      }
-      else
-      {
-        int8Calib_single = std::make_unique<CalibFromCacheFile>(onnxPath);
-        if (!int8Calib_single->hasCache())
-        {
-          SetError("INT8 mode requested but graph has no QDQ nodes and no calibration cache: " +
-                   int8Calib_single->cachePath() +
-                   ". Provide a QDQ ONNX (CeresTrain scripts/qdq_export.py) or a .calib cache (int8_validate.py).");
-          return nullptr;
-        }
-        config->setFlag(nvinfer1::BuilderFlag::kINT8);
-        config->setInt8Calibrator(int8Calib_single.get());
-      }
-    }
-
     // Enable refit support if requested
     if (opts->refittable)
     {
@@ -1650,104 +839,8 @@ extern "C"
     // Enable detailed profiling for layer precision inspection
     config->setProfilingVerbosity(nvinfer1::ProfilingVerbosity::kDETAILED);
 
-    // Force FP32 precision for normalization layers to prevent FP16 overflow.
-    // Three modes: broad (fp32PostAttentionNorm) = all normalization layers (recommended),
-    //              strict (fp32PostAttentionNormStrict) = only main encoder ln1 (LC0-specific),
-    //              smolgen (fp32SmolgenNorm) = only smolgen attention ln1 (LC0-specific).
-    if (!stronglyTyped && !hasQDQ && (opts->fp32PostAttentionNorm || opts->fp32PostAttentionNormStrict || opts->fp32SmolgenNorm))
-    {
-      config->setFlag(nvinfer1::BuilderFlag::kOBEY_PRECISION_CONSTRAINTS);
-
-      const char* modeName = "broad";
-      int layersMarked = 0;
-      int totalLayers = network->getNbLayers();
-
-      // Compute residual-stream norm layer set for the broad mode
-      auto residualNormSet = FindResidualStreamNormLayers(network.get(), totalLayers);
-
-      for (int32_t i = 0; i < totalLayers; ++i)
-      {
-        auto* layer = network->getLayer(i);
-        bool shouldMark = false;
-
-        if (opts->fp32SmolgenNorm)
-        {
-          shouldMark = IsSmolgenNormLayer(layer->getName());
-          modeName = "smolgen";
-        }
-        else if (opts->fp32PostAttentionNormStrict)
-        {
-          shouldMark = IsPostAttentionNormLayerStrict(layer->getName());
-          modeName = "strict";
-        }
-        else
-        {
-          shouldMark = residualNormSet.count(i) > 0;
-        }
-
-        if (shouldMark)
-        {
-          layer->setPrecision(nvinfer1::DataType::kFLOAT);
-          for (int32_t j = 0; j < layer->getNbOutputs(); ++j)
-          {
-            layer->setOutputType(j, nvinfer1::DataType::kFLOAT);
-          }
-          layersMarked++;
-        }
-      }
-      fprintf(stderr, "[TensorRT] Marked %d/%d layers as FP32 for normalization (%s mode)\n",
-        layersMarked, totalLayers, modeName);
-    }
-
-    // Force FP32 for all Softmax layers (prevents exp() overflow in FP16).
-    // SKIPPED for QDQ: kOBEY_PRECISION_CONSTRAINTS + setPrecision around the
-    // attention softmaxes degrades the INT8 value path (the GREEN standalone
-    // qdq_export.py sets neither kOBEY nor any softmax pin).
-    if (!stronglyTyped && !hasQDQ && opts->fp32Softmax)
-    {
-      config->setFlag(nvinfer1::BuilderFlag::kOBEY_PRECISION_CONSTRAINTS);
-      int totalLayers = network->getNbLayers();
-      int softmaxMarked = 0;
-      for (int32_t i = 0; i < totalLayers; ++i)
-      {
-        auto* layer = network->getLayer(i);
-        if (layer->getType() == nvinfer1::LayerType::kSOFTMAX)
-        {
-          layer->setPrecision(nvinfer1::DataType::kFLOAT);
-          for (int32_t j = 0; j < layer->getNbOutputs(); ++j)
-          {
-            layer->setOutputType(j, nvinfer1::DataType::kFLOAT);
-          }
-          softmaxMarked++;
-        }
-      }
-      fprintf(stderr, "[TensorRT] Marked %d Softmax layers as FP32\n", softmaxMarked);
-    }
-
-    // Force FP32 for normalization chains (scope: 1=all, 2=QKV, 3=smolgen, 4=QKV+smolgen).
-    // SKIPPED for QDQ (see softmax block — kOBEY degrades the INT8 value path).
-    if (!stronglyTyped && !hasQDQ && opts->fp32AllNorms)
-    {
-      config->setFlag(nvinfer1::BuilderFlag::kOBEY_PRECISION_CONSTRAINTS);
-      int totalLayers = network->getNbLayers();
-      auto allNormSet = FindAllNormLayers(network.get(), totalLayers, opts->fp32AllNorms);
-      int normsMarked = 0;
-      for (int32_t i = 0; i < totalLayers; ++i)
-      {
-        if (allNormSet.count(i) > 0)
-        {
-          auto* layer = network->getLayer(i);
-          layer->setPrecision(nvinfer1::DataType::kFLOAT);
-          for (int32_t j = 0; j < layer->getNbOutputs(); ++j)
-          {
-            layer->setOutputType(j, nvinfer1::DataType::kFLOAT);
-          }
-          normsMarked++;
-        }
-      }
-      fprintf(stderr, "[TensorRT] Marked %d/%d layers as FP32 for norms (scope=%d)\n",
-        normsMarked, totalLayers, opts->fp32AllNorms);
-    }
+    // No per-layer precision handling here: the network is strongly typed, so the fp32 norm /
+    // softmax islands and any INT8/FP8 Q/DQ come from the ONNX itself.
 
     // Determine batch sizes for optimization profile
     int32_t minBatch = (opts->minBatchSize > 0) ? opts->minBatchSize : batchSize;
@@ -1958,7 +1051,12 @@ extern "C"
     return p;
   }
 
-  // Helper: compute hash of build options
+  // Helper: compute hash of build options.
+  // The fp32PostAttentionNorm / Strict / SmolgenNorm / Softmax / AllNorms options no longer affect
+  // the engine (strongly-typed build) and are deliberately NOT hashed, so toggling them on the C#
+  // side cannot fork the cache. The cache file name additionally carries a "st" segment with the
+  // ONNX content fingerprint (see TRT_GenerateCacheFilenameForDevice), which is what retires every
+  // engine cached by the former weakly-typed builds.
   static uint64_t HashBuildOptions(const TRT_BuildOptions* opts)
   {
     uint64_t hash = 0;
@@ -1970,26 +1068,13 @@ extern "C"
     hash ^= std::hash<int32_t>{}(opts->useBF16) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
     hash ^= std::hash<int32_t>{}(opts->useFP8) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
     hash ^= std::hash<int32_t>{}(opts->useBest) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-    hash ^= std::hash<int32_t>{}(opts->fp32PostAttentionNorm) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-    hash ^= std::hash<int32_t>{}(opts->fp32PostAttentionNormStrict) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-    hash ^= std::hash<int32_t>{}(opts->fp32SmolgenNorm) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-    // Only include new fields in hash when non-zero, to avoid invalidating existing cached engines
-    if (opts->fp32Softmax)
-    {
-      hash ^= std::hash<int32_t>{}(opts->fp32Softmax) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-    }
-    if (opts->fp32AllNorms)
-    {
-      hash ^= std::hash<int32_t>{}(opts->fp32AllNorms) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-    }
-    // Only include refittable in hash when true, so existing cached files (with false) remain valid
+    // Only include refittable in hash when true, so cached files built with false remain valid
     if (opts->refittable)
     {
       hash ^= std::hash<int32_t>{}(opts->refittable) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
     }
-    // INT8 mode produces a fundamentally different engine — must invalidate any
-    // pre-existing FP16/BF16 cache entry. Only include when non-zero so existing
-    // cached files (with useInt8=0) remain valid.
+    // INT8 (Q/DQ) mode produces a fundamentally different engine from the same base name.
+    // Only include when non-zero so files cached with useInt8=0 remain valid.
     if (opts->useInt8)
     {
       hash ^= std::hash<int32_t>{}(opts->useInt8) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
@@ -2312,12 +1397,16 @@ extern "C"
     int32_t maxBatch = (opts->maxBatchSize > 0) ? opts->maxBatchSize : batchSize;
 
     uint64_t hash = HashBuildOptions(opts);
+    uint64_t onnxHash = ComputeOnnxContentHash(onnxPath);
     int32_t trtVersion = NV_TENSORRT_VERSION;
 
+    // "st<onnx fingerprint>": strongly-typed engine keyed on the ONNX content (size + head/tail
+    // hash), so a re-export under the same name gets a fresh engine and no engine cached by the
+    // former weakly-typed builds (whose names lack this segment) is ever reused.
     char buffer[512];
-    snprintf(buffer, sizeof(buffer), "%s_b%d-%d-%d_%s_trt%d_%016llx.engine",
+    snprintf(buffer, sizeof(buffer), "%s_b%d-%d-%d_%s_trt%d_st%016llx_%016llx.engine",
       basename.c_str(), minBatch, optBatch, maxBatch, gpuId.c_str(), trtVersion,
-      static_cast<unsigned long long>(hash));
+      static_cast<unsigned long long>(onnxHash), static_cast<unsigned long long>(hash));
 
     return strdup(buffer);
   }
@@ -2336,13 +1425,12 @@ extern "C"
     int32_t optBatch = (opts->optBatchSize > 0) ? opts->optBatchSize : batchSize;
     int32_t maxBatch = (opts->maxBatchSize > 0) ? opts->maxBatchSize : batchSize;
 
+    // Precision is whatever the ONNX declares (strongly-typed build); the INT8/FP8 options only
+    // label which kind of export the caller asked for.
     std::string precision;
-    if (opts->useFP8) precision = "FP8";
-    else if (opts->useBF16) precision = "BF16";
-    else if (opts->useInt8 && opts->useFP16) precision = "INT8+FP16";
-    else if (opts->useInt8) precision = "INT8";
-    else if (opts->useFP16) precision = "FP16";
-    else precision = "FP32";
+    if (opts->useInt8) precision = "INT8 Q/DQ (strongly typed)";
+    else if (opts->useFP8) precision = "FP8 Q/DQ (strongly typed)";
+    else precision = "ONNX-typed (strongly typed)";
 
     char buffer[512];
     if (minBatch == maxBatch)
@@ -3860,7 +2948,7 @@ extern "C"
       return -4;
     }
 
-    // Read the ONNX bytes once; reused for strong-typing detection and the parse below.
+    // Read the ONNX bytes once; reused for Q/DQ detection and the parse below.
     std::vector<char> onnxBlob;
     if (!ReadEntireFile(onnxPath, onnxBlob))
     {
@@ -3868,45 +2956,41 @@ extern "C"
       return -8;
     }
 
-    // STRONGLY-TYPED network if either (a) the ONNX contains explicit QuantizeLinear
-    // (FP8/FP4 QDQ) nodes — TensorRT ignores FP8/FP4 QDQ scale layers in a weakly-typed
-    // network — or (b) the caller requests INT8/FP8 QDQ mode. Strongly typed makes TRT
-    // honor the ONNX/QDQ types exactly (like ORT) instead of re-deriving precisions and
-    // discarding dequant scales on outlier tensors (which corrupts the value head).
-    // (ORT-simulated INT8 preserves value 100%; standard TRT build collapses it.)
-    // 2026-09-09: INT8=true REQUIRES a QDQ graph (see the single-profile path for the rationale).
-    const bool onnxQDQ = OnnxNeedsStrongTyping(onnxBlob.data(), onnxBlob.size());
+    // Always a STRONGLY-TYPED network (TensorRT 11 removed weak typing): precision comes from
+    // the ONNX dtypes alone -- fp32 Cast islands around norms/softmax in the FP16 export, or
+    // INT8/FP8 through embedded Q/DQ nodes. No builder precision flags, no per-layer precision
+    // pins, no calibrator (see the single-profile path for the INT8-without-Q/DQ rationale).
+    const bool onnxQDQ = OnnxHasQDQ(onnxBlob.data(), onnxBlob.size());
     if (opts->useInt8 && !onnxQDQ)
     {
       SetError("INT8=true but the ONNX carries no QuantizeLinear/DequantizeLinear nodes: INT8 serving needs an "
                "explicit-quantization (QDQ) graph (CeresTrain scripts/qdq_export.py --precision int8, then "
-               "qdq_to_fp16.py). The implicit .calib calibrator path is retired. Drop INT8=true to build this file in FP16.");
+               "qdq_to_fp16.py). Drop INT8=true to build this file from its own (FP16) types.");
       return -20;
     }
-    const bool stronglyTyped = onnxQDQ || opts->useFP8;
-    const uint32_t netFlags = stronglyTyped
-      ? (1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED)) : 0U;
-    if (stronglyTyped)
-      fprintf(stderr, "[TensorRT] STRONGLY-TYPED build (QDQ): precision from ONNX types; "
-        "builder precision flags + setPrecision norm/softmax marking skipped.\n");
+    if (opts->useFP8 && !onnxQDQ)
+    {
+      SetError("FP8=true but the ONNX carries no Q/DQ nodes: a strongly-typed build takes its types from the "
+        "ONNX (FP16). FP8 needs an FP8-QDQ export.");
+      fprintf(stderr, "[TensorRT] %s\n", g_lastError.c_str());
+      return -20;
+    }
+    // Every network is strongly typed. TensorRT 11 has no other mode and warns if the flag is passed;
+    // TensorRT 10 needs the flag explicitly.
+#if NV_TENSORRT_MAJOR >= 11
+    const uint32_t netFlags = 0U;
+#else
+    const uint32_t netFlags = 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED);
+#endif
+    fprintf(stderr, "[TensorRT] STRONGLY-TYPED build (multi-profile, %s): precision from the ONNX types; "
+      "no builder precision flags, layer pins or calibrator.\n",
+      onnxQDQ ? "Q/DQ graph" : "FP16 graph with fp32 islands");
+    LogIgnoredPrecisionOptions(opts, "multi-profile");
     auto network = std::unique_ptr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(netFlags));
     if (!network)
     {
       SetError("Failed to create network");
       return -5;
-    }
-    // Strongly-typed builds ignore builder precision flags and forbid setPrecision; neutralize
-    // the manual-precision options (FP8 + FP32 norms come from the ONNX itself).
-    // N.B. useInt8 is deliberately NOT neutralized: later code keys the engine-cache hash on it
-    //      and guards its calibrator paths with !stronglyTyped already.
-    TRT_BuildOptions optsStrong;
-    if (stronglyTyped)
-    {
-      optsStrong = *opts;
-      optsStrong.useBest = optsStrong.useFP16 = optsStrong.useBF16 = optsStrong.useFP8 = 0;
-      optsStrong.fp32PostAttentionNorm = optsStrong.fp32PostAttentionNormStrict = 0;
-      optsStrong.fp32SmolgenNorm = optsStrong.fp32Softmax = optsStrong.fp32AllNorms = 0;
-      opts = &optsStrong;
     }
 
     // Parse ONNX
@@ -3965,60 +3049,6 @@ extern "C"
         static_cast<nvinfer1::TilingOptimizationLevel>(opts->tilingOptimizationLevel));
     }
 
-    // Precision builder flags are illegal in strongly-typed mode (types come
-    // from the ONNX) -> only set them for the standard path.
-    if (!stronglyTyped)
-    {
-      if (opts->useBest) config->setFlag(nvinfer1::BuilderFlag::kPREFER_PRECISION_CONSTRAINTS);
-      if (opts->useFP16) config->setFlag(nvinfer1::BuilderFlag::kFP16);
-      if (opts->useBF16) config->setFlag(nvinfer1::BuilderFlag::kBF16);
-      if (opts->useFP8) config->setFlag(nvinfer1::BuilderFlag::kFP8);
-    }
-
-    // Detect explicit quantization (QDQ): if the ONNX carries
-    // QuantizeLinear/DequantizeLinear nodes (from CeresTrain scripts/qdq_export.py),
-    // TRT honors those embedded scales directly -> no calibrator/cache needed.
-    // (Declared at function scope so the calibration-profile block below can skip
-    // itself for QDQ graphs.)
-    bool hasQDQ = false;
-    for (int32_t li = 0; li < network->getNbLayers(); ++li)
-    {
-      auto lt = network->getLayer(li)->getType();
-      if (lt == nvinfer1::LayerType::kQUANTIZE || lt == nvinfer1::LayerType::kDEQUANTIZE)
-      {
-        hasQDQ = true;
-        break;
-      }
-    }
-
-    // INT8. Explicit QDQ -> enable INT8 kernels, no calibrator. Otherwise legacy
-    // implicit path requires <onnxPath>.calib (int8_validate.py).
-    // Skipped entirely in strongly-typed mode (the QDQ types drive INT8/FP8
-    // automatically; setting kINT8 is illegal there).
-    std::unique_ptr<CalibFromCacheFile> int8Calib;
-    if (!stronglyTyped && opts->useInt8)
-    {
-      if (hasQDQ)
-      {
-        config->setFlag(nvinfer1::BuilderFlag::kINT8);
-        fprintf(stderr, "[TensorRT] Multi-profile INT8: explicit QDQ graph -> INT8 kernels, no calibrator.\n");
-      }
-      else
-      {
-        int8Calib = std::make_unique<CalibFromCacheFile>(onnxPath);
-        if (!int8Calib->hasCache())
-        {
-          SetError("INT8 mode requested but graph has no QDQ nodes and no calibration cache: " +
-                   int8Calib->cachePath() +
-                   ". Provide a QDQ ONNX (CeresTrain scripts/qdq_export.py) or a .calib cache (int8_validate.py).");
-          return -8;
-        }
-        config->setFlag(nvinfer1::BuilderFlag::kINT8);
-        config->setInt8Calibrator(int8Calib.get());
-        fprintf(stderr, "[TensorRT] Multi-profile INT8+FP16 build enabled (calibration cache loaded)\n");
-      }
-    }
-
     if (opts->refittable)
     {
       config->setFlag(nvinfer1::BuilderFlag::kREFIT_IDENTICAL);
@@ -4027,376 +3057,9 @@ extern "C"
 
     config->setProfilingVerbosity(nvinfer1::ProfilingVerbosity::kDETAILED);
 
-    // -------- STRUCTURAL FP32 norm marker (auto-applied) --------
-    // PyTorch ≥2.4 opset-18 export gives RMSNorm compute layers generic names
-    // (node_pow_*, node_mean, node_sqrt, node_div) that the name-based
-    // HasNormName() matcher can NEVER hit. The only stable handle is the scale
-    // constant (e.g. inner.transformer_layer.0.ln1.scale). Walk forward from
-    // each *.scale const → its Mul consumer (= final RMSNorm step), then BFS
-    // back over Pow/ReduceMean/Add/Sqrt/Div compute layers and mark them FP32.
-    // This protects pre-norm trunks (including trunk_end_norm) where the
-    // residual stream is unnormalized between blocks and FP16 Pow(x,2)
-    // overflows for |x| > 256.
-    //
-    // Skipped under BF16: BF16 has the same 8-bit exponent as FP32, so the
-    // overflow path doesn't exist — forcing FP32 there is pure conversion
-    // overhead with no accuracy gain.
-    // Skipped under BF16 (same exponent range as FP32 — no overflow risk).
-    // Skipped under INT8 — TRT's INT8 calibration places norms in higher
-    // precision automatically; manual FP32 marking on top conflicts with
-    // the calibrator's layer-precision decisions.
-    if (!opts->useBF16 && !opts->useInt8 && !stronglyTyped)
-    {
-      int totalAuto = network->getNbLayers();
-      std::unordered_map<std::string, int32_t> autoProducer;
-      std::unordered_map<std::string, std::vector<int32_t>> autoConsumers;
-      for (int32_t i = 0; i < totalAuto; ++i)
-      {
-        auto* L = network->getLayer(i);
-        for (int32_t j = 0; j < L->getNbOutputs(); ++j)
-        {
-          auto* t = L->getOutput(j);
-          if (t && t->getName()) autoProducer[t->getName()] = i;
-        }
-        for (int32_t j = 0; j < L->getNbInputs(); ++j)
-        {
-          auto* t = L->getInput(j);
-          if (t && t->getName()) autoConsumers[t->getName()].push_back(i);
-        }
-      }
-
-      auto isNormScaleConst = [](const std::string& nm) -> bool
-      {
-        if (nm.find(".scale") == std::string::npos) return false;
-        return nm.find("ln1") != std::string::npos
-            || nm.find("ln2") != std::string::npos
-            || nm.find("rms_norm") != std::string::npos
-            || nm.find("rmsnorm") != std::string::npos
-            || nm.find("embedding_norm") != std::string::npos
-            || nm.find("trunk_end_norm") != std::string::npos
-            || nm.find("qkvLN") != std::string::npos
-            || nm.find("LayerNorm") != std::string::npos
-            || nm.find("layer_norm") != std::string::npos;
-      };
-
-      auto isComputeKind = [](nvinfer1::LayerType t) -> bool
-      {
-        return t == nvinfer1::LayerType::kELEMENTWISE
-            || t == nvinfer1::LayerType::kREDUCE
-            || t == nvinfer1::LayerType::kUNARY
-            || t == nvinfer1::LayerType::kNORMALIZATION;
-      };
-
-      std::unordered_set<int32_t> autoMark;
-      int chainCount = 0;
-      for (int32_t i = 0; i < totalAuto; ++i)
-      {
-        auto* L = network->getLayer(i);
-        std::string nm(L->getName());
-        if (!isNormScaleConst(nm)) continue;
-
-        // Walk forward to find the kELEMENTWISE Mul that this scale feeds.
-        int32_t cur = i;
-        int32_t mulIdx = -1;
-        for (int hop = 0; hop < 6; ++hop)
-        {
-          auto* Lc = network->getLayer(cur);
-          if (Lc->getType() == nvinfer1::LayerType::kELEMENTWISE && cur != i)
-          {
-            mulIdx = cur; break;
-          }
-          auto* outT = Lc->getOutput(0);
-          if (!outT || !outT->getName()) break;
-          auto cit = autoConsumers.find(outT->getName());
-          if (cit == autoConsumers.end() || cit->second.empty()) break;
-          cur = cit->second[0];
-        }
-        if (mulIdx < 0) continue;
-
-        // BFS back from the Mul up to depth 6, marking only compute kinds.
-        autoMark.insert(mulIdx);
-        std::vector<int32_t> frontier; frontier.push_back(mulIdx);
-        std::unordered_set<int32_t> seen; seen.insert(mulIdx);
-        for (int depth = 0; depth < 6 && !frontier.empty(); ++depth)
-        {
-          std::vector<int32_t> next;
-          for (int32_t wIdx : frontier)
-          {
-            auto* wL = network->getLayer(wIdx);
-            for (int32_t ii = 0; ii < wL->getNbInputs(); ++ii)
-            {
-              auto* iT = wL->getInput(ii);
-              if (!iT || !iT->getName()) continue;
-              auto pit = autoProducer.find(iT->getName());
-              if (pit == autoProducer.end()) continue;
-              int32_t pIdx = pit->second;
-              if (pIdx == wIdx) continue;
-              if (seen.count(pIdx)) continue;
-              seen.insert(pIdx);
-              auto* pL = network->getLayer(pIdx);
-              if (isComputeKind(pL->getType()))
-              {
-                autoMark.insert(pIdx);
-                next.push_back(pIdx);
-              }
-            }
-          }
-          frontier = next;
-        }
-        chainCount++;
-      }
-
-      if (!autoMark.empty())
-      {
-        config->setFlag(nvinfer1::BuilderFlag::kOBEY_PRECISION_CONSTRAINTS);
-        int marked = 0;
-        for (int32_t idx : autoMark)
-        {
-          auto* L = network->getLayer(idx);
-          L->setPrecision(nvinfer1::DataType::kFLOAT);
-          for (int32_t j = 0; j < L->getNbOutputs(); ++j)
-          {
-            L->setOutputType(j, nvinfer1::DataType::kFLOAT);
-          }
-          marked++;
-        }
-        fprintf(stderr, "[TensorRT] Auto-marked %d compute layers FP32 across %d norm chains (structural detection by scale-constant)\n",
-                marked, chainCount);
-      }
-      else
-      {
-        fprintf(stderr, "[TensorRT] Auto FP32 norm marker: found 0 chains\n");
-      }
-    }
-    // ------ end STRUCTURAL FP32 norm marker -----
-
-    // -------- FP32 FUSED-norm marker (opset-23 RMSNormalization / LayerNormalization) --------
-    // The scale-const -> Mul walk above only reaches DECOMPOSED norms (opset<=18
-    // export: Pow/ReduceMean/Sqrt/Div/Mul). PyTorch opset-23 export collapses each
-    // RMSNorm/LayerNorm into a single FUSED op that TensorRT imports as one
-    // kNORMALIZATION layer with NO downstream elementwise Mul -- so the walk finds
-    // mulIdx == -1, bails, and the norm is left in FP16. TRT then runs the fused
-    // norm's internal mean(x^2) in FP16, which OVERFLOWS once the (unnormalized)
-    // residual stream grows past ~256 -> Inf/NaN. The poison lands in the value
-    // head (garbage WDL/eval) while the argmax policy still looks plausible.
-    //
-    // This is exactly the failure that decomposed-norm nets avoid via the walk
-    // above; mark every fused normalization layer FP32 to cover the opset-23 case.
-    // ONNXRuntime/Torch keep the norm accumulation in FP32 internally, which is why
-    // they are bit-correct while only the TRT FP16 path regresses.
-    // Skipped under BF16 (8-bit exponent, no overflow) and INT8 (calibrator-managed).
-    if (!opts->useBF16 && !opts->useInt8 && !stronglyTyped)
-    {
-      int totalNorm = network->getNbLayers();
-      int fusedNormMarked = 0;
-      for (int32_t i = 0; i < totalNorm; ++i)
-      {
-        auto* L = network->getLayer(i);
-        if (L->getType() != nvinfer1::LayerType::kNORMALIZATION) continue;
-        config->setFlag(nvinfer1::BuilderFlag::kOBEY_PRECISION_CONSTRAINTS);
-        L->setPrecision(nvinfer1::DataType::kFLOAT);
-        for (int32_t j = 0; j < L->getNbOutputs(); ++j)
-          L->setOutputType(j, nvinfer1::DataType::kFLOAT);
-        fusedNormMarked++;
-      }
-      if (fusedNormMarked > 0)
-        fprintf(stderr, "[TensorRT] Auto-marked %d fused kNORMALIZATION layers FP32 (opset-23 RMSNormalization FP16-overflow guard)\n",
-                fusedNormMarked);
-    }
-    // ------ end FP32 FUSED-norm marker -----
-
-    // DEBUG: enumerate norm-scale constants and trace forward to the Mul that
-    // consumes them — that Mul is the tail of a RMSNorm compute chain. Then
-    // walk back through its producers to enumerate Pow/ReduceMean/Add/Sqrt/Div.
-    if (getenv("TRT_DUMP_LAYER_NAMES"))
-    {
-      int total = network->getNbLayers();
-      fprintf(stderr, "[TRT-DUMP] Total TRT layers: %d\n", total);
-
-      // Build tensor -> producer-layer index map AND tensor -> consumer-layers map
-      std::unordered_map<std::string, int32_t> producer;
-      std::unordered_map<std::string, std::vector<int32_t>> consumers;
-      for (int32_t i = 0; i < total; ++i)
-      {
-        auto* l = network->getLayer(i);
-        for (int32_t j = 0; j < l->getNbOutputs(); ++j)
-        {
-          auto* t = l->getOutput(j);
-          if (t && t->getName()) producer[t->getName()] = i;
-        }
-        for (int32_t j = 0; j < l->getNbInputs(); ++j)
-        {
-          auto* t = l->getInput(j);
-          if (t && t->getName()) consumers[t->getName()].push_back(i);
-        }
-      }
-
-      // For each *.scale constant, find the Mul that consumes it and walk back.
-      auto layerLine = [&](int32_t idx)
-      {
-        auto* L = network->getLayer(idx);
-        fprintf(stderr, "[TRT-DUMP] L%05d type=%d name=%s\n", idx, (int)L->getType(), L->getName());
-      };
-
-      // Walk forward from scale-constant → broadcast → Mul (final RMSNorm step),
-      // then back from Mul to expose the Pow/ReduceMean/Add/Sqrt/Div chain.
-      auto walkForward = [&](int32_t startIdx, int maxHops) -> int32_t
-      {
-        int32_t cur = startIdx;
-        for (int h = 0; h < maxHops; ++h)
-        {
-          auto* L = network->getLayer(cur);
-          if (L->getType() == nvinfer1::LayerType::kELEMENTWISE) return cur;
-          auto* outT = L->getOutput(0);
-          if (!outT || !outT->getName()) return -1;
-          auto cit = consumers.find(outT->getName());
-          if (cit == consumers.end() || cit->second.empty()) return -1;
-          cur = cit->second[0];
-        }
-        return cur;
-      };
-
-      int shownChains = 0;
-      for (int32_t i = 0; i < total; ++i)
-      {
-        auto* l = network->getLayer(i);
-        std::string nm(l->getName());
-        if (nm.find(".scale") == std::string::npos) continue;
-        if (nm.find("norm") == std::string::npos && nm.find("ln1") == std::string::npos
-            && nm.find("ln2") == std::string::npos) continue;
-        fprintf(stderr, "[TRT-DUMP] === scale=%s ===\n", nm.c_str());
-        int32_t mulIdx = walkForward(i, 6);
-        fprintf(stderr, "[TRT-DUMP] forward-walk hit (or last) idx=%d\n", mulIdx);
-        if (mulIdx < 0) continue;
-        // BFS backward up to depth 8, dumping all reached layers
-        std::vector<int32_t> walk; walk.push_back(mulIdx);
-        std::unordered_set<int32_t> seen; seen.insert(mulIdx);
-        for (int depth = 0; depth < 8 && !walk.empty(); ++depth)
-        {
-          std::vector<int32_t> next;
-          for (int32_t wIdx : walk)
-          {
-            auto* wL = network->getLayer(wIdx);
-            for (int32_t ii = 0; ii < wL->getNbInputs(); ++ii)
-            {
-              auto* iT = wL->getInput(ii);
-              if (!iT || !iT->getName()) continue;
-              auto pit = producer.find(iT->getName());
-              if (pit == producer.end()) continue;
-              int32_t pIdx = pit->second;
-              if (pIdx == wIdx) continue;
-              if (seen.count(pIdx)) continue;
-              seen.insert(pIdx);
-              fprintf(stderr, "[TRT-DUMP]   d%d:\n", depth);
-              layerLine(pIdx);
-              next.push_back(pIdx);
-            }
-          }
-          walk = next;
-          if (walk.size() > 8) walk.resize(8); // cap fanout
-        }
-        if (++shownChains >= 2) { fprintf(stderr, "[TRT-DUMP] (stopping after 2 chains)\n"); break; }
-      }
-    }
-
-    // Force FP32 precision for normalization layers to prevent FP16 overflow.
-    // Applied for QDQ too (protects value head from decomposed-norm FP16 overflow;
-    // coexists with QDQ on MatMuls). The "[SCALE] invalid precision" warnings are
-    // benign (present in the GREEN +35% standalone build).
-    if (!stronglyTyped && !hasQDQ && (opts->fp32PostAttentionNorm || opts->fp32PostAttentionNormStrict || opts->fp32SmolgenNorm))
-    {
-      config->setFlag(nvinfer1::BuilderFlag::kOBEY_PRECISION_CONSTRAINTS);
-
-      const char* modeName = "broad";
-      int layersMarked = 0;
-      int totalLayers = network->getNbLayers();
-
-      // Compute residual-stream norm layer set for the broad mode
-      auto residualNormSet = FindResidualStreamNormLayers(network.get(), totalLayers);
-
-      for (int32_t i = 0; i < totalLayers; ++i)
-      {
-        auto* layer = network->getLayer(i);
-        bool shouldMark = false;
-
-        if (opts->fp32SmolgenNorm)
-        {
-          shouldMark = IsSmolgenNormLayer(layer->getName());
-          modeName = "smolgen";
-        }
-        else if (opts->fp32PostAttentionNormStrict)
-        {
-          shouldMark = IsPostAttentionNormLayerStrict(layer->getName());
-          modeName = "strict";
-        }
-        else
-        {
-          shouldMark = residualNormSet.count(i) > 0;
-        }
-
-        if (shouldMark)
-        {
-          layer->setPrecision(nvinfer1::DataType::kFLOAT);
-          for (int32_t j = 0; j < layer->getNbOutputs(); ++j)
-          {
-            layer->setOutputType(j, nvinfer1::DataType::kFLOAT);
-          }
-          layersMarked++;
-        }
-      }
-      fprintf(stderr, "[TensorRT] Marked %d/%d layers as FP32 for normalization (%s mode)\n",
-        layersMarked, totalLayers, modeName);
-    }
-
-    // Force FP32 for all Softmax layers (prevents exp() overflow in FP16).
-    // SKIPPED for QDQ: kOBEY_PRECISION_CONSTRAINTS + setPrecision around the
-    // attention softmaxes degrades the INT8 value path (the GREEN standalone
-    // qdq_export.py sets neither kOBEY nor any softmax pin).
-    if (!stronglyTyped && !hasQDQ && opts->fp32Softmax)
-    {
-      config->setFlag(nvinfer1::BuilderFlag::kOBEY_PRECISION_CONSTRAINTS);
-      int totalLayers = network->getNbLayers();
-      int softmaxMarked = 0;
-      for (int32_t i = 0; i < totalLayers; ++i)
-      {
-        auto* layer = network->getLayer(i);
-        if (layer->getType() == nvinfer1::LayerType::kSOFTMAX)
-        {
-          layer->setPrecision(nvinfer1::DataType::kFLOAT);
-          for (int32_t j = 0; j < layer->getNbOutputs(); ++j)
-          {
-            layer->setOutputType(j, nvinfer1::DataType::kFLOAT);
-          }
-          softmaxMarked++;
-        }
-      }
-      fprintf(stderr, "[TensorRT] Marked %d Softmax layers as FP32\n", softmaxMarked);
-    }
-
-    // Force FP32 for normalization chains (scope: 1=all, 2=QKV, 3=smolgen, 4=QKV+smolgen).
-    // SKIPPED for QDQ (see softmax block — kOBEY degrades the INT8 value path).
-    if (!stronglyTyped && !hasQDQ && opts->fp32AllNorms)
-    {
-      config->setFlag(nvinfer1::BuilderFlag::kOBEY_PRECISION_CONSTRAINTS);
-      int totalLayers = network->getNbLayers();
-      auto allNormSet = FindAllNormLayers(network.get(), totalLayers, opts->fp32AllNorms);
-      int normsMarked = 0;
-      for (int32_t i = 0; i < totalLayers; ++i)
-      {
-        if (allNormSet.count(i) > 0)
-        {
-          auto* layer = network->getLayer(i);
-          layer->setPrecision(nvinfer1::DataType::kFLOAT);
-          for (int32_t j = 0; j < layer->getNbOutputs(); ++j)
-          {
-            layer->setOutputType(j, nvinfer1::DataType::kFLOAT);
-          }
-          normsMarked++;
-        }
-      }
-      fprintf(stderr, "[TensorRT] Marked %d/%d layers as FP32 for norms (scope=%d)\n",
-        normsMarked, totalLayers, opts->fp32AllNorms);
-    }
+    // No per-layer precision handling here (formerly the structural / fused-norm FP32 auto-markers,
+    // the fp32 norm / softmax / all-norms pins and the INT8 calibration profile): the network is
+    // strongly typed, so the fp32 islands and any INT8/FP8 Q/DQ come from the ONNX itself.
 
     // Create N optimization profiles (one per batch size, Exact mode: min=opt=max)
     for (int32_t p = 0; p < numProfiles; ++p)
@@ -4420,31 +3083,6 @@ extern "C"
         profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX, maxDims);
       }
       config->addOptimizationProfile(profile);
-    }
-
-    // INT8 + multi-profile requires an explicit calibration profile, otherwise TRT
-    // picks the first runtime profile (batch=240 here) and the calibration cache
-    // — which was generated at a different shape (typically batch=64) — produces
-    // a corrupt engine. We add a dedicated single-shape calibration profile that
-    // matches the shape calibration data was generated against.
-    // Skipped for QDQ graphs: explicit quantization carries its own scales, so
-    // there is no calibrator and no calibration profile is needed.
-    if (!stronglyTyped && opts->useInt8 && !hasQDQ)
-    {
-      const int32_t kCalibBatch = 64;  // must match the shape used to generate <onnx>.calib
-      auto calibProfile = builder->createOptimizationProfile();
-      for (int32_t i = 0; i < network->getNbInputs(); ++i)
-      {
-        auto input = network->getInput(i);
-        auto dims = input->getDimensions();
-        nvinfer1::Dims d = dims;
-        if (d.d[0] == -1) d.d[0] = kCalibBatch;
-        calibProfile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN, d);
-        calibProfile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT, d);
-        calibProfile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX, d);
-      }
-      config->setCalibrationProfile(calibProfile);
-      fprintf(stderr, "[TensorRT] INT8 calibration profile set: batch=%d (matches calib cache shape)\n", kCalibBatch);
     }
 
     // Build a batch sizes description for logging
@@ -4636,6 +3274,7 @@ extern "C"
     std::string basename = GetBaseName(onnxPath);
     std::string gpuId = GetGPUIdentifier(deviceId);
     uint64_t hash = HashBuildOptions(opts);
+    uint64_t onnxHash = ComputeOnnxContentHash(onnxPath);
     int32_t trtVersion = NV_TENSORRT_VERSION;
 
     // Build batch sizes string: "b1-b2-...-bN"
@@ -4646,10 +3285,11 @@ extern "C"
       batchStr += std::to_string(batchSizes[i]);
     }
 
+    // "st<onnx fingerprint>" segment: see TRT_GenerateCacheFilenameForDevice.
     char buffer[1024];
-    snprintf(buffer, sizeof(buffer), "%s_mp%s_%s_trt%d_%016llx.engine",
+    snprintf(buffer, sizeof(buffer), "%s_mp%s_%s_trt%d_st%016llx_%016llx.engine",
       basename.c_str(), batchStr.c_str(), gpuId.c_str(), trtVersion,
-      static_cast<unsigned long long>(hash));
+      static_cast<unsigned long long>(onnxHash), static_cast<unsigned long long>(hash));
 
     return strdup(buffer);
   }

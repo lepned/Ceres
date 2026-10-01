@@ -5,7 +5,11 @@
   REM Configuration - Update these paths for your environment
   REM ============================================================================
   set "CUDA_ROOT=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9"
-  set "TENSORRT_ROOT=D:\TensorRT10.14.1.48"
+  set "TENSORRT_ROOT=C:\Dev\TensorRT-10.15.1.29"
+
+  REM Major version of the TensorRT runtime libraries (nvinfer_<N>.lib / nvonnxparser_<N>.lib):
+  REM 10 for TensorRT 10.x, 11 for TensorRT 11.x. Keep in sync with TENSORRT_ROOT.
+  set "NVINFER_MAJOR=10"
 
   REM Derived paths
   set "CUDA_INCLUDE=%CUDA_ROOT%\include"
@@ -54,6 +58,12 @@
       exit /b 1
   )
 
+  if not exist "%TENSORRT_LIB%\nvinfer_%NVINFER_MAJOR%.lib" (
+      echo ERROR: nvinfer_%NVINFER_MAJOR%.lib not found in %TENSORRT_LIB%
+      echo Please set NVINFER_MAJOR in this script to the major version shipped by TENSORRT_ROOT.
+      exit /b 1
+  )
+
   if not exist "%SOURCE_FILE%" (
       echo ERROR: Source file not found: %SOURCE_FILE%
       echo Please run this script from the directory containing %SOURCE_FILE%
@@ -82,7 +92,7 @@
      "%SOURCE_FILE%" ^
      /link /LIBPATH:"%CUDA_LIB%" ^
            /LIBPATH:"%TENSORRT_LIB%" ^
-           nvinfer_10.lib nvonnxparser_10.lib cudart.lib ^
+           nvinfer_%NVINFER_MAJOR%.lib nvonnxparser_%NVINFER_MAJOR%.lib cudart.lib ^
      /OUT:"%OUTPUT_DLL%"
 
   if errorlevel 1 (
