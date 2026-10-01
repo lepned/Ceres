@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <atomic>
+#include <algorithm>   // std::remove
 
 // Platform-specific includes for file stat
 #ifdef _WIN32
@@ -518,6 +519,14 @@ static bool ReadEntireFile(const char* path, std::vector<char>& out)
 // first in the GraphProto) plus the start of the weight section, the tail the end of it, so a
 // re-export under the same file name (new weights, new graph, new fp32 islands) changes the
 // key without hashing hundreds of MB on every load. Returns 0 if the file cannot be read.
+// Fold a 64-bit hash to 32 bits for the cache file name: 8 hex digits per segment keeps the
+// full path under Windows MAX_PATH (260) for our ~90-character net basenames (16+16 hex came
+// within ~25 characters of it; a save that exceeds it fails silently and rebuilds every start).
+static unsigned long long Fold32(uint64_t h)
+{
+  return static_cast<unsigned long long>((h ^ (h >> 32)) & 0xffffffffULL);
+}
+
 static uint64_t ComputeOnnxContentHash(const char* onnxPath)
 {
   constexpr uint64_t kFnvOffset = 0xcbf29ce484222325ULL;  // FNV-1a 64-bit offset basis
@@ -1404,9 +1413,9 @@ extern "C"
     // hash), so a re-export under the same name gets a fresh engine and no engine cached by the
     // former weakly-typed builds (whose names lack this segment) is ever reused.
     char buffer[512];
-    snprintf(buffer, sizeof(buffer), "%s_b%d-%d-%d_%s_trt%d_st%016llx_%016llx.engine",
+    snprintf(buffer, sizeof(buffer), "%s_b%d-%d-%d_%s_trt%d_st%08llx_%08llx.engine",
       basename.c_str(), minBatch, optBatch, maxBatch, gpuId.c_str(), trtVersion,
-      static_cast<unsigned long long>(onnxHash), static_cast<unsigned long long>(hash));
+      Fold32(onnxHash), Fold32(hash));
 
     return strdup(buffer);
   }
@@ -2626,12 +2635,47 @@ extern "C"
       return -4;
     }
 
-    // Set the named weights
-    // Weights are expected to be FP16 (Half precision)
+    // Set the named weights. The caller always passes FP16 (Half) data, but in a strongly-typed
+    // network the weight keeps the dtype the ONNX declares: norm gains / eps inside an fp32
+    // island are FP32 initializers (upcast in place, or "<name>_fp32isl_f32" twins). Ask the
+    // refitter for the prototype and widen Half -> float on the fly when needed; the float
+    // buffer must outlive refitCudaEngine() below, hence the local vector.
+    std::vector<float> widened;
     nvinfer1::Weights trtWeights;
     trtWeights.type = nvinfer1::DataType::kHALF;
     trtWeights.values = weights;
     trtWeights.count = numElements;
+    const nvinfer1::Weights proto = refitter->getWeightsPrototype(weightTensorName);
+    if (proto.type == nvinfer1::DataType::kFLOAT)
+    {
+      const uint16_t* h = static_cast<const uint16_t*>(weights);
+      widened.resize(static_cast<size_t>(numElements));
+      for (int64_t i = 0; i < numElements; ++i)
+      {
+        // IEEE half -> float (handles normals, subnormals, inf/nan)
+        const uint32_t x = h[i];
+        const uint32_t sign = (x & 0x8000u) << 16;
+        uint32_t exp = (x >> 10) & 0x1fu;
+        uint32_t mant = x & 0x3ffu;
+        uint32_t bits;
+        if (exp == 0)
+        {
+          if (mant == 0) bits = sign;
+          else
+          {
+            exp = 127 - 15 + 1;
+            while ((mant & 0x400u) == 0) { mant <<= 1; --exp; }
+            mant &= 0x3ffu;
+            bits = sign | (exp << 23) | (mant << 13);
+          }
+        }
+        else if (exp == 0x1fu) bits = sign | 0x7f800000u | (mant << 13);
+        else bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+        std::memcpy(&widened[static_cast<size_t>(i)], &bits, sizeof(float));
+      }
+      trtWeights.type = nvinfer1::DataType::kFLOAT;
+      trtWeights.values = widened.data();
+    }
 
     bool success = refitter->setNamedWeights(weightTensorName, trtWeights);
     if (!success)
@@ -3287,9 +3331,9 @@ extern "C"
 
     // "st<onnx fingerprint>" segment: see TRT_GenerateCacheFilenameForDevice.
     char buffer[1024];
-    snprintf(buffer, sizeof(buffer), "%s_mp%s_%s_trt%d_st%016llx_%016llx.engine",
+    snprintf(buffer, sizeof(buffer), "%s_mp%s_%s_trt%d_st%08llx_%08llx.engine",
       basename.c_str(), batchStr.c_str(), gpuId.c_str(), trtVersion,
-      static_cast<unsigned long long>(onnxHash), static_cast<unsigned long long>(hash));
+      Fold32(onnxHash), Fold32(hash));
 
     return strdup(buffer);
   }

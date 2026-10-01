@@ -56,7 +56,7 @@ extern "C"
     int32_t useCudaGraphs;             // 1 = true, 0 = false (default)
     int32_t useFP16;                   // IGNORED for precision (the ONNX is FP16-typed already); still part of the engine-cache key
     int32_t useBF16;                   // IGNORED (no BF16 builder flag; a BF16 engine needs a BF16-typed ONNX); still part of the cache key
-    int32_t useFP8;                    // Label/cache key only: FP8 comes from FP8 Q/DQ nodes in the ONNX (no builder flag)
+    int32_t useFP8;                    // 1 = FP8 export expected: the ONNX MUST carry Q/DQ nodes (build is refused otherwise); label + cache key
     int32_t useBest;                   // IGNORED (no precision-constraint flags); still part of the cache key
     int32_t minBatchSize;              // Min batch size for optimization profile (0 = use batchSize)
     int32_t optBatchSize;              // Optimal batch size for optimization profile (0 = use batchSize)
@@ -108,6 +108,8 @@ extern "C"
   // st{onnxhash}: "strongly typed" marker + fingerprint of the ONNX content (size, first and last
   // 1 MB), so a re-exported ONNX under the same name never reuses a stale engine and no engine
   // cached by the former weakly-typed builds (names without this segment) is ever picked up.
+  // Both hashes are written as 8 hex digits (64-bit values folded to 32) to keep the full cache
+  // path under Windows MAX_PATH for long net basenames.
   // The multi-profile variant uses {basename}_mp{b1-b2-..}_{gpuid}_trt{version}_st{onnxhash}_{optionshash}.engine.
   TRT_API char* TRT_GenerateCacheFilename(const char* onnxPath, int32_t batchSize,
     const TRT_BuildOptions* options);
