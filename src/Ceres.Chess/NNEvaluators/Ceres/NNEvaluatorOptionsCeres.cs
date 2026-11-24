@@ -118,6 +118,13 @@ namespace Ceres.Chess.NNEvaluators.Ceres
     public bool UseInt8 { get; init; } = false;
 
     /// <summary>
+    /// TensorRT plugin libraries (comma-separated full paths) to load before the engine is built or
+    /// deserialized, for ONNX graphs with custom-domain plugin nodes (e.g. BT6TermsAttention).
+    /// Network option PLUGIN=<path>[,<path>...] (TensorRTNative only). Env CERES_TRT_PLUGINS is the fallback.
+    /// </summary>
+    public string TrtPluginLibraries { get; init; } = null;
+
+    /// <summary>
     /// When true, build an FP8 (E4M3) TensorRT engine from an FP8-QDQ ONNX
     /// (CeresTrain scripts/qdq_export.py --precision fp8). FP8 is floating-point
     /// so it preserves small-magnitude signals (e.g. the value head) that
@@ -239,6 +246,7 @@ namespace Ceres.Chess.NNEvaluators.Ceres
 
       bool useBF16 = CheckOptionSpecifiedElseDefaultBoolean(optionsDict, "BF16", false);
       bool useInt8 = CheckOptionSpecifiedElseDefaultBoolean(optionsDict, "INT8", false);
+      string trtPluginLibraries = optionsDict != null && optionsDict.TryGetValue("PLUGIN", out string pluginValue) ? pluginValue : TrtPluginLibraries;
       bool useFP8 = CheckOptionSpecifiedElseDefaultBoolean(optionsDict, "FP8", false);
       bool refittable = CheckOptionSpecifiedElseDefaultBoolean(optionsDict, "REFITTABLE", false);
       int fp32AllNorms = CheckOptionSpecifiedElseDefaultInt(optionsDict, "FP32ALLNORMS", -1, -1, 4);
@@ -296,6 +304,7 @@ namespace Ceres.Chess.NNEvaluators.Ceres
         PlySinceLastMoveMode = plySinceMode,
         UseBF16 = useBF16,
         UseInt8 = useInt8,
+        TrtPluginLibraries = trtPluginLibraries,
         UseFP8 = useFP8,
         Refittable = refittable,
         Fp32AllNorms = fp32AllNorms,

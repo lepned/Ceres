@@ -45,6 +45,9 @@ internal static partial class TensorRTNative
   [LibraryImport(LibraryName, EntryPoint = "TRT_GetLastError")]
   internal static partial IntPtr GetLastError();
 
+  [LibraryImport(LibraryName, EntryPoint = "TRT_LoadPluginLibrary", StringMarshalling = StringMarshalling.Utf8)]
+  internal static partial int LoadPluginLibrary(string path);
+
   // =========================================================================
   // Build options
   // =========================================================================

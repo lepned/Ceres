@@ -31,6 +31,12 @@ extern "C"
   // Get last error message (nullptr if no error).
   TRT_API const char* TRT_GetLastError();
 
+  // Load a TensorRT plugin library (IPluginV3, exporting getCreators/setLoggerFinder) into the
+  // process-global plugin registry. Must precede building or deserializing any engine whose ONNX
+  // or plan uses the plugin. Idempotent per path. Returns 0 on success, negative on error.
+  // TRT_Init also loads every library listed in env CERES_TRT_PLUGINS (';' Windows, ':' Linux).
+  TRT_API int32_t TRT_LoadPluginLibrary(const char* path);
+
   // =========================================================================
   // Engine Management
   // =========================================================================

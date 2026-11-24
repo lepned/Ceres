@@ -54,6 +54,40 @@ public sealed class TensorRT : IDisposable
 
 
   /// <summary>
+  /// Loads TensorRT plugin libraries (comma-separated full paths) into the process-global plugin
+  /// registry. Must be called before any engine of a net using the plugin is built or deserialized
+  /// (including from the engine cache). Each path is loaded once; repeated calls are no-ops.
+  /// </summary>
+  public static void LoadPluginLibraries(string commaSeparatedPaths)
+  {
+    if (string.IsNullOrWhiteSpace(commaSeparatedPaths))
+    {
+      return;
+    }
+
+    _ = Instance; // TRT_Init first (it also loads env CERES_TRT_PLUGINS)
+    foreach (string raw in commaSeparatedPaths.Split(','))
+    {
+      string path = raw.Trim();
+      if (path.Length == 0)
+      {
+        continue;
+      }
+      string fullPath = System.IO.Path.GetFullPath(path);
+      if (!System.IO.File.Exists(fullPath))
+      {
+        throw new System.IO.FileNotFoundException($"TensorRT plugin library not found: {fullPath}");
+      }
+      if (TensorRTNative.LoadPluginLibrary(fullPath) != 0)
+      {
+        string error = TensorRTNative.GetLastErrorString();
+        throw new InvalidOperationException($"TensorRT plugin library failed to load: {fullPath} ({error ?? "unknown error"})");
+      }
+    }
+  }
+
+
+  /// <summary>
   /// Gets the TensorRT version as (Major, Minor, Patch).
   /// </summary>
   public static (int Major, int Minor, int Patch) Version

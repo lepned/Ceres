@@ -122,6 +122,54 @@ namespace
     g_lastError = error;
   }
 
+  // TensorRT plugin libraries (IPluginV3 libraries exporting getCreators/setLoggerFinder, e.g.
+  // bt6_trt_plugin.dll / libbt6_trt_plugin.so for the BT6TermsAttention node). The registry is
+  // process-global: a library must be loaded before the ONNX parse that meets its custom node and
+  // before any deserializeCudaEngine of a plan that uses it (a plan stores only the plugin's name,
+  // version and fields, not its code). Each distinct path is loaded once; caller holds g_mutex.
+  std::vector<std::string> g_loadedPluginLibraries;
+
+  int32_t LoadPluginLibraryLocked(const std::string& path)
+  {
+    if (path.empty()) return 0;
+    if (std::find(g_loadedPluginLibraries.begin(), g_loadedPluginLibraries.end(), path) != g_loadedPluginLibraries.end())
+    {
+      return 0;
+    }
+    if (getPluginRegistry()->loadLibrary(path.c_str()) == nullptr)
+    {
+      SetError("TensorRT plugin library failed to load: " + path);
+      fprintf(stderr, "[TensorRTWrapper] ERROR: TensorRT plugin library failed to load: %s\n", path.c_str());
+      return -1;
+    }
+    g_loadedPluginLibraries.push_back(path);
+    fprintf(stderr, "[TensorRTWrapper] TensorRT plugin library loaded: %s\n", path.c_str());
+    return 0;
+  }
+
+  // Env CERES_TRT_PLUGINS = list of plugin library paths (';' separated on Windows, ':' elsewhere).
+  int32_t LoadPluginLibrariesFromEnvLocked()
+  {
+    const char* env = std::getenv("CERES_TRT_PLUGINS");
+    if (!env || !*env) return 0;
+#if defined(_WIN32)
+    const char sep = ';';
+#else
+    const char sep = ':';
+#endif
+    std::string list(env);
+    int32_t rc = 0;
+    size_t start = 0;
+    while (start <= list.size())
+    {
+      size_t end = list.find(sep, start);
+      if (end == std::string::npos) end = list.size();
+      if (LoadPluginLibraryLocked(list.substr(start, end - start)) != 0) rc = -1;
+      start = end + 1;
+    }
+    return rc;
+  }
+
   // Get element size in bytes for a TensorRT data type
   size_t GetElementSize(nvinfer1::DataType dtype)
   {
@@ -413,6 +461,13 @@ extern "C"
       return -1;
     }
 
+    // Plugin libraries named in CERES_TRT_PLUGINS: loaded before the runtime exists, so before
+    // every build (ONNX parse) and every deserializeCudaEngine, including cached engines.
+    if (LoadPluginLibrariesFromEnvLocked() != 0)
+    {
+      return -3;
+    }
+
     g_runtime = nvinfer1::createInferRuntime(g_logger);
     if (!g_runtime)
     {
@@ -449,6 +504,17 @@ extern "C"
   TRT_API int32_t TRT_GetVersion()
   {
     return NV_TENSORRT_VERSION;
+  }
+
+  TRT_API int32_t TRT_LoadPluginLibrary(const char* path)
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!path || !*path)
+    {
+      SetError("TRT_LoadPluginLibrary: empty path");
+      return -1;
+    }
+    return LoadPluginLibraryLocked(path);
   }
 
   TRT_API const char* TRT_GetLastError()

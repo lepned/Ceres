@@ -2728,6 +2728,14 @@ public class NNEvaluatorTensorRT : NNEvaluator
     bool forceFP8 = options is NNEvaluatorOptionsCeres optionsCeresFP8 && optionsCeresFP8.UseFP8;
     bool refittable = options is NNEvaluatorOptionsCeres optionsCeresRefit && optionsCeresRefit.Refittable;
     int fp32AllNorms = options is NNEvaluatorOptionsCeres optionsCeresNorms ? optionsCeresNorms.Fp32AllNorms : -1;
+
+    // TensorRT plugin libraries (network option PLUGIN=<path>[,<path>]) must be registered before
+    // the ONNX parse and before any (cached) engine deserialization of this net.
+    if (options is NNEvaluatorOptionsCeres optionsCeresPlugin && !string.IsNullOrWhiteSpace(optionsCeresPlugin.TrtPluginLibraries))
+    {
+      TensorRT.LoadPluginLibraries(optionsCeresPlugin.TrtPluginLibraries);
+      Console.WriteLine($"  TensorRT plugin libraries: {optionsCeresPlugin.TrtPluginLibraries}");
+    }
     // INT8 and FP8 (QDQ) both use the multi-profile path, which now builds a
     // STRONGLY-TYPED network so TRT honors the ONNX/QDQ types exactly (the fix
     // for the value-head collapse — standard TRT was discarding dequant scales).
