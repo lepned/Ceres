@@ -14,6 +14,7 @@
 #region Using directives
 
 using System;
+using System.Diagnostics;
 using System.Buffers.Binary;
 using System.IO;
 using System.Net.Sockets;
@@ -100,6 +101,13 @@ namespace Ceres.Chess.NNEvaluators.Remote
     ///            content-driven (HasCompactHistories from batch content, HasPlanes only when
     ///            planes present and no compact records). MCGS clients ship compact records even
     ///            to LC0 servers (which materialize planes server-side), a wire size reduction.
+    ///
+    /// Later additions did not change the version, because old and new builds interoperate:
+    ///   - the handshake carries an optional trailing stream index (see NNDeviceSlots), which the server
+    ///     makes part of its evaluator cache key so that several concurrent streams placed on the same
+    ///     remote device(s) each get their own evaluator. An older server ignores it (the streams then
+    ///     share one evaluator), and a handshake without it is taken as stream 0.
+    ///   - a Disconnect received in place of a Handshake is a reachability probe (closed silently).
     /// </summary>
     public const int PROTOCOL_VERSION = 4;
 
@@ -120,6 +128,55 @@ namespace Ceres.Chess.NNEvaluators.Remote
     /// </summary>
     public const int DEFAULT_READ_TIMEOUT_MS = 30 * 60 * 1000;
 
+    /// <summary>
+    /// If clients ask for Zstd compression of their evaluation requests.
+    /// Compression trades CPU time (on both sides) for time on the wire: it pays off on links of
+    /// about 1 Gbit/s or slower, is roughly neutral at 2.5 Gbit/s and costs time at 10 Gbit/s.
+    /// Can be turned off by setting the environment variable CERES_REMOTE_COMPRESSION=0 on the client.
+    /// Never used for connections to the local machine.
+    /// </summary>
+    public static bool CompressionEnabled = Environment.GetEnvironmentVariable("CERES_REMOTE_COMPRESSION") != "0";
+
+    /// <summary>
+    /// If clients ask for results whose policies carry only their used move slots (see
+    /// NNRemoteResultFlags.CompactPolicies), which are less than half the size. Such results are Zstd
+    /// compressed only if they also carry bulky outputs (see NNRemoteServer).
+    /// Can be turned off by setting the environment variable CERES_REMOTE_COMPACT_POLICIES=0 on the client.
+    /// </summary>
+    public static bool CompactPoliciesEnabled = Environment.GetEnvironmentVariable("CERES_REMOTE_COMPACT_POLICIES") != "0";
+
+    /// <summary>
+    /// Client capability bits, sent in the handshake byte which formerly held only the compression flag
+    /// (so that older servers still read it as "compression on/off").
+    /// </summary>
+    public const byte CLIENT_CAPABILITY_COMPRESSION = 1;
+
+    /// <summary>
+    /// The client can read results whose policies carry only their used move slots
+    /// (see NNRemoteResultFlags.CompactPolicies).
+    /// </summary>
+    public const byte CLIENT_CAPABILITY_COMPACT_POLICIES = 2;
+
+
+    #region Performance diagnostics (see NNRemotePerfStats)
+
+    /// <summary>
+    /// Stopwatch timestamp at which the header of the message most recently read on this thread had arrived.
+    /// </summary>
+    [ThreadStatic] internal static long PerfHeaderTimestamp;
+
+    /// <summary>
+    /// Stopwatch ticks spent in compression/decompression by the most recent WriteMessage/ReadMessage on this thread.
+    /// </summary>
+    [ThreadStatic] internal static long PerfCodecTicks;
+
+    /// <summary>
+    /// Payload bytes actually sent/received on the wire by the most recent WriteMessage/ReadMessage on this thread.
+    /// </summary>
+    [ThreadStatic] internal static int PerfWireBytes;
+
+    #endregion
+
 
     /// <summary>
     /// Writes a framed message to the network stream.
@@ -131,6 +188,7 @@ namespace Ceres.Chess.NNEvaluators.Remote
       Span<byte> header = stackalloc byte[HEADER_SIZE];
       int payloadLength = payload.Length;
       int compressedLength = 0;
+      long codecTicks = 0;
       ReadOnlySpan<byte> dataToSend = payload;
 
       if (useCompression && payloadLength > COMPRESSION_THRESHOLD)
@@ -141,7 +199,9 @@ namespace Ceres.Chess.NNEvaluators.Remote
           compressBuffer = new byte[maxCompressedSize];
         }
 
+        long codecStart = Stopwatch.GetTimestamp();
         int actualCompressed = ZstdBlockCompress.Compress(payload, compressBuffer, ZSTD_LEVEL);
+        codecTicks = Stopwatch.GetTimestamp() - codecStart;
 
         // Only use compression if it actually reduced size.
         if (actualCompressed < payloadLength)
@@ -161,6 +221,9 @@ namespace Ceres.Chess.NNEvaluators.Remote
         stream.Write(dataToSend);
       }
       stream.Flush();
+
+      PerfCodecTicks = codecTicks;
+      PerfWireBytes = dataToSend.Length;
     }
 
 
@@ -174,10 +237,14 @@ namespace Ceres.Chess.NNEvaluators.Remote
     {
       Span<byte> header = stackalloc byte[HEADER_SIZE];
       ReadExact(stream, header);
+      PerfHeaderTimestamp = Stopwatch.GetTimestamp();
+      PerfCodecTicks = 0;
 
       NNRemoteMessageType type = (NNRemoteMessageType)BinaryPrimitives.ReadUInt32LittleEndian(header);
       int payloadLength = (int)BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(4));
       int compressedLength = (int)BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(8));
+
+      PerfWireBytes = compressedLength > 0 ? compressedLength : payloadLength;
 
       if (payloadLength == 0)
       {
@@ -191,9 +258,11 @@ namespace Ceres.Chess.NNEvaluators.Remote
         ReadExact(stream, decompressBuffer.AsSpan(0, compressedLength));
 
         EnsureBufferSize(ref buffer, payloadLength);
+        long codecStart = Stopwatch.GetTimestamp();
         int decompressed = ZstdBlockCompress.Decompress(
           decompressBuffer.AsSpan(0, compressedLength),
           buffer.AsSpan(0, payloadLength));
+        PerfCodecTicks = Stopwatch.GetTimestamp() - codecStart;
 
         if (decompressed != payloadLength)
         {

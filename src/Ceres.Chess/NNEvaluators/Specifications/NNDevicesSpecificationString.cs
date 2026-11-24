@@ -87,6 +87,41 @@ namespace Ceres.Chess.NNEvaluators.Specifications
         throw new Exception("Device specification string has too many equals parts " + deviceString);
       }
 
+      // "+"-joined device groups, e.g. "GPU:0#TensorRTNative+GPU:0,1#TensorRTNative@HOP".
+      // Each group is parsed with the existing syntax and tagged with its GroupIndex.
+      // The factory then builds one sub-evaluator per group (one connection per remote host)
+      // and combines them with a calibrated, latency-aware balanced split.
+      if (equalsParts[0].Contains('+'))
+      {
+        string[] groupStrings = equalsParts[0].Split('+', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        if (groupStrings.Length < 2)
+        {
+          throw new Exception($"Device group specification requires at least two groups: {deviceString}");
+        }
+
+        for (int g = 0; g < groupStrings.Length; g++)
+        {
+          NNDevicesSpecificationString groupSpec = new(groupStrings[g]);
+          if (groupSpec.ComboType == NNEvaluatorDeviceComboType.Pooled)
+          {
+            throw new Exception($"POOLED not supported within a device group: {groupStrings[g]}");
+          }
+
+          foreach ((NNEvaluatorDeviceDef devDef, float weight) in groupSpec.Devices)
+          {
+            if (devDef.Type != NNDeviceType.GPU)
+            {
+              throw new Exception($"Only GPU devices supported in device groups: {groupStrings[g]}");
+            }
+            devDef.GroupIndex = g;
+            Devices.Add((devDef, weight));
+          }
+        }
+
+        ComboType = NNEvaluatorDeviceComboType.Split;
+        return;
+      }
+
       string[] deviceStringParts = equalsParts[0].Split(":");
 
       if (deviceStringParts[0].ToUpper() == "CPU")
@@ -114,6 +149,7 @@ namespace Ceres.Chess.NNEvaluators.Specifications
       // Example: "0@0.75,1@0.25@myhost" -> hostname="myhost", devicesStr="0@0.75,1@0.25"
       string remoteHost = null;
       int remotePort = NNRemoteProtocol.DEFAULT_PORT;
+      int remoteStreamIndex = 0;
       string devicesStr = deviceStringParts[1];
 
       int lastAt = devicesStr.LastIndexOf('@');
@@ -122,15 +158,24 @@ namespace Ceres.Chess.NNEvaluators.Specifications
         string afterAt = devicesStr.Substring(lastAt + 1);
         if (!float.TryParse(afterAt, NumberStyles.Float, CultureInfo.InvariantCulture, out _))
         {
-          // Not a weight -- it's a hostname (possibly with /port suffix).
-          remoteHost = afterAt;
+          // Not a weight -- it's a hostname, possibly with a "/port" suffix and (rarely written by hand,
+          // but emitted by ToSpecificationString) a further "/stream" suffix, e.g. "station/50055/2".
           devicesStr = devicesStr.Substring(0, lastAt);
 
-          int slashIndex = remoteHost.IndexOf('/');
-          if (slashIndex >= 0)
+          string[] hostParts = afterAt.Split('/');
+          if (hostParts.Length > 3 || hostParts[0].Length == 0)
           {
-            remotePort = int.Parse(remoteHost.Substring(slashIndex + 1));
-            remoteHost = remoteHost.Substring(0, slashIndex);
+            throw new Exception($"Invalid remote host specification '@{afterAt}' in {deviceString}, expected @host[/port[/stream]]");
+          }
+
+          remoteHost = hostParts[0];
+          if (hostParts.Length >= 2)
+          {
+            remotePort = int.Parse(hostParts[1], CultureInfo.InvariantCulture);
+          }
+          if (hostParts.Length == 3)
+          {
+            remoteStreamIndex = int.Parse(hostParts[2], CultureInfo.InvariantCulture);
           }
         }
       }
@@ -157,6 +202,7 @@ namespace Ceres.Chess.NNEvaluators.Specifications
         {
           devDef.RemoteHost = remoteHost;
           devDef.RemotePort = remotePort;
+          devDef.StreamIndex = remoteStreamIndex;
         }
         Devices.Add((devDef, device.weight));
       }
@@ -219,6 +265,28 @@ namespace Ceres.Chess.NNEvaluators.Specifications
     public static string ToSpecificationString(NNEvaluatorDeviceComboType comboType,
                                                IEnumerable<(NNEvaluatorDeviceDef, float)> devices)
     {
+      // Device groups are rendered back as "+"-joined group specifications.
+      // The same rendering is used for a (non-grouped) specification whose devices all live on one
+      // remote host, e.g. "GPU:0,1#TensorRTNative@HOP/50055" (the general rendering below omits the host,
+      // which would make an engine launched from this string silently evaluate locally).
+      NNEvaluatorDeviceDef firstDevice = devices.First().Item1;
+      bool allOnOneRemoteHost = firstDevice.RemoteHost != null
+                             && devices.All(d => d.Item1.RemoteHost == firstDevice.RemoteHost
+                                              && d.Item1.RemotePort == firstDevice.RemotePort
+                                              && d.Item1.StreamIndex == firstDevice.StreamIndex);
+      if (devices.Any(d => d.Item1.GroupIndex >= 0) || (allOnOneRemoteHost && comboType != NNEvaluatorDeviceComboType.Pooled))
+      {
+        IEnumerable<string> groupStrs = devices.GroupBy(d => d.Item1.GroupIndex).OrderBy(g => g.Key).Select(g =>
+        {
+          NNEvaluatorDeviceDef first = g.First().Item1;
+          string engine = first.OverrideEngineType != null ? "#" + first.OverrideEngineType : "";
+          string stream = first.StreamIndex != 0 ? "/" + first.StreamIndex : "";
+          string remote = first.RemoteHost != null ? $"@{first.RemoteHost}/{first.RemotePort}{stream}" : "";
+          return $"GPU:{string.Join(",", g.Select(d => d.Item1.DeviceIndex))}{engine}{remote}";
+        });
+        return "Device=" + string.Join("+", groupStrs);
+      }
+
       int count = 0;
       // TODO: Currently support conversion back to original specification string only for simple cases
       if ((comboType == NNEvaluatorDeviceComboType.Single

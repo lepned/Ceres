@@ -1428,8 +1428,14 @@ public partial class UCIManagerMCGS
   {
     if (EvaluatorDef.Nets[i].Net.Type == NNEvaluatorType.LC0)
     {
-      INNWeightsFileInfo net = NNWeightsFiles.LookupNetworkFile(EvaluatorDef.Nets[i].Net.NetworkID);
-      string infoStr = net == null ? "(unknown)" : net.ShortStr;
+      // If evaluation happens on a remote server then the weights file lives there
+      // (and need not exist on this machine), so its absence here is not an error.
+      bool evaluatesRemotely = Array.TrueForAll(EvaluatorDef.Devices, d => d.Device.RemoteHost != null);
+      INNWeightsFileInfo net = NNWeightsFiles.LookupNetworkFile(EvaluatorDef.Nets[i].Net.NetworkID,
+                                                                   throwExceptionIfMissing: !evaluatesRemotely);
+      string infoStr = net != null ? net.ShortStr
+                     : evaluatesRemotely ? EvaluatorDef.Nets[i].Net.NetworkID + " (on remote server)"
+                     : "(unknown)";
       UCIWriteLine($"Loaded network weights: {i} {infoStr}");
     }
     else
@@ -1660,15 +1666,22 @@ public partial class UCIManagerMCGS
     GameEngineSearchResultCeresMCGS result = CeresEngine.Search(curPositionAndMoves, searchLimit, gameMoveHistory, callbackPlain) as GameEngineSearchResultCeresMCGS;
     lastSearchResult = result;
 
+    // Clock consumed is the running total of search seconds for the side which just searched
+    // (including this search), the same basis as used by the in-process tournament harness.
+    // It is carried in the history itself, so it restarts whenever the history does.
+    SideType side = curPositionAndMoves.FinalPosition.MiscInfo.SideToMove;
+    float secondsElapsed = (float)result.TimingStats.ElapsedTimeSecs;
+    float secondsConsumed = secondsElapsed + (gameMoveHistory.FindLast(m => m.Side == side)?.ClockSecondsAlreadyConsumed ?? 0);
+
     GameMoveStat moveStat = new(gameMoveHistory.Count,
-                                curPositionAndMoves.FinalPosition.MiscInfo.SideToMove,
+                                side,
                                 curPositionAndMoves.FinalPosition,
                                 result.ScoreQ, result.ScoreCentipawns,
-                                float.NaN, //engine1.CumulativeSearchTimeSeconds, 
+                                secondsConsumed,
                                 curPositionAndMoves.FinalPosition.PieceCount,
                                 result.MAvg, result.FinalN, result.FinalN - result.StartingN,
                                 searchLimit,
-                                (float)result.TimingStats.ElapsedTimeSecs, result.NPS);
+                                secondsElapsed, result.NPS);
 
     gameMoveHistory.Add(moveStat);
 

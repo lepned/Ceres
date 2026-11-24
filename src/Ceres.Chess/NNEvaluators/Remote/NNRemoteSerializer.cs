@@ -15,6 +15,7 @@
 
 using System;
 using System.Buffers.Binary;
+using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -63,6 +64,13 @@ namespace Ceres.Chess.NNEvaluators.Remote
     HasPlyBinOutputs = 1 << 7,
     HasPunimOutputs = 1 << 8,
     HasPolicySecondary = 1 << 9,
+
+    /// <summary>
+    /// Policies are written with only their used move slots (a count, then that many move indices and
+    /// probabilities) rather than as full fixed-size vectors. Set per result message by servers
+    /// for clients which announced CLIENT_CAPABILITY_COMPACT_POLICIES; never part of the capabilities.
+    /// </summary>
+    CompactPolicies = 1 << 10,
   }
 
 
@@ -385,6 +393,64 @@ namespace Ceres.Chess.NNEvaluators.Remote
 
 
     /// <summary>
+    /// Buffer size sufficient to serialize the given result batch: MaxSerializedResultSize for the flags
+    /// actually written (including the ply-bin/PUNIM outputs SerializeBatchResult adds at runtime), with the
+    /// variable-length State outputs sized from their actual lengths. Without this, nets emitting such
+    /// outputs overflow the handshake-sized buffer once the batch is large enough ("Destination is too short").
+    /// </summary>
+    public static int RequiredResultSize(IPositionEvaluationBatch batch, NNRemoteResultFlags flags)
+    {
+      int numPos = batch.NumPos;
+
+      // Include the optional outputs that SerializeBatchResult adds at runtime when present in the batch
+      // (ply-bin: 2 x 512 values per position, PUNIM: 2 x 8). These are not part of the handshake flags,
+      // so a buffer sized from those flags alone overflows for nets that emit them (e.g. C3 nets).
+      if (batch is PositionEvaluationBatch pebRuntime)
+      {
+        if (pebRuntime.HasPlyBinOutputs && !pebRuntime.PlyBinMoveProbs.IsEmpty) flags |= NNRemoteResultFlags.HasPlyBinOutputs;
+        if (pebRuntime.HasPunimOutputs && !pebRuntime.PunimSelfProbs.IsEmpty) flags |= NNRemoteResultFlags.HasPunimOutputs;
+      }
+
+      int size = MaxSerializedResultSize(numPos, flags & ~NNRemoteResultFlags.HasState);
+      if (flags.HasFlag(NNRemoteResultFlags.HasState))
+      {
+        size += numPos * 4;
+        if (batch is PositionEvaluationBatch peb && !peb.States.IsEmpty)
+        {
+          ReadOnlySpan<Half[]> states = peb.States.Span.Slice(0, numPos);
+          for (int i = 0; i < numPos; i++)
+          {
+            size += (states[i]?.Length ?? 0) * sizeof(ushort);
+          }
+        }
+      }
+      return size;
+    }
+
+
+    /// <summary>
+    /// Buffer size sufficient to serialize the given input batch (variable-length input States sized from
+    /// their actual lengths rather than the 256 elements assumed by MaxSerializedInputSize).
+    /// </summary>
+    public static int RequiredInputSize(IEncodedPositionBatchFlat batch, NNEvaluator.InputTypes requiredInputs)
+    {
+      int numPos = batch.NumPos;
+      int size = MaxSerializedInputSize(numPos);
+      if (requiredInputs.HasFlag(NNEvaluator.InputTypes.State) && !batch.States.IsEmpty)
+      {
+        size -= numPos * 256 * sizeof(ushort); // replace the generic allowance with actual lengths
+        ReadOnlySpan<Half[]> states = batch.States.Span.Slice(0, numPos);
+        for (int i = 0; i < numPos; i++)
+        {
+          size += (states[i]?.Length ?? 0) * sizeof(ushort);
+        }
+        size = Math.Max(size, MaxSerializedInputSize(numPos));
+      }
+      return size;
+    }
+
+
+    /// <summary>
     /// Serializes an IPositionEvaluationBatch into a byte buffer.
     /// Returns the number of bytes written.
     /// </summary>
@@ -414,7 +480,9 @@ namespace Ceres.Chess.NNEvaluators.Remote
       }
 
       // Policies (CompressedPolicyVector[])
-      offset += WriteBlittableSpan(peb.Policies.Span.Slice(0, numPos), buffer.Slice(offset));
+      bool compactPolicies = resultFlags.HasFlag(NNRemoteResultFlags.CompactPolicies);
+      offset += compactPolicies ? WriteCompactPolicies(peb.Policies.Span.Slice(0, numPos), buffer.Slice(offset))
+                                : WriteBlittableSpan(peb.Policies.Span.Slice(0, numPos), buffer.Slice(offset));
 
       // W (FP16[])
       offset += WriteFP16Span(peb.W.Span, numPos, buffer.Slice(offset));
@@ -517,7 +585,8 @@ namespace Ceres.Chess.NNEvaluators.Remote
       // Policy2 (secondary policy head)
       if (resultFlags.HasFlag(NNRemoteResultFlags.HasPolicySecondary) && !peb.Policies2.IsEmpty)
       {
-        offset += WriteBlittableSpan(peb.Policies2.Span.Slice(0, numPos), buffer.Slice(offset));
+        offset += compactPolicies ? WriteCompactPolicies(peb.Policies2.Span.Slice(0, numPos), buffer.Slice(offset))
+                                  : WriteBlittableSpan(peb.Policies2.Span.Slice(0, numPos), buffer.Slice(offset));
       }
 
       return offset;
@@ -548,8 +617,10 @@ namespace Ceres.Chess.NNEvaluators.Remote
       bool hasPolicySecondary = flags.HasFlag(NNRemoteResultFlags.HasPolicySecondary);
 
       // Policies
+      bool compactPolicies = flags.HasFlag(NNRemoteResultFlags.CompactPolicies);
       CompressedPolicyVector[] policies = new CompressedPolicyVector[numPos];
-      offset += ReadBlittableSpan(buffer.Slice(offset), policies.AsSpan());
+      offset += compactPolicies ? ReadCompactPolicies(buffer.Slice(offset), policies.AsSpan())
+                                : ReadBlittableSpan(buffer.Slice(offset), policies.AsSpan());
 
       // W
       FP16[] w = new FP16[numPos];
@@ -637,7 +708,8 @@ namespace Ceres.Chess.NNEvaluators.Remote
       if (hasPolicySecondary)
       {
         policies2 = new CompressedPolicyVector[numPos];
-        offset += ReadBlittableSpan(buffer.Slice(offset), policies2.AsSpan());
+        offset += compactPolicies ? ReadCompactPolicies(buffer.Slice(offset), policies2.AsSpan())
+                                  : ReadBlittableSpan(buffer.Slice(offset), policies2.AsSpan());
       }
 
       // Construct the result batch using the Memory<>-based constructor.
@@ -674,7 +746,7 @@ namespace Ceres.Chess.NNEvaluators.Remote
     public static int SerializeHandshake(Span<byte> buffer,
                                           string networkSpec, string deviceSpec,
                                           string optionsString, int maxBatchSize,
-                                          bool useCompression)
+                                          bool useCompression, bool acceptCompactPolicies = true, int streamIndex = 0)
     {
       int offset = 0;
       offset += NNRemoteProtocol.WriteString(buffer.Slice(offset), networkSpec);
@@ -682,8 +754,19 @@ namespace Ceres.Chess.NNEvaluators.Remote
       offset += NNRemoteProtocol.WriteString(buffer.Slice(offset), optionsString);
       BinaryPrimitives.WriteInt32LittleEndian(buffer.Slice(offset), maxBatchSize);
       offset += 4;
-      buffer[offset++] = useCompression ? (byte)1 : (byte)0;
+      // Capability bits (an older server reads this byte as "compression on" whenever it is nonzero;
+      // the client copes with either, since each message header says whether its payload is compressed).
+      byte capabilities = 0;
+      if (useCompression) capabilities |= NNRemoteProtocol.CLIENT_CAPABILITY_COMPRESSION;
+      if (acceptCompactPolicies) capabilities |= NNRemoteProtocol.CLIENT_CAPABILITY_COMPACT_POLICIES;
+      buffer[offset++] = capabilities;
       BinaryPrimitives.WriteInt32LittleEndian(buffer.Slice(offset), NNRemoteProtocol.PROTOCOL_VERSION);
+      offset += 4;
+
+      // Optional trailing field (ignored by older servers, which then share one evaluator among all streams):
+      // index of the concurrent stream on whose behalf the client evaluates (see NNDeviceSlots). The server
+      // makes it part of its evaluator cache key so that streams placed on the same device(s) do not share an evaluator.
+      BinaryPrimitives.WriteInt32LittleEndian(buffer.Slice(offset), streamIndex);
       offset += 4;
       return offset;
     }
@@ -693,7 +776,7 @@ namespace Ceres.Chess.NNEvaluators.Remote
     /// Deserializes the client handshake message.
     /// </summary>
     public static (string networkSpec, string deviceSpec, string optionsString,
-                    int maxBatchSize, bool useCompression, int protocolVersion)
+                    int maxBatchSize, bool useCompression, int protocolVersion, bool acceptsCompactPolicies, int streamIndex)
       DeserializeHandshake(ReadOnlySpan<byte> buffer)
     {
       int offset = 0;
@@ -706,11 +789,21 @@ namespace Ceres.Chess.NNEvaluators.Remote
       offset += n3;
       int maxBatchSize = BinaryPrimitives.ReadInt32LittleEndian(buffer.Slice(offset));
       offset += 4;
-      bool useCompression = buffer[offset++] != 0;
+      byte capabilities = buffer[offset++];
+      bool useCompression = (capabilities & NNRemoteProtocol.CLIENT_CAPABILITY_COMPRESSION) != 0;
+      bool acceptsCompactPolicies = (capabilities & NNRemoteProtocol.CLIENT_CAPABILITY_COMPACT_POLICIES) != 0;
       int protocolVersion = BinaryPrimitives.ReadInt32LittleEndian(buffer.Slice(offset));
       offset += 4;
 
-      return (networkSpec, deviceSpec, optionsString, maxBatchSize, useCompression, protocolVersion);
+      // Optional trailing field (absent in handshakes from older clients, in which case stream 0 is assumed).
+      int streamIndex = 0;
+      if (buffer.Length >= offset + 4)
+      {
+        streamIndex = BinaryPrimitives.ReadInt32LittleEndian(buffer.Slice(offset));
+        offset += 4;
+      }
+
+      return (networkSpec, deviceSpec, optionsString, maxBatchSize, useCompression, protocolVersion, acceptsCompactPolicies, streamIndex);
     }
 
 
@@ -723,7 +816,9 @@ namespace Ceres.Chess.NNEvaluators.Remote
                                              int maxBatchSize,
                                              NNEvaluator.InputTypes inputsRequired,
                                              string engineNetworkID,
-                                             string serverInfo)
+                                             string serverInfo,
+                                             int numDevices = 0,
+                                             long networkFileSizeBytes = 0)
     {
       int offset = 0;
       buffer[offset++] = success ? (byte)1 : (byte)0;
@@ -735,6 +830,14 @@ namespace Ceres.Chess.NNEvaluators.Remote
       offset += 4;
       offset += NNRemoteProtocol.WriteString(buffer.Slice(offset), engineNetworkID);
       offset += NNRemoteProtocol.WriteString(buffer.Slice(offset), serverInfo);
+
+      // Optional trailing fields (ignored by older clients, absent from older servers):
+      // number of compute devices behind the server's evaluator and size of its network file,
+      // which the client's search uses to size batches exactly as it would for a local evaluator.
+      BinaryPrimitives.WriteInt32LittleEndian(buffer.Slice(offset), numDevices);
+      offset += 4;
+      BinaryPrimitives.WriteInt64LittleEndian(buffer.Slice(offset), networkFileSizeBytes);
+      offset += 8;
       return offset;
     }
 
@@ -743,7 +846,8 @@ namespace Ceres.Chess.NNEvaluators.Remote
     /// Deserializes the server handshake acknowledgment.
     /// </summary>
     public static (bool success, NNRemoteResultFlags resultFlags, int maxBatchSize,
-                    NNEvaluator.InputTypes inputsRequired, string engineNetworkID, string serverInfo)
+                    NNEvaluator.InputTypes inputsRequired, string engineNetworkID, string serverInfo,
+                    int numDevices, long networkFileSizeBytes)
       DeserializeHandshakeAck(ReadOnlySpan<byte> buffer)
     {
       int offset = 0;
@@ -760,7 +864,18 @@ namespace Ceres.Chess.NNEvaluators.Remote
       var (serverInfo, n2) = NNRemoteProtocol.ReadString(buffer.Slice(offset));
       offset += n2;
 
-      return (success, resultFlags, maxBatchSize, inputsRequired, engineNetworkID, serverInfo);
+      // Optional trailing fields (absent when the server predates them): 0 means unknown.
+      int numDevices = 0;
+      long networkFileSizeBytes = 0;
+      if (buffer.Length >= offset + 12)
+      {
+        numDevices = BinaryPrimitives.ReadInt32LittleEndian(buffer.Slice(offset));
+        offset += 4;
+        networkFileSizeBytes = BinaryPrimitives.ReadInt64LittleEndian(buffer.Slice(offset));
+        offset += 8;
+      }
+
+      return (success, resultFlags, maxBatchSize, inputsRequired, engineNetworkID, serverInfo, numDevices, networkFileSizeBytes);
     }
 
 
@@ -786,6 +901,105 @@ namespace Ceres.Chess.NNEvaluators.Remote
       offset += n1;
       var (message, n2) = NNRemoteProtocol.ReadString(buffer.Slice(offset));
       return (exceptionType, message);
+    }
+
+    #endregion
+
+
+    #region Compact policies
+
+    // Byte offsets of the fields of CompressedPolicyVector (determined from the actual layout).
+    static readonly int policySideOffset;
+    static readonly int policyIndicesOffset;
+    static readonly int policyProbabilitiesOffset;
+
+    static NNRemoteSerializer()
+    {
+      CompressedPolicyVector sample = default;
+      ref byte start = ref Unsafe.As<CompressedPolicyVector, byte>(ref sample);
+      policySideOffset = (int)Unsafe.ByteOffset(ref start, ref Unsafe.As<SideType, byte>(ref Unsafe.AsRef(in sample.Side)));
+      policyIndicesOffset = (int)Unsafe.ByteOffset(ref start,
+        ref Unsafe.As<ushort, byte>(ref MemoryMarshal.GetReference(sample.MoveIndicesSpan)));
+      policyProbabilitiesOffset = (int)Unsafe.ByteOffset(ref start,
+        ref Unsafe.As<ushort, byte>(ref MemoryMarshal.GetReference(sample.ProbabilitiesSpan)));
+    }
+
+
+    /// <summary>
+    /// Writes policies with only their used move slots. Per position:
+    ///   [1 byte] number of slots n written (those before the terminator, at most NUM_MOVE_SLOTS)
+    ///   [1 byte] side
+    ///   [n * 2 bytes] move indices, [n * 2 bytes] probabilities
+    /// A position typically has about 30 legal moves, so this is well under half the size of the
+    /// full 80-slot vector at negligible CPU cost (it never exceeds the size of the full vector).
+    /// Returns bytes written.
+    /// </summary>
+    static int WriteCompactPolicies(ReadOnlySpan<CompressedPolicyVector> policies, Span<byte> dest)
+    {
+      const int NUM_SLOTS = CompressedPolicyVector.NUM_MOVE_SLOTS;
+      int policySize = Unsafe.SizeOf<CompressedPolicyVector>();
+      ReadOnlySpan<byte> raw = MemoryMarshal.AsBytes(policies);
+
+      int offset = 0;
+      for (int i = 0; i < policies.Length; i++)
+      {
+        ReadOnlySpan<byte> policy = raw.Slice(i * policySize, policySize);
+        ReadOnlySpan<ushort> indices = MemoryMarshal.Cast<byte, ushort>(policy.Slice(policyIndicesOffset, NUM_SLOTS * sizeof(ushort)));
+
+        int numUsed = indices.IndexOf(CompressedPolicyVector.SPECIAL_VALUE_SENTINEL_TERMINATOR);
+        if (numUsed < 0)
+        {
+          numUsed = NUM_SLOTS;
+        }
+
+        dest[offset++] = (byte)numUsed;
+        dest[offset++] = policy[policySideOffset];
+
+        int numBytes = numUsed * sizeof(ushort);
+        policy.Slice(policyIndicesOffset, numBytes).CopyTo(dest.Slice(offset));
+        offset += numBytes;
+        policy.Slice(policyProbabilitiesOffset, numBytes).CopyTo(dest.Slice(offset));
+        offset += numBytes;
+      }
+      return offset;
+    }
+
+
+    /// <summary>
+    /// Reads policies written by WriteCompactPolicies into dest (which must be zero initialized).
+    /// Returns bytes consumed.
+    /// </summary>
+    static int ReadCompactPolicies(ReadOnlySpan<byte> src, Span<CompressedPolicyVector> dest)
+    {
+      const int NUM_SLOTS = CompressedPolicyVector.NUM_MOVE_SLOTS;
+      int policySize = Unsafe.SizeOf<CompressedPolicyVector>();
+      Span<byte> raw = MemoryMarshal.AsBytes(dest);
+
+      int offset = 0;
+      for (int i = 0; i < dest.Length; i++)
+      {
+        Span<byte> policy = raw.Slice(i * policySize, policySize);
+
+        int numUsed = src[offset++];
+        if (numUsed > NUM_SLOTS)
+        {
+          throw new InvalidDataException($"Compact policy has {numUsed} move slots (maximum {NUM_SLOTS}).");
+        }
+        policy[policySideOffset] = src[offset++];
+
+        int numBytes = numUsed * sizeof(ushort);
+        src.Slice(offset, numBytes).CopyTo(policy.Slice(policyIndicesOffset));
+        offset += numBytes;
+        src.Slice(offset, numBytes).CopyTo(policy.Slice(policyProbabilitiesOffset));
+        offset += numBytes;
+
+        if (numUsed < NUM_SLOTS)
+        {
+          BinaryPrimitives.WriteUInt16LittleEndian(policy.Slice(policyIndicesOffset + numBytes),
+                                                   CompressedPolicyVector.SPECIAL_VALUE_SENTINEL_TERMINATOR);
+        }
+      }
+      return offset;
     }
 
     #endregion
