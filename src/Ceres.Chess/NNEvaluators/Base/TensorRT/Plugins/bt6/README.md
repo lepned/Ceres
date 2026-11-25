@@ -39,14 +39,14 @@ The ONNX file must be the plugin ONNX (see below); a plain ONNX file runs withou
 One command per checkpoint:
 
 ```
-python make_plugin_onnx.py <served m80.onnx> <net.ts | ckpt> <out_dir> --fp16 | --int8 [--gate] [--keep]
+python make_plugin_onnx.py <served m80.onnx> <net.ts | ckpt> <out_dir> --fp16 | --int8 [--qdq F] [--gate] [--keep]
 ```
 
-FP16 chain: `bt6_trt_plugin_params` -> `bt6_trt_plugin_onnx` -> `bt6_trt_plugin_onnx_r2 --site` ->
-`bt6_trt_plugin_merge --coef --ffn` -> `bt6_trt_plugin_dec_r4`.
+The steps are functions in `bt6_trt_plugin_export.py` (one module; its command line runs a single step).
+FP16 chain: `dump_params` -> `terms_attention` -> `prologue_sites` -> `merge_gemms` (coef, ffn) -> `decoder`.
 INT8 chain: the plain INT8 QDQ ONNX (`qdq_export.py` percentile 99.9999 + shape allowlist, `qdq_to_fp16.py` with
-fp32 islands), then params -> onnx -> onnx_r2 --site -> `port_qdq --exclude 1536x768` -> `merge --coef` ->
-`glu_r3` -> `i8out_r3` -> `dec_r4`.
+fp32 islands; `--qdq` reuses an existing one), then `dump_params` -> `terms_attention` -> `prologue_sites` ->
+`port_qdq` (exclude 1536x768) -> `merge_gemms` (coef) -> `glu_quant` -> `attn_int8_out` -> `decoder`.
 
 ## Check
 
