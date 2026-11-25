@@ -311,6 +311,14 @@ namespace Ceres.Chess.NNEvaluators
 
           if (isTensorRTNative)
           {
+            // TensorRT plugin libraries (network option PLUGIN=<path>[,<path>]) also for LC0-format nets, e.g. an lc0
+            // BT6 net with the bt6 plugins (Plugins/bt6). The Ceres-net path loads them in BuildEvaluator from
+            // NNEvaluatorOptionsCeres; here the options are the generic ones, so load them before the engine build.
+            if (optionsDict != null && optionsDict.TryGetValue("PLUGIN", out string lc0PluginLibraries))
+            {
+              TensorRT.TensorRT.LoadPluginLibraries(lc0PluginLibraries);
+              Console.WriteLine($"  TensorRT plugin libraries: {lc0PluginLibraries}");
+            }
             return NNEvaluatorTensorRT.BuildEvaluator(netDef, gpuIDs: [deviceDef.DeviceIndex], options,
                                                       ONNXNetExecutor.NetTypeEnum.LC0, fullFN,
                                                       referenceEvaluator: ReferenceForDevice(referenceEvaluator, referenceEvaluatorIndex));
