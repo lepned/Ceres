@@ -1,4 +1,4 @@
-# BT6 TensorRT plugins (round 4)
+# BT6 TensorRT plugins (round 4 + lc0 BT6)
 
 TensorRT IPluginV3 plugins for nets with BT6 term layers and the move-token decoder (for example the 768x16 flat
 BT6 HL-Gauss net). One library holds all of them; every older name / version is kept, so plugin ONNX files from
@@ -14,6 +14,13 @@ earlier rounds still build.
 | `BT6GluQuant` | 1 | SiLU(gate + bias) * up and per-token INT8 quantization of the FFN down input |
 | `BT6DecAttn` | 1 | one attention of a move-token decoder block (self / cross / post-move) |
 | `BT6DecHead` | 1 | decoder read-out: out_ln, policy with per-move bias, mean / max pooling |
+| `BT6EgtAttention` | 1 | lc0 BT6 attention (32 heads, [Q\|K\|V\|G] packing, 2·sigmoid output gate, per-head qk_scale, door-scaled H for the sites, optional INT8 output) |
+| `BT6PlanesPrologue` | 1 | the prologue of an lc0 BT6 net read from the 112 lc0 planes |
+| `BT6TripletSite` | 1 | lc0 BT6 edge site with the triplet branch (contraction path / ag) |
+| `BT6SigGluQuant` | 1 | sigmoid GLU (sigmoid(gate) · (up + b)) and per-token INT8 of the FFN down input |
+| `BT6RowQuant` | 1 | per-token INT8 quantisation of a tensor (attention output before the out GEMM) |
+
+lc0 BT6 nets (Kovax's BT6 flagship): ONNX chain, gates and results in `tools/kovax_bt6/README.md`.
 
 ## Build
 

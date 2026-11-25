@@ -17,6 +17,13 @@
 // e0 FP16 [B, 64, 64, 16] cell-major (channel innermost: the BT6TermsAttention state input and edge site 1's
 // channels-last input, without the transposes).
 // Table blob tab32 FP32: D [34][16] | Pin [34][16] | T [225][16] | Toff [225][16].
+//
+// k1 (2026-11-25): BT6PlanesPrologue, the same kernel (template kPlanes) for Kovax's BT6 flagship, straight from the lc0
+// input planes FP32 [B, 112, 64] (planes 0-11 current, 13-24 previous, > 0.5; bt6_net.forward_served): NO substitution
+// of a missing history (bt6_relations: an all-zero previous frame gives gained = all attacks, lost = nothing). Its
+// mix_codes / offsets are exactly linear / relidx-only (checked: max deviation 2.3e-7 / 0), so D = channel_mix,
+// Pin = edge_mix, T = offsets by relidx, Toff = edge_offsets by relidx. A 4th output carries the policy head's pair
+// term pol FP32 [B, 64, 64] = S (sum_c psc[c] E[c, i, j] + pcb[i, j]) (tab32 continues: psc [34] | pcb [4096]).
 #include <cuda_fp16.h>
 #include <cstdint>
 #include "bt6_kernels.h"
@@ -120,16 +127,23 @@ constexpr int kThreads = 256;
 constexpr int kTabD = 0, kTabPin = 34 * 16, kTabT = 2 * 34 * 16, kTabToff = kTabT + 225 * 16;
 constexpr int kTab = kTabToff + 225 * 16;
 
+constexpr int kTabPsc = kTab, kTabPcb = kTab + 34, kTabPlanes = kTab + 34 + 4096;
+
+template <bool kPlanes>
 __global__ void __launch_bounds__(kThreads) bt6_prologue(int* __restrict__ edges, __half* __restrict__ norm,
-                                                         __half* __restrict__ state, const __half* __restrict__ squares,
-                                                         const float* __restrict__ tab, int rows_per_cta, float eps) {
+                                                         __half* __restrict__ state, const void* __restrict__ input,
+                                                         const float* __restrict__ tab, int rows_per_cta, float eps,
+                                                         float* __restrict__ pol, float* __restrict__ e0f) {
   __shared__ u64 sRows[17][64];
   __shared__ unsigned int sPlane[24][2];   // 12 current + 12 previous piece boards, 32-bit halves
   __shared__ float sDP[34][32];            // per channel: D[c][0..15] | Pin[c][0..15]
   __shared__ float sT[225][32];            // per relative bin: T[r][0..15] | Toff[r][0..15]
   __shared__ int sAnyPrev;
+  __shared__ float sPsc[34];
   const int b = blockIdx.x, part = blockIdx.y, tid = threadIdx.x;
-  const __half* rec = squares + (size_t)b * 64 * kRecord;
+  const __half* rec = static_cast<const __half*>(input) + (size_t)b * 64 * kRecord;
+  const float* pl = static_cast<const float*>(input) + (size_t)b * 112 * 64;
+  if (kPlanes && tid < 34) sPsc[tid] = __ldg(tab + kTabPsc + tid);
 
   for (int k = tid; k < 34 * 32; k += kThreads) {
     const int c = k >> 5, d = k & 31;
@@ -147,8 +161,8 @@ __global__ void __launch_bounds__(kThreads) bt6_prologue(int* __restrict__ edges
     bool anyp = false;
 #pragma unroll
     for (int c = 0; c < 12; ++c) {
-      const bool cur = __half2float(rec[s * kRecord + 1 + c]) > 0.5f;
-      const bool prv = __half2float(rec[s * kRecord + 14 + c]) > 0.5f;
+      const bool cur = kPlanes ? __ldg(pl + c * 64 + s) > 0.5f : __half2float(rec[s * kRecord + 1 + c]) > 0.5f;
+      const bool prv = kPlanes ? __ldg(pl + (13 + c) * 64 + s) > 0.5f : __half2float(rec[s * kRecord + 14 + c]) > 0.5f;
       anyp |= prv;
       const unsigned int bc = __ballot_sync(0xffffffffu, cur), bp = __ballot_sync(0xffffffffu, prv);
       if (lane == 0) { sPlane[c][half] = bc; sPlane[12 + c][half] = bp; }
@@ -160,7 +174,7 @@ __global__ void __launch_bounds__(kThreads) bt6_prologue(int* __restrict__ edges
     const int s = tid;
     const u64 src = 1ull << s;
     u64 us[6], them[6], pus[6], pthem[6];
-    const bool missing = sAnyPrev == 0;
+    const bool missing = !kPlanes && sAnyPrev == 0;  // the 137-byte record's convention only
 #pragma unroll
     for (int c = 0; c < 6; ++c) {
       us[c] = (u64)sPlane[c][0] | ((u64)sPlane[c][1] << 32);
@@ -228,9 +242,11 @@ __global__ void __launch_bounds__(kThreads) bt6_prologue(int* __restrict__ edges
       z[d] = v.x; z[d + 1] = v.y; z[d + 2] = v.z; z[d + 3] = v.w;
     }
     u64 bits = (u64)lo | ((u64)hi << 17);
+    float psum = 0.f;
     while (bits) {
       const int c = __ffsll(static_cast<long long>(bits)) - 1;
       bits &= bits - 1;
+      if (kPlanes) psum += sPsc[c];
 #pragma unroll
       for (int d = 0; d < 32; d += 4) {
         const float4 v = *reinterpret_cast<const float4*>(&sDP[c][d]);
@@ -244,10 +260,16 @@ __global__ void __launch_bounds__(kThreads) bt6_prologue(int* __restrict__ edges
     const size_t cell = ((size_t)b * 64 + i) * 64 + j;
     *reinterpret_cast<int2*>(edges + 2 * cell) = make_int2(static_cast<int>(lo), static_cast<int>(hi));
     norm[cell] = __float2half_rn(S);
+    if (kPlanes) pol[cell] = S * (psum + __ldg(tab + kTabPcb + i * 64 + j));
     uint4 w[2];
     __half2* h = reinterpret_cast<__half2*>(w);
 #pragma unroll
     for (int d = 0; d < 8; ++d) h[d] = __floats2half2_rn(z[16 + 2 * d] * r, z[17 + 2 * d] * r);
+    if (kPlanes && e0f != nullptr) {  // e0 FP32 channels-first [B, 16, 64, 64] (the edge sites' FP32 input)
+      float* ef = e0f + (size_t)b * 16 * 4096 + i * 64 + j;
+#pragma unroll
+      for (int d = 0; d < 16; ++d) ef[(size_t)d * 4096] = z[16 + d] * r;
+    }
     uint4* dst = reinterpret_cast<uint4*>(state + cell * 16);
     dst[0] = w[0];
     dst[1] = w[1];
@@ -264,9 +286,20 @@ int launch_prologue(int* edges, __half* norm, __half* state, const __half* squar
   int split = 1;  // CTAs per position (each rebuilds the rows, then writes 64 / split source rows of cells)
   while (split < 8 && batch * split < 2 * sms) split *= 2;
   dim3 grid(batch, split);
-  bt6_prologue<<<grid, kThreads, 0, stream>>>(edges, norm, state, squares, tab, 64 / split, 1e-6f);
+  bt6_prologue<false><<<grid, kThreads, 0, stream>>>(edges, norm, state, squares, tab, 64 / split, 1e-6f, nullptr, nullptr);
+  return static_cast<int>(cudaGetLastError());
+}
+
+int launch_prologue_planes(int* edges, __half* norm, __half* state, float* pol, const float* planes, const float* tab,
+                           int batch, int sms, float eps, cudaStream_t stream, float* e0f) {
+  if (batch <= 0) return 0;
+  int split = 1;
+  while (split < 8 && batch * split < 2 * sms) split *= 2;
+  dim3 grid(batch, split);
+  bt6_prologue<true><<<grid, kThreads, 0, stream>>>(edges, norm, state, planes, tab, 64 / split, eps, pol, e0f);
   return static_cast<int>(cudaGetLastError());
 }
 
 }  // namespace bt6
 static_assert(kTab == bt6::kPrologueTab32, "prologue table size");
+static_assert(kTabPlanes == bt6::kPlanesPrologueTab32, "planes prologue table size");

@@ -37,6 +37,13 @@
 #include <cstdint>
 #include "bt6_kernels.h"
 
+// k1 (2026-11-25): the kernel body can be compiled a second time with other compile-time switches (bt6_egt_attn.cu,
+// Kovax's 32-head [Q|K|V|G] BT6 flagship): BT6_ATTN_KERNEL names the kernel, BT6_ATTN_KERNEL_ONLY drops the template-bias
+// kernel and the host side of the 24-head build.
+#ifndef BT6_ATTN_KERNEL
+#define BT6_ATTN_KERNEL terms_v9_attention
+#endif
+
 #ifndef HEADS
 #define HEADS 24
 #endif
@@ -174,6 +181,53 @@ __device__ __forceinline__ float hsum(__half2 v) {
   const float2 f = __half22float2(v);
   return f.x + f.y;
 }
+// read / door / gate . e of one cell (16 FP16 channels in two uint4 halves x0, x1). Default: the lab kernel's HFMA2 chains
+// (FP16 accumulation, 8 terms per half lane). k1 RDG_F32: FP32 FMAs (the weights converted at use; no extra registers).
+__device__ __forceinline__ void rdg_dot(const __half2* x0, const __half2* x1, const __half2* wr, const __half2* wd,
+                                        const __half2* wg, float& r, float& d, float& g) {
+#if defined(RDG_SPLIT)  // k1: two HFMA2 chains per output (channels 0-7 | 8-15, 4 products per half lane), summed in FP32
+  __half2 r0 = __float2half2_rn(0.f), r1 = r0, d0 = r0, d1 = r0, g0 = r0, g1 = r0;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    r0 = __hfma2(x0[i], wr[i], r0);
+    d0 = __hfma2(x0[i], wd[i], d0);
+    g0 = __hfma2(x0[i], wg[i], g0);
+    r1 = __hfma2(x1[i], wr[4 + i], r1);
+    d1 = __hfma2(x1[i], wd[4 + i], d1);
+    g1 = __hfma2(x1[i], wg[4 + i], g1);
+  }
+  r = hsum(r0) + hsum(r1);
+  d = hsum(d0) + hsum(d1);
+  g = hsum(g0) + hsum(g1);
+#elif defined(RDG_F32)
+  r = d = g = 0.f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float2 a = __half22float2(x0[i]), b = __half22float2(x1[i]);
+    float2 w = __half22float2(wr[i]); r = fmaf(a.x, w.x, fmaf(a.y, w.y, r));
+    w = __half22float2(wr[4 + i]); r = fmaf(b.x, w.x, fmaf(b.y, w.y, r));
+    w = __half22float2(wd[i]); d = fmaf(a.x, w.x, fmaf(a.y, w.y, d));
+    w = __half22float2(wd[4 + i]); d = fmaf(b.x, w.x, fmaf(b.y, w.y, d));
+    w = __half22float2(wg[i]); g = fmaf(a.x, w.x, fmaf(a.y, w.y, g));
+    w = __half22float2(wg[4 + i]); g = fmaf(b.x, w.x, fmaf(b.y, w.y, g));
+  }
+#else
+  __half2 ar = __float2half2_rn(0.f), ad = ar, ag = ar;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    ar = __hfma2(x0[i], wr[i], ar);
+    ad = __hfma2(x0[i], wd[i], ad);
+    ag = __hfma2(x0[i], wg[i], ag);
+    ar = __hfma2(x1[i], wr[4 + i], ar);
+    ad = __hfma2(x1[i], wd[4 + i], ad);
+    ag = __hfma2(x1[i], wg[4 + i], ag);
+  }
+  r = hsum(ar);
+  d = hsum(ad);
+  g = hsum(ag);
+#endif
+}
+
 __device__ __forceinline__ float two_sigmoid(float x) {
 #ifdef GATE_TANH
   float y;
@@ -271,7 +325,7 @@ using EdgeT = unsigned long long;
 // kI8 (round 3): output 0 is INT8 codes round(x * inv_out_scale) clamped to +-127 (the W_h input of an INT8 graph,
 // whose DequantizeLinear then reads it directly) instead of FP16.
 template <int kStrideT, bool kI8>
-__global__ void __launch_bounds__(kThreads, 1) terms_v9_attention(
+__global__ void __launch_bounds__(kThreads, 1) BT6_ATTN_KERNEL(
     void* __restrict__ out_ptr, void* __restrict__ hexp_ptr, const __half* __restrict__ qkv,
     const EdgeT* __restrict__ edges, const __half* __restrict__ norm, const __half* __restrict__ state,
     const float* __restrict__ qk_scale_t, const float* __restrict__ attack_t, const float* __restrict__ key_t,
@@ -692,16 +746,8 @@ __global__ void __launch_bounds__(kThreads, 1) terms_v9_attention(
 #endif
           const __half2* x0 = reinterpret_cast<const __half2*>(&c0);
           const __half2* x1 = reinterpret_cast<const __half2*>(&c1);
-          __half2 ar = __float2half2_rn(0.f), ad = ar, ag = ar;
-#pragma unroll
-          for (int i = 0; i < 4; ++i) {
-            ar = __hfma2(x0[i], wr[i], ar);
-            ad = __hfma2(x0[i], wd[i], ad);
-            ag = __hfma2(x0[i], wg[i], ag);
-            ar = __hfma2(x1[i], wr[4 + i], ar);
-            ad = __hfma2(x1[i], wd[4 + i], ad);
-            ag = __hfma2(x1[i], wg[4 + i], ag);
-          }
+          float f_ar, f_ad, f_ag;
+          rdg_dot(x0, x1, wr, wd, wg, f_ar, f_ad, f_ag);
           const float nb = b ? nr.y : nr.x;
           const int cnt = static_cast<int>((counts >> (4 * k)) & 15u);
 #ifdef DBG_NO_E
@@ -710,12 +756,15 @@ __global__ void __launch_bounds__(kThreads, 1) terms_v9_attention(
           hv[n][2 * a + b] = cnt ? sP[cell_start + cnt - 1] - (cell_start ? sP[cell_start - 1] : 0.f) : 0.f;
 #endif
           cell_start += cnt;
-          hv[n][2 * a + b] += elem(s[n], 2 * a + b) * qk_scale + nb * (b ? cbf.y : cbf.x) + hsum(ar) + (b ? bsf.y : bsf.x);
-          const float x = hsum(ag) + gate_b;
+          hv[n][2 * a + b] += elem(s[n], 2 * a + b) * qk_scale + nb * (b ? cbf.y : cbf.x) + f_ar + (b ? bsf.y : bsf.x);
+#ifdef DOOR_F32  // k1: the door applied here in FP32 (not via its FP16 copy in dg below)
+          hv[n][2 * a + b] *= 1.f + f_ad;
+#endif
+          const float x = f_ag + gate_b;
 #if CAP
-          dg[n][2 * a + b] = __floats2half2_rn(hsum(ad), x >= 0.f ? 1.f : two_sigmoid(x));
+          dg[n][2 * a + b] = __floats2half2_rn(f_ad, x >= 0.f ? 1.f : two_sigmoid(x));
 #else
-          dg[n][2 * a + b] = __floats2half2_rn(hsum(ad), two_sigmoid(x));
+          dg[n][2 * a + b] = __floats2half2_rn(f_ad, two_sigmoid(x));
 #endif
         }
       }
@@ -743,16 +792,8 @@ __global__ void __launch_bounds__(kThreads, 1) terms_v9_attention(
 #endif
           const __half2* x0 = reinterpret_cast<const __half2*>(&c0);
           const __half2* x1 = reinterpret_cast<const __half2*>(&c1);
-          __half2 ar = __float2half2_rn(0.f), ad = ar, ag = ar;
-#pragma unroll
-          for (int i = 0; i < 4; ++i) {
-            ar = __hfma2(x0[i], wr[i], ar);
-            ad = __hfma2(x0[i], wd[i], ad);
-            ag = __hfma2(x0[i], wg[i], ag);
-            ar = __hfma2(x1[i], wr[4 + i], ar);
-            ad = __hfma2(x1[i], wd[4 + i], ad);
-            ag = __hfma2(x1[i], wg[4 + i], ag);
-          }
+          float f_ar, f_ad, f_ag;
+          rdg_dot(x0, x1, wr, wd, wg, f_ar, f_ad, f_ag);
           const float nb = b ? nr.y : nr.x;
           if (walk && ((nz >> k) & 1u)) {  // the rare lane whose bits did not fit the list
             unsigned long long m = load_edge1(edges, ((size_t)sample * 64 + row0 + rl) * 64 + key);
@@ -772,12 +813,15 @@ __global__ void __launch_bounds__(kThreads, 1) terms_v9_attention(
 #endif
             cell_start += cnt;
           }
-          hv[n][2 * a + b] += elem(s[n], 2 * a + b) * qk_scale + nb * (b ? cbf.y : cbf.x) + hsum(ar) + (b ? bsf.y : bsf.x);
-          const float x = hsum(ag) + gate_b;
+          hv[n][2 * a + b] += elem(s[n], 2 * a + b) * qk_scale + nb * (b ? cbf.y : cbf.x) + f_ar + (b ? bsf.y : bsf.x);
+#ifdef DOOR_F32  // k1: the door applied here in FP32 (not via its FP16 copy in dg below)
+          hv[n][2 * a + b] *= 1.f + f_ad;
+#endif
+          const float x = f_ag + gate_b;
 #if CAP
-          dg[n][2 * a + b] = __floats2half2_rn(hsum(ad), x >= 0.f ? 1.f : two_sigmoid(x));
+          dg[n][2 * a + b] = __floats2half2_rn(f_ad, x >= 0.f ? 1.f : two_sigmoid(x));
 #else
-          dg[n][2 * a + b] = __floats2half2_rn(hsum(ad), two_sigmoid(x));
+          dg[n][2 * a + b] = __floats2half2_rn(f_ad, two_sigmoid(x));
 #endif
         }
       }
@@ -789,14 +833,16 @@ __global__ void __launch_bounds__(kThreads, 1) terms_v9_attention(
 #pragma unroll
       for (int n = 0; n < 4; ++n) {
 #pragma unroll
+#ifndef DOOR_F32
         for (int b = 0; b < 2; ++b) hv[n][2 * a + b] *= 1.f + __low2float(dg[n][2 * a + b]);
+#endif
 #if EXPORT_H && !H_F16
         *reinterpret_cast<float2*>(hexp + (((size_t)sample * kHeads + h) * 64 + row0 + rl) * 64 + kh * 32 + 8 * n + 2 * t) =
             make_float2(hv[n][2 * a], hv[n][2 * a + 1]);
 #endif
       }
 #if EXPORT_H && H_F16
-      {  // FP16 H: a 4 x 4 transpose across the quad (lane t, register n) -> (lane n, register t) gives lane t the key half's
+      if (hexp != nullptr) {  // FP16 H (k1: only when the caller asks for it): a 4 x 4 transpose across the quad (lane t, register n) -> (lane n, register t) gives lane t the key half's
          // n-tile t, 8 consecutive keys stored as one 16-byte write (a row's 32 keys = 64 contiguous bytes per instruction)
         uint32_t p[4];
 #pragma unroll
@@ -948,6 +994,7 @@ __global__ void __launch_bounds__(kThreads, 1) terms_v9_attention(
   }
 }
 
+#ifndef BT6_ATTN_KERNEL_ONLY
 // ---------------------------------------------------------------------------------------------------------------------
 // Template bias (AttnTemplates, attn_templates.AttnTemplateMixer): bias[b, h, i, j] = sum_t c[b, i, h, t] * table[t, i, j]
 // c = the layer's mix output [B, 64, heads * T] (FP16, with bias), table [T, 64, 64] FP16 shared by every layer.
@@ -1046,3 +1093,4 @@ int launch_attention(void* out, const __half* qkv, const __half* coef, const int
 }  // namespace bt6
 static_assert(bt6::kTab16Elems == bt6::kPluginTab16 && bt6::kTab32Elems == bt6::kPluginTab32, "table blob sizes");
 static_assert(kHeads == bt6::kPluginHeads && kHd == bt6::kPluginHeadDim, "compiled shape");
+#endif  // BT6_ATTN_KERNEL_ONLY

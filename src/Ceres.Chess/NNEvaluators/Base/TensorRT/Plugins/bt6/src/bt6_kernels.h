@@ -32,6 +32,10 @@ int launch_prologue(int* edges, __half* norm, __half* state, const __half* squar
 constexpr int kGluChannels = 1536;
 int launch_glu_quant(int8_t* codes, __half* rmax, const int8_t* qg, const int8_t* qu, const __half* bias, float gate_scale,
                      float up_scale, int rows, cudaStream_t stream);
+// k2: BT6RowQuant / BT6SigGluQuant (bt6_rowquant_kernels.cu): per-token INT8 codes + row scale, 1024 wide (glu = 1:
+// input [rows, 2048] = [gate | up], m = sigmoid(gate) * up)
+constexpr int kRowQuantChannels = 1024;
+int launch_row_quant(int8_t* codes, __half* rmax, const __half* x, int glu, float eps, int rows, cudaStream_t stream);
 int launch_site(__half* out, const __half* state, const __half* hraw, const float* tab, int batch, cudaStream_t stream);
 
 // Round 4 (bt6_dec_kernels.cu): move-token decoder, 80 tokens, dm 256, 8 heads x 32.
@@ -47,5 +51,26 @@ int launch_dec_attn(__half* out, const __half* q, int q_stride, const __half* kv
 constexpr int kDecHeadTab32 = 256 + 4 * 256 + 1858;
 int launch_dec_head(__half* policy, __half* pooled, const __half* x, const __half* kbias, const int* sel, const float* tab,
                     const int* slot, float eps, int batch, cudaStream_t stream);
+
+// ---- k1 (2026-11-25): Kovax's BT6 flagship (1024 x 24, 32 heads x 32, lc0 planes input) ------------------------------
+// BT6EgtAttention (bt6_egt_attn.cu): qkvg FP16 [B, 64, 4096] = [Q | K | V | G] (heads side by side in each lane),
+// edges INT32 [B, 64, 64, 2], norm S FP16 [B, 64, 64], state FP16 [B, 64, 64, 16] cell-major, tab16 / tab32
+// -> out FP16 [B, 64, 1024] = (A @ V) * 2 sigmoid(G) (or INT8 codes with out_int8_scale > 0), and, when h_out is
+// not null, H FP16 [B, 32, 64, 64] (the door-scaled logits the edge sites read).
+constexpr int kEgtHeads = 32;
+constexpr int kEgtHeadDim = 32;
+constexpr int kEgtQkvgWidth = 4 * 32 * 32;
+constexpr int kEgtTab16 = 2 * 32 * 40 * 32 + 32 * 48 + 32 * 4096;
+constexpr int kEgtTab32 = 32 + 2 * 32 * 34 + 32;
+int prepare_egt_attention();
+int launch_egt_attention(void* out, const __half* qkvg, const int* edges, const __half* norm, const __half* state,
+                         const __half* tab16, const float* tab32, int batch, int sms, cudaStream_t stream, __half* h_out,
+                         float out_int8_scale);
+// BT6PlanesPrologue (bt6_prologue_kernels.cu, kPlanes): planes FP32 [B, 112, 64] + tab FP32 [kPlanesPrologueTab32]
+// (the BT6Prologue blob | policy psc [34] | policy pcb [4096]) -> edges, S, e0 (as BT6Prologue) + pol FP32 [B, 64, 64]
+// (+ e0f FP32 [B, 16, 64, 64] channels-first when not null).
+constexpr int kPlanesPrologueTab32 = kPrologueTab32 + 34 + 4096;
+int launch_prologue_planes(int* edges, __half* norm, __half* state, float* pol, const float* planes, const float* tab,
+                           int batch, int sms, float eps, cudaStream_t stream, float* e0f = nullptr);
 
 }  // namespace bt6

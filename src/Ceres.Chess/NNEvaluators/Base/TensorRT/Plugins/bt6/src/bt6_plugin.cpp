@@ -1,3 +1,16 @@
+// trt_bt6_plugin k1 (library bt6_trt_plugin_k1, 2026-11-25) = round 4 + two plugins for Kovax's BT6 flagship
+// (1024 x 24, 32 heads, lc0 planes input); every round-1..4 plugin name / version below is unchanged:
+// BT6EgtAttention version "1": inputs 0 qkvg FP16 [B, 64, 4096] ([Q | K | V | G], heads side by side), 1 edges INT32
+//   [B, 64, 64, 2], 2 norm FP16 [B, 64, 64], 3 state FP16 [B, 64, 64, 16] cell-major, 4 tab16 FP16 [kEgtTab16],
+//   5 tab32 FP32 [kEgtTab32]; attributes heads (32), head_dim (32), export_h (0 / 1), out_int8 (0 / 1), out_scale;
+//   outputs 0 out FP16 [B, 64, 1024] (output-gated A @ V; INT8 codes with out_int8), 1 (export_h) H FP16
+//   [B, 32, 64, 64] = the door-scaled logits (bt6_egt_attn.cu).
+// BT6TripletSite version "1": fused edge site incl. the triplet branch (src_k1_triplet/NOTES.md).
+// BT6PlanesPrologue version "1": planes FP32 [B, 112, 8, 8] (or [B, 112, 64]) + tab FP32 [kPlanesPrologueTab32],
+//   attribute eps (default 1e-6) -> edges INT32 [B, 64, 64, 2], S FP16 [B, 64, 64], e0 FP16 [B, 64, 64, 16],
+//   pol FP32 [B, 64, 64] (the policy head's S * pair term) (bt6_prologue_kernels.cu, kPlanes); attribute e0_fp32
+//   (0 / 1, default 0): a 5th output e0f FP32 [B, 16, 64, 64] (e0 channels-first, unrounded, for the edge sites).
+//
 // trt_bt6_plugin round 4 (library bt6_trt_plugin_r4; every round-1, round-2 and round-3 plugin name / version is kept): TensorRT IPluginV3 plugins for the flat 768x16 BT6 trunk.
 //
 // BT6TermsAttention version "1": unchanged from round 1 (one output; kept so round-1 ONNX files still build).
@@ -583,6 +596,124 @@ class GluCreator : public IPluginCreatorV3One {
   PluginFieldCollection mFc{};
 };
 
+
+// ===================================================================================================== k2 (INT8 Kovax BT6)
+// BT6RowQuant version "1": input 0 x FP16 [..., 1024]; output 0 codes INT8 [..., 1024], output 1 r FP16 [..., 1]:
+//   r = max(max_j |x_j|, eps) (FP16), codes = round(127 x / r) clamped to +-127. Attribute eps (FP32, default 1e-4).
+// BT6SigGluQuant version "1": input 0 p FP16 [..., 2048] = [gate | up] (the FFN dense1 GEMM output with its bias),
+//   m = sigmoid(gate) * up, then codes / r of m as BT6RowQuant; outputs codes INT8 [..., 1024], r FP16 [..., 1].
+constexpr char const* kRowQuantName = "BT6RowQuant";
+constexpr char const* kSigGluName = "BT6SigGluQuant";
+
+class RowQuantPlugin : public IPluginV3, public IPluginV3OneCore, public IPluginV3OneBuild, public IPluginV3OneRuntime {
+ public:
+  RowQuantPlugin(int glu, float eps) : mGlu(glu), mEps(eps) {
+    mFields[0] = PluginField("eps", &mEps, PluginFieldType::kFLOAT32, 1);
+    mFc.nbFields = 1;
+    mFc.fields = mFields;
+  }
+  IPluginCapability* getCapabilityInterface(PluginCapabilityType type) noexcept override {
+    switch (type) {
+      case PluginCapabilityType::kCORE: return static_cast<IPluginV3OneCore*>(this);
+      case PluginCapabilityType::kBUILD: return static_cast<IPluginV3OneBuild*>(this);
+      case PluginCapabilityType::kRUNTIME: return static_cast<IPluginV3OneRuntime*>(this);
+    }
+    return nullptr;
+  }
+  IPluginV3* clone() noexcept override { return new RowQuantPlugin(mGlu, mEps); }
+  char const* getPluginName() const noexcept override { return mGlu ? kSigGluName : kRowQuantName; }
+  char const* getPluginVersion() const noexcept override { return "1"; }
+  char const* getPluginNamespace() const noexcept override { return ""; }
+  int32_t configurePlugin(DynamicPluginTensorDesc const*, int32_t, DynamicPluginTensorDesc const*, int32_t) noexcept override {
+    return 0;
+  }
+  int32_t getNbOutputs() const noexcept override { return 2; }
+  int32_t getOutputDataTypes(DataType* t, int32_t n, DataType const*, int32_t) const noexcept override {
+    if (n != 2) return 1;
+    t[0] = DataType::kINT8;
+    t[1] = DataType::kHALF;
+    return 0;
+  }
+  int32_t getOutputShapes(DimsExprs const* in, int32_t nbInputs, DimsExprs const*, int32_t, DimsExprs* out,
+                          int32_t nbOutputs, IExprBuilder& eb) noexcept override {
+    if (nbInputs != 1 || nbOutputs != 2 || in[0].nbDims < 2) return 1;
+    const int nd = in[0].nbDims;
+    out[0] = in[0];
+    out[0].d[nd - 1] = eb.constant(bt6::kRowQuantChannels);
+    out[1] = in[0];
+    out[1].d[nd - 1] = eb.constant(1);
+    return 0;
+  }
+  bool supportsFormatCombination(int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs,
+                                 int32_t nbOutputs) noexcept override {
+    if (nbInputs != 1 || nbOutputs != 2) return false;
+    PluginTensorDesc const& d = inOut[pos].desc;
+    if (d.format != TensorFormat::kLINEAR) return false;
+    return pos == 1 ? d.type == DataType::kINT8 : d.type == DataType::kHALF;
+  }
+  size_t getWorkspaceSize(DynamicPluginTensorDesc const*, int32_t, DynamicPluginTensorDesc const*, int32_t) const noexcept override {
+    return 0;
+  }
+  int32_t onShapeChange(PluginTensorDesc const* in, int32_t, PluginTensorDesc const*, int32_t) noexcept override {
+    const int nd = in[0].dims.nbDims;
+    if (nd < 2 || in[0].dims.d[nd - 1] != (mGlu ? 2 : 1) * bt6::kRowQuantChannels) {
+      log_error(getPluginName(), mGlu ? "expects FP16 [..., 2048] = [gate | up]" : "expects FP16 [..., 1024]");
+      return 1;
+    }
+    return 0;
+  }
+  int32_t enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const*, void const* const* inputs,
+                  void* const* outputs, void*, cudaStream_t stream) noexcept override {
+    int64_t rows = 1;
+    for (int i = 0; i + 1 < inputDesc[0].dims.nbDims; ++i) rows *= inputDesc[0].dims.d[i];
+    const int rc = bt6::launch_row_quant(static_cast<int8_t*>(outputs[0]), static_cast<__half*>(outputs[1]),
+                                         static_cast<__half const*>(inputs[0]), mGlu, mEps, static_cast<int>(rows), stream);
+    if (rc != 0) {
+      log_error(getPluginName(), (std::string("kernel launch failed: ") + cudaGetErrorString(static_cast<cudaError_t>(rc))).c_str());
+      return 1;
+    }
+    return 0;
+  }
+  IPluginV3* attachToContext(IPluginResourceContext*) noexcept override { return clone(); }
+  PluginFieldCollection const* getFieldsToSerialize() noexcept override { return &mFc; }
+
+ private:
+  int mGlu;
+  float mEps;
+  PluginField mFields[1];
+  PluginFieldCollection mFc{};
+};
+
+class RowQuantCreator : public IPluginCreatorV3One {
+ public:
+  explicit RowQuantCreator(int glu) : mGlu(glu) {
+    mFields[0] = PluginField("eps", nullptr, PluginFieldType::kFLOAT32, 1);
+    mFc.nbFields = 1;
+    mFc.fields = mFields;
+  }
+  IPluginV3* createPlugin(char const*, PluginFieldCollection const* fc, TensorRTPhase) noexcept override {
+    float eps = 1e-4f;
+    for (int i = 0; fc && i < fc->nbFields; ++i) {
+      PluginField const& f = fc->fields[i];
+      if (f.name && f.data && !strcmp(f.name, "eps")) eps = read_float(f);
+    }
+    if (!(eps > 0.f)) {
+      log_error(getPluginName(), "needs eps > 0");
+      return nullptr;
+    }
+    return new RowQuantPlugin(mGlu, eps);
+  }
+  PluginFieldCollection const* getFieldNames() noexcept override { return &mFc; }
+  char const* getPluginName() const noexcept override { return mGlu ? kSigGluName : kRowQuantName; }
+  char const* getPluginVersion() const noexcept override { return "1"; }
+  char const* getPluginNamespace() const noexcept override { return ""; }
+
+ private:
+  int mGlu;
+  PluginField mFields[1];
+  PluginFieldCollection mFc{};
+};
+
 // ===================================================================================================== decoder (round 4)
 constexpr char const* kDecAttnName = "BT6DecAttn";
 constexpr char const* kDecHeadName = "BT6DecHead";
@@ -826,6 +957,280 @@ class DecHeadCreator : public IPluginCreatorV3One {
   PluginFieldCollection mFc{};
 };
 
+// ===================================================================================================== k1: Kovax BT6
+constexpr char const* kEgtName = "BT6EgtAttention";
+constexpr char const* kPlanesProName = "BT6PlanesPrologue";
+constexpr int kEgtInputs = 6;
+
+class EgtPlugin : public SimplePluginBase {
+ public:
+  EgtPlugin(int heads, int head_dim, int export_h, int out_int8, float out_scale)
+      : mHeads(heads), mHeadDim(head_dim), mExportH(export_h), mOutInt8(out_int8), mOutScale(out_scale) {
+    mFields[0] = PluginField("heads", &mHeads, PluginFieldType::kINT32, 1);
+    mFields[1] = PluginField("head_dim", &mHeadDim, PluginFieldType::kINT32, 1);
+    mFields[2] = PluginField("export_h", &mExportH, PluginFieldType::kINT32, 1);
+    mFields[3] = PluginField("out_int8", &mOutInt8, PluginFieldType::kINT32, 1);
+    mFields[4] = PluginField("out_scale", &mOutScale, PluginFieldType::kFLOAT32, 1);
+    mFc.nbFields = 5;
+    mFc.fields = mFields;
+  }
+  IPluginV3* clone() noexcept override {
+    auto* p = new EgtPlugin(mHeads, mHeadDim, mExportH, mOutInt8, mOutScale);
+    p->mSms = mSms;
+    p->mPrepared = mPrepared;
+    return p;
+  }
+  char const* getPluginName() const noexcept override { return kEgtName; }
+  int32_t getNbOutputs() const noexcept override { return mExportH ? 2 : 1; }
+  int32_t getOutputDataTypes(DataType* t, int32_t n, DataType const*, int32_t) const noexcept override {
+    if (n != getNbOutputs()) return 1;
+    for (int i = 0; i < n; ++i) t[i] = DataType::kHALF;
+    if (mOutInt8) t[0] = DataType::kINT8;
+    return 0;
+  }
+  int32_t getOutputShapes(DimsExprs const* in, int32_t nbInputs, DimsExprs const*, int32_t, DimsExprs* out,
+                          int32_t nbOutputs, IExprBuilder& eb) noexcept override {
+    if (nbInputs != kEgtInputs || nbOutputs != getNbOutputs()) return 1;
+    out[0].nbDims = 3;
+    out[0].d[0] = in[0].d[0];
+    out[0].d[1] = in[0].d[1];
+    out[0].d[2] = eb.constant(mHeads * mHeadDim);
+    if (mExportH) {
+      out[1].nbDims = 4;
+      out[1].d[0] = in[0].d[0];
+      out[1].d[1] = eb.constant(mHeads);
+      out[1].d[2] = eb.constant(64);
+      out[1].d[3] = eb.constant(64);
+    }
+    return 0;
+  }
+  bool supportsFormatCombination(int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs,
+                                 int32_t nbOutputs) noexcept override {
+    if (nbInputs != kEgtInputs || nbOutputs != getNbOutputs()) return false;
+    PluginTensorDesc const& d = inOut[pos].desc;
+    if (d.format != TensorFormat::kLINEAR) return false;
+    switch (pos) {
+      case 1: return d.type == DataType::kINT32;
+      case 5: return d.type == DataType::kFLOAT;
+      case kEgtInputs: return d.type == (mOutInt8 ? DataType::kINT8 : DataType::kHALF);
+      default: return d.type == DataType::kHALF;
+    }
+  }
+  int32_t onShapeChange(PluginTensorDesc const* in, int32_t nb, PluginTensorDesc const*, int32_t) noexcept override {
+    const bool ok = nb == kEgtInputs && in[0].dims.nbDims == 3 && in[0].dims.d[1] == 64 &&
+                    in[0].dims.d[2] == bt6::kEgtQkvgWidth && in[1].dims.nbDims == 4 && in[1].dims.d[3] == 2 &&
+                    in[3].dims.nbDims == 4 && in[3].dims.d[3] == 16 && in[4].dims.d[0] == bt6::kEgtTab16 &&
+                    in[5].dims.d[0] == bt6::kEgtTab32;
+    if (!ok) {
+      log_error(kEgtName, "expects qkvg [B, 64, 4096], edges [B, 64, 64, 2], state [B, 64, 64, 16] and the k1 tables");
+      return 1;
+    }
+    return ensure_device();
+  }
+  int32_t enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const*, void const* const* inputs,
+                  void* const* outputs, void*, cudaStream_t stream) noexcept override {
+    if (ensure_device() != 0) return 1;
+    const int batch = static_cast<int>(inputDesc[0].dims.d[0]);
+    const int rc = bt6::launch_egt_attention(
+        outputs[0], static_cast<__half const*>(inputs[0]), static_cast<int const*>(inputs[1]),
+        static_cast<__half const*>(inputs[2]), static_cast<__half const*>(inputs[3]), static_cast<__half const*>(inputs[4]),
+        static_cast<float const*>(inputs[5]), batch, mSms, stream, mExportH ? static_cast<__half*>(outputs[1]) : nullptr,
+        mOutInt8 ? mOutScale : 0.f);
+    if (rc != 0) {
+      log_error(kEgtName, (std::string("kernel launch failed: ") + cudaGetErrorString(static_cast<cudaError_t>(rc))).c_str());
+      return 1;
+    }
+    return 0;
+  }
+  IPluginV3* attachToContext(IPluginResourceContext*) noexcept override {
+    auto* p = static_cast<EgtPlugin*>(clone());
+    p->ensure_device();
+    return p;
+  }
+  PluginFieldCollection const* getFieldsToSerialize() noexcept override { return &mFc; }
+  bool valid() const {
+    return mHeads == bt6::kEgtHeads && mHeadDim == bt6::kEgtHeadDim && (mExportH == 0 || mExportH == 1) &&
+           (mOutInt8 == 0 || mOutInt8 == 1) && (mOutInt8 == 0 || mOutScale > 0.f);
+  }
+
+ private:
+  int ensure_device() {
+    if (device_sms(mSms) != 0) return 1;
+    if (!mPrepared) {
+      if (bt6::prepare_egt_attention() != 0) {
+        log_error(kEgtName, "cudaFuncSetAttribute (dynamic shared memory) failed");
+        return 1;
+      }
+      mPrepared = true;
+    }
+    return 0;
+  }
+  int32_t mHeads, mHeadDim, mExportH, mOutInt8;
+  float mOutScale;
+  int mSms = 0;
+  bool mPrepared = false;
+  PluginField mFields[5];
+  PluginFieldCollection mFc{};
+};
+
+class EgtCreator : public IPluginCreatorV3One {
+ public:
+  EgtCreator() {
+    mFields[0] = PluginField("heads", nullptr, PluginFieldType::kINT32, 1);
+    mFields[1] = PluginField("head_dim", nullptr, PluginFieldType::kINT32, 1);
+    mFields[2] = PluginField("export_h", nullptr, PluginFieldType::kINT32, 1);
+    mFields[3] = PluginField("out_int8", nullptr, PluginFieldType::kINT32, 1);
+    mFields[4] = PluginField("out_scale", nullptr, PluginFieldType::kFLOAT32, 1);
+    mFc.nbFields = 5;
+    mFc.fields = mFields;
+  }
+  IPluginV3* createPlugin(char const*, PluginFieldCollection const* fc, TensorRTPhase) noexcept override {
+    int heads = bt6::kEgtHeads, hd = bt6::kEgtHeadDim, export_h = 0, out_int8 = 0;
+    float out_scale = 0.f;
+    for (int i = 0; fc && i < fc->nbFields; ++i) {
+      PluginField const& f = fc->fields[i];
+      if (!f.name || !f.data) continue;
+      if (!strcmp(f.name, "heads")) heads = read_int(f);
+      else if (!strcmp(f.name, "head_dim")) hd = read_int(f);
+      else if (!strcmp(f.name, "export_h")) export_h = read_int(f);
+      else if (!strcmp(f.name, "out_int8")) out_int8 = read_int(f);
+      else if (!strcmp(f.name, "out_scale")) out_scale = read_float(f);
+    }
+    auto* p = new EgtPlugin(heads, hd, export_h, out_int8, out_scale);
+    if (!p->valid()) {
+      log_error(kEgtName, "unsupported attributes: this build serves heads 32, head_dim 32, export_h 0/1, out_int8 0/1 with out_scale > 0");
+      delete p;
+      return nullptr;
+    }
+    return p;
+  }
+  PluginFieldCollection const* getFieldNames() noexcept override { return &mFc; }
+  char const* getPluginName() const noexcept override { return kEgtName; }
+  char const* getPluginVersion() const noexcept override { return "1"; }
+  char const* getPluginNamespace() const noexcept override { return ""; }
+
+ private:
+  PluginField mFields[5];
+  PluginFieldCollection mFc{};
+};
+
+class PlanesProPlugin : public SimplePluginBase {
+ public:
+  PlanesProPlugin(float eps, int e0_fp32) : mEps(eps), mE0F(e0_fp32) {
+    mFields[0] = PluginField("eps", &mEps, PluginFieldType::kFLOAT32, 1);
+    mFields[1] = PluginField("e0_fp32", &mE0F, PluginFieldType::kINT32, 1);
+    mFc.nbFields = 2;
+    mFc.fields = mFields;
+  }
+  IPluginV3* clone() noexcept override {
+    auto* p = new PlanesProPlugin(mEps, mE0F);
+    p->mSms = mSms;
+    return p;
+  }
+  char const* getPluginName() const noexcept override { return kPlanesProName; }
+  int32_t getNbOutputs() const noexcept override { return mE0F ? 5 : 4; }
+  int32_t getOutputDataTypes(DataType* t, int32_t n, DataType const*, int32_t) const noexcept override {
+    if (n != getNbOutputs()) return 1;
+    if (mE0F) t[4] = DataType::kFLOAT;
+    t[0] = DataType::kINT32;
+    t[1] = DataType::kHALF;
+    t[2] = DataType::kHALF;
+    t[3] = DataType::kFLOAT;
+    return 0;
+  }
+  int32_t getOutputShapes(DimsExprs const* in, int32_t nbInputs, DimsExprs const*, int32_t, DimsExprs* out,
+                          int32_t nbOutputs, IExprBuilder& eb) noexcept override {
+    if (nbInputs != 2 || nbOutputs != getNbOutputs()) return 1;
+    auto const* c64 = eb.constant(64);
+    if (mE0F) { out[4].nbDims = 4; out[4].d[0] = in[0].d[0]; out[4].d[1] = eb.constant(16); out[4].d[2] = c64; out[4].d[3] = c64; }
+    out[0].nbDims = 4; out[0].d[0] = in[0].d[0]; out[0].d[1] = c64; out[0].d[2] = c64; out[0].d[3] = eb.constant(2);
+    out[1].nbDims = 3; out[1].d[0] = in[0].d[0]; out[1].d[1] = c64; out[1].d[2] = c64;
+    out[2].nbDims = 4; out[2].d[0] = in[0].d[0]; out[2].d[1] = c64; out[2].d[2] = c64; out[2].d[3] = eb.constant(16);
+    out[3].nbDims = 3; out[3].d[0] = in[0].d[0]; out[3].d[1] = c64; out[3].d[2] = c64;
+    return 0;
+  }
+  bool supportsFormatCombination(int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs,
+                                 int32_t nbOutputs) noexcept override {
+    if (nbInputs != 2 || nbOutputs != getNbOutputs()) return false;
+    PluginTensorDesc const& d = inOut[pos].desc;
+    if (d.format != TensorFormat::kLINEAR) return false;
+    switch (pos) {
+      case 0: case 1: case 5: case 6: return d.type == DataType::kFLOAT;
+      case 2: return d.type == DataType::kINT32;
+      default: return d.type == DataType::kHALF;
+    }
+  }
+  int32_t onShapeChange(PluginTensorDesc const* in, int32_t, PluginTensorDesc const*, int32_t) noexcept override {
+    int64_t per = 1;
+    for (int i = 1; i < in[0].dims.nbDims; ++i) per *= in[0].dims.d[i];
+    if (per != 112 * 64 || in[0].dims.d[1] != 112 || in[1].dims.nbDims != 1 || in[1].dims.d[0] != bt6::kPlanesPrologueTab32) {
+      log_error(kPlanesProName, "expects planes [B, 112, 8, 8] or [B, 112, 64] and the k1 prologue table");
+      return 1;
+    }
+    return device_sms(mSms);
+  }
+  int32_t enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const*, void const* const* inputs,
+                  void* const* outputs, void*, cudaStream_t stream) noexcept override {
+    if (device_sms(mSms) != 0) return 1;
+    const int batch = static_cast<int>(inputDesc[0].dims.d[0]);
+    const int rc = bt6::launch_prologue_planes(static_cast<int*>(outputs[0]), static_cast<__half*>(outputs[1]),
+                                               static_cast<__half*>(outputs[2]), static_cast<float*>(outputs[3]),
+                                               static_cast<float const*>(inputs[0]), static_cast<float const*>(inputs[1]),
+                                               batch, mSms, mEps, stream, mE0F ? static_cast<float*>(outputs[4]) : nullptr);
+    if (rc != 0) {
+      log_error(kPlanesProName, (std::string("kernel launch failed: ") + cudaGetErrorString(static_cast<cudaError_t>(rc))).c_str());
+      return 1;
+    }
+    return 0;
+  }
+  IPluginV3* attachToContext(IPluginResourceContext*) noexcept override {
+    auto* p = static_cast<PlanesProPlugin*>(clone());
+    device_sms(p->mSms);
+    return p;
+  }
+  PluginFieldCollection const* getFieldsToSerialize() noexcept override { return &mFc; }
+
+ private:
+  float mEps;
+  int32_t mE0F;
+  int mSms = 0;
+  PluginField mFields[2];
+  PluginFieldCollection mFc{};
+};
+
+class PlanesProCreator : public IPluginCreatorV3One {
+ public:
+  PlanesProCreator() {
+    mFields[0] = PluginField("eps", nullptr, PluginFieldType::kFLOAT32, 1);
+    mFields[1] = PluginField("e0_fp32", nullptr, PluginFieldType::kINT32, 1);
+    mFc.nbFields = 2;
+    mFc.fields = mFields;
+  }
+  IPluginV3* createPlugin(char const*, PluginFieldCollection const* fc, TensorRTPhase) noexcept override {
+    float eps = 1e-6f;
+    int e0f = 0;
+    for (int i = 0; fc && i < fc->nbFields; ++i) {
+      PluginField const& f = fc->fields[i];
+      if (!f.name || !f.data) continue;
+      if (!strcmp(f.name, "eps")) eps = read_float(f);
+      else if (!strcmp(f.name, "e0_fp32")) e0f = read_int(f);
+    }
+    if (!(eps > 0.f) || (e0f != 0 && e0f != 1)) {
+      log_error(kPlanesProName, "needs eps > 0 and e0_fp32 0 / 1");
+      return nullptr;
+    }
+    return new PlanesProPlugin(eps, e0f);
+  }
+  PluginFieldCollection const* getFieldNames() noexcept override { return &mFc; }
+  char const* getPluginName() const noexcept override { return kPlanesProName; }
+  char const* getPluginVersion() const noexcept override { return "1"; }
+  char const* getPluginNamespace() const noexcept override { return ""; }
+
+ private:
+  PluginField mFields[2];
+  PluginFieldCollection mFc{};
+};
+
 }  // namespace
 
 #if defined(_WIN32)
@@ -834,7 +1239,14 @@ class DecHeadCreator : public IPluginCreatorV3One {
 #define BT6_EXPORT extern "C" __attribute__((visibility("default")))
 #endif
 
-BT6_EXPORT void setLoggerFinder(ILoggerFinder* finder) { gLoggerFinder = finder; }
+// k1: BT6TripletSite v1 (bt6_triplet_site_plugin.cpp, namespace bt6t; the triplet agent's fused edge site)
+IPluginCreatorInterface* bt6t_triplet_site_creator();
+void bt6t_set_logger_finder(ILoggerFinder* finder);
+
+BT6_EXPORT void setLoggerFinder(ILoggerFinder* finder) {
+  gLoggerFinder = finder;
+  bt6t_set_logger_finder(finder);
+}
 
 BT6_EXPORT IPluginCreatorInterface* const* getCreators(int32_t& nbCreators) {
   static BT6Creator v1(1), v2(2), v3(3);
@@ -843,7 +1255,11 @@ BT6_EXPORT IPluginCreatorInterface* const* getCreators(int32_t& nbCreators) {
   static GluCreator glu;
   static DecAttnCreator dec_attn;
   static DecHeadCreator dec_head;
-  static IPluginCreatorInterface* const list[] = {&v1, &v2, &v3, &pro, &site, &glu, &dec_attn, &dec_head};
-  nbCreators = 8;
+  static EgtCreator egt;
+  static PlanesProCreator planes_pro;
+  static RowQuantCreator row_quant(0), sig_glu_quant(1);
+  static IPluginCreatorInterface* const list[] = {&v1, &v2, &v3, &pro, &site, &glu, &dec_attn, &dec_head, &egt, &planes_pro,
+                                                  bt6t_triplet_site_creator(), &row_quant, &sig_glu_quant};
+  nbCreators = 13;
   return list;
 }
