@@ -6,7 +6,8 @@
 # The TensorRT headers must be the same major version as the TensorRT the engine runs on (10 or newer).
 #   CUTLASS_INCLUDE  the include directory of CUTLASS 4.x (https://github.com/NVIDIA/cutlass, tested with 4.8.1); needed by
 #                    BT6I8GemmGlu. Default: third_party/cutlass/include next to this script.
-#   $1               the -gencode list (default sm_80/86/89/90/120; add sm_103 / sm_121 for GB300 / GB10, e.g.
+#   $1               the -gencode list (default sm_80/86/89/90/120 plus PTX for compute_80, which the driver compiles for
+#                    any other architecture >= sm_80; add sm_103 / sm_121 for GB300 / GB10, e.g.
 #                    "-gencode arch=compute_103,code=sm_103").
 #   BT6_T5           GB300 attention (bt6_egt_t5.cu, tcgen05, compiled for sm_103a only and chosen at run time on compute
 #                    capability 10.3; every other GPU keeps v9): auto (default) = when the -gencode list has compute_103,
@@ -20,7 +21,7 @@ NVCC=${NVCC:-nvcc}
 TRT_INCLUDE=${TRT_INCLUDE:-/usr/include/x86_64-linux-gnu}
 CUTLASS_INCLUDE=${CUTLASS_INCLUDE:-$(pwd)/third_party/cutlass/include}
 [ -f "$CUTLASS_INCLUDE/cutlass/cutlass.h" ] || { echo "CUTLASS headers not found in $CUTLASS_INCLUDE: set CUTLASS_INCLUDE"; exit 1; }
-ARCHS=${1:-"-gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_120,code=sm_120"}
+ARCHS=${1:-"-gencode arch=compute_80,code=[sm_80,compute_80] -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_120,code=sm_120"}
 NAME=libbt6_trt_plugin
 EXTRA=""
 if [ "${BT6_ORT:-0}" = 1 ]; then
