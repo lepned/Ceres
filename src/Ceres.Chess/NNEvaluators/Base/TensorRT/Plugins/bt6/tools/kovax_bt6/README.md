@@ -48,6 +48,10 @@ gate positions. The same vectors build an lc0ex INT8 program (`make_carrier.py` 
 
 ### lc0 `onnx-trt` (`lc0_onnx_trt/`)
 
+The lc0 change is also available as a branch: https://github.com/lepned/lc0/tree/bt6-trt-plugins (lc0 master + the
+patch below, with a guide in `BT6_TRT_PLUGINS.md`); its release `bt6-trt-plugins-v1` has a Windows plugin library and
+the BT6 7M INT8 net.
+
 lc0 master runs the same ONNX through ONNX Runtime's TensorRT provider after three things:
 `lc0_trt_plugins.patch` (backend option `trt_plugins='<lib>'` -> `trt_extra_plugin_lib_paths`, and placeholder custom
 ops for the `trt.plugins` nodes so ONNX Runtime accepts them), the ONNX Runtime variant of the plugin library
