@@ -554,10 +554,22 @@ __global__ void __launch_bounds__(kThreads, 1) BT6_ATTN_KERNEL(
     // ---- loads for q.k and the tables, all issued ahead of the MMAs
     static_assert(kHd == 32 && kKs == 2 && kNd == 4, "ld128 is written for head_dim 32");
     const __half* qrow = base + (size_t)HOTI(row0 + rt * 16 + g, g) * kStride;
+#ifdef DBG_DUP
+    const bool dup_v = (DBG_DUP & 1) && rt, dup_q = (DBG_DUP & 2) && kh, dup_k = (DBG_DUP & 4) && rt;
+    const bool dup_tq = (DBG_DUP & 8) && rt, dup_tk = (DBG_DUP & 8) && kh;
+    const uint4 z4 = make_uint4(0, 0, 0, 0);
+    uint4 qraw0 = dup_q ? z4 : row_load(qrow, t), qraw1 = dup_q ? z4 : row_load(qrow + HOTI(8, 0) * kStride, t);
+    uint4 kraw[4];
+#pragma unroll
+    for (int n = 0; n < 4; ++n) kraw[n] = dup_k ? z4 : row_load(base + kKOff + (size_t)HOTI(kh * 32 + 8 * n + g, g) * kStride, t);
+#define DUPSEL(c, x) ((c) ? 0u : (x))
+#else
+#define DUPSEL(c, x) (x)
     uint4 qraw0 = row_load(qrow, t), qraw1 = row_load(qrow + HOTI(8, 0) * kStride, t);
     uint4 kraw[4];  // keys kh * 32 + 8n + g
 #pragma unroll
     for (int n = 0; n < 4; ++n) kraw[n] = row_load(base + kKOff + (size_t)HOTI(kh * 32 + 8 * n + g, g) * kStride, t);
+#endif
 
     uint32_t tqf[3][kKs][2], tkf[3][kKs][2];
 #if defined(EGT_TAB128) && defined(BT6_ATTN_KERNEL_ONLY)
@@ -580,8 +592,8 @@ __global__ void __launch_bounds__(kThreads, 1) BT6_ATTN_KERNEL(
       const int nn = kh ? (i < 2 ? 3 + i : 4) : i;  // kh = 1 has two tiles; its third slot repeats tile 4 and is not stored
 #pragma unroll
       for (int ks = 0; ks < kKs; ++ks) {
-        tqf[i][ks][0] = table_pair(query_t, HOTI(h, 0), HOTI(8 * nn + g, g), 16 * ks + 2 * t);
-        tqf[i][ks][1] = table_pair(query_t, HOTI(h, 0), HOTI(8 * nn + g, g), 16 * ks + 2 * t + 8);
+        tqf[i][ks][0] = DUPSEL(dup_tq, table_pair(query_t, HOTI(h, 0), HOTI(8 * nn + g, g), 16 * ks + 2 * t));
+        tqf[i][ks][1] = DUPSEL(dup_tq, table_pair(query_t, HOTI(h, 0), HOTI(8 * nn + g, g), 16 * ks + 2 * t + 8));
       }
     }
 #pragma unroll
@@ -589,8 +601,8 @@ __global__ void __launch_bounds__(kThreads, 1) BT6_ATTN_KERNEL(
       const int nn = rt ? (i < 2 ? 3 + i : 4) : i;  // the row tile picks the column table's channel tiles: 0-2 or 3-4
 #pragma unroll
       for (int ks = 0; ks < kKs; ++ks) {
-        tkf[i][ks][0] = table_pair(key_t, HOTI(h, 0), HOTI(8 * nn + g, g), 16 * ks + 2 * t);
-        tkf[i][ks][1] = table_pair(key_t, HOTI(h, 0), HOTI(8 * nn + g, g), 16 * ks + 2 * t + 8);
+        tkf[i][ks][0] = DUPSEL(dup_tk, table_pair(key_t, HOTI(h, 0), HOTI(8 * nn + g, g), 16 * ks + 2 * t));
+        tkf[i][ks][1] = DUPSEL(dup_tk, table_pair(key_t, HOTI(h, 0), HOTI(8 * nn + g, g), 16 * ks + 2 * t + 8));
       }
     }
 #endif
@@ -902,7 +914,11 @@ __global__ void __launch_bounds__(kThreads, 1) BT6_ATTN_KERNEL(
 #pragma unroll
     for (int kk = 0; kk < 2; ++kk)
 #pragma unroll
+#ifdef DBG_DUP
+      for (int j = 0; j < 2; ++j) vload[kk][j] = dup_v ? z4 : row_load(vrow + (size_t)HOTI(16 * kk + 8 * j, 0) * kStride, t);
+#else
       for (int j = 0; j < 2; ++j) vload[kk][j] = row_load(vrow + (size_t)HOTI(16 * kk + 8 * j, 0) * kStride, t);
+#endif
     const bool walk = eover;  // the half-position's bits did not fit the list: every lane reads its cells' masks
 #ifndef DBG_NO_E
     if (!walk) {  // this head's E values: 4 consecutive entries per head thread, then an FP32 prefix over the list

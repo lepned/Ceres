@@ -69,6 +69,10 @@ architectures (sm_80 .. sm_90, sm_103, sm_121) compiles but has not been execute
 Environment switches of the lc0 BT6 attention kernel: `BT6_EGT_K4=1` selects the previous kernel path and schedule
 (bit-identical outputs), `BT6_EGT_SCHED=0` only the previous schedule.
 
+`BT6TripletSite` runs its third kernel (output map and edge FFN) on the tensor cores: FP16 operands, FP32 accumulation,
+weights split in two FP16 halves. About 2.4 % faster end to end on the 1024x24 net, outputs equal within the INT8 gate's
+noise but not bit-identical; `BT6_SITE_K5=1` selects the previous FP32 kernels (bit-identical to the previous library).
+
 ## Our own nets: making the plugin ONNX (CeresTrain, `src/CeresTrainPy`)
 
 One command per checkpoint:

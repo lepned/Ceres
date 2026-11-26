@@ -30,8 +30,10 @@ CARRIER.pb.gz`); `BT6_CARRIER=<path>` selects it for the two export scripts. A c
 | gates vs PyTorch FP32 on 256 real positions | `trt_gate.py`, `metrics.py`, `npz_gate.py`, `lc0ex_ref_gate.py`, `run_lc0ex_int8.py` (the lc0ex INT8 program on the same positions), `emu.py` (INT8 emulator) | W-L, top-1, KL |
 | build + gate / time | `k1_build_gate.sh`, `k1_time.sh`, `k2_build_gate.sh`, `k2_time.sh`, `time_trt.sh`; backward compatibility with our nets: `gate_n400M_k1.sh` | |
 
-"k5" is not another ONNX: it is the k4 ONNX with the current plugin library (faster attention kernel, bit-identical
-outputs).
+"k5" and "k6" are not other ONNX files: they are the k4 ONNX with a newer plugin library. k5 = faster attention kernel
+(bit-identical outputs); k6 = the current library, k5 plus the triplet edge site's third kernel on the tensor cores
+(trtexec 5.87 / 11.37 ms at batch 64 / 128 against 6.01 / 11.65 for k5; Ceres 10.9K against 10.6K evaluations per
+second; gate and puzzles within noise of k5: rg2700 2810 / 3312 / 2933).
 
 ### INT8 without the carrier's vectors (`int8_vectors/`)
 
