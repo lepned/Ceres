@@ -15,6 +15,7 @@ Output policy [B, 1858] logits, wdl [B, 3] logits, mlh [B, 1], err [B, 1] (sigmo
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 
@@ -23,12 +24,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-sys.path.insert(0, "/mnt/c/Users/lepne/source/repos/CeresTrain/src/CeresTrainPy")
+sys.path.insert(0, __import__("os").environ.get("CERESTRAIN_PY", "CeresTrain/src/CeresTrainPy"))
 from bt6_carrier import read_carrier  # noqa: E402
 from bt6_net import CODE_GROUPS, CODE_GROUP_BASES, BT6Config, policy_gather_index  # noqa: E402
 from bt6_relations import BT6Relations  # noqa: E402
 
-CARRIER = ("/mnt/c/lc0_bt6/net/bt6_flagship_ffnmuon_1024x24x32_5400000_swa_blend_grill_0.4315_optimistic_st_0.5685_"
+CARRIER = os.environ.get("BT6_CARRIER") or ("/mnt/c/lc0_bt6/net/bt6_flagship_ffnmuon_1024x24x32_5400000_swa_blend_grill_0.4315_optimistic_st_0.5685_"
            "winner_q1i8_v2c62ccc4_d1e4b030c2_with_error_head_st_lc0ex_carrier.pb.gz")
 POSITIONS = "/mnt/c/Dev/Chess/lc0ex_work/bt6_torch/reference_7040.npz"
 
@@ -211,12 +212,13 @@ class BT6Served(nn.Module):
 
     wdl = head("/value")
     mlh = torch.relu(head("/moves"))
-    err = torch.sigmoid(head("/value_error"))
+    # a carrier without the error head (make_carrier.py from the plain export): err = 0.5 placeholder
+    err = torch.sigmoid(head("/value_error")) if "/value_error/dense2/w" in self._names else torch.full_like(mlh, 0.5)
     return policy.float(), wdl.float(), mlh.float(), err.float()
 
 
 def real_planes(start, count):
-  sys.path.insert(0, "/mnt/c/Users/lepne/source/repos/CeresTrain/src/CeresTrainPy")
+  sys.path.insert(0, __import__("os").environ.get("CERESTRAIN_PY", "CeresTrain/src/CeresTrainPy"))
   from bt6_planes import expand_planes
   with np.load(POSITIONS) as a:
     return expand_planes(a["masks"][start:start + count], a["values"][start:start + count]).reshape(-1, 112, 8, 8)

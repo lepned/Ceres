@@ -1,0 +1,136 @@
+diff --git a/src/neural/backends/onnx/network_onnx.cc b/src/neural/backends/onnx/network_onnx.cc
+index e6520b3..69cb6fa 100644
+--- a/src/neural/backends/onnx/network_onnx.cc
++++ b/src/neural/backends/onnx/network_onnx.cc
+@@ -33,6 +33,7 @@
+ #include <iterator>
+ #include <list>
+ #include <memory>
++#include <set>
+ #include <sstream>
+ #include <string>
+ #include <vector>
+@@ -49,6 +50,7 @@
+ #include "neural/network.h"
+ #include "neural/onnx/converter.h"
+ #include "onnxruntime_cxx_api.h"
++#include "proto/onnx.pb.h"
+ #include "utils/bf16_utils.h"
+ #include "utils/bititer.h"
+ #include "utils/commandline.h"
+@@ -62,6 +64,46 @@ namespace onnx {
+ 
+ enum class OnnxProvider { CPU, CUDA, DML, ROCM, TRT, MIGRAPHX, COREML };
+ 
++// Placeholder ONNX Runtime custom op for a TensorRT plugin node (ONNX domain trt.plugins). It only makes ONNX Runtime
++// accept the node; the TensorRT EP hands the node to TensorRT's ONNX parser, which builds the plugin from TensorRT's
++// plugin registry (IPluginV3 plugins included, loaded through trt_extra_plugin_lib_paths). The kernel never runs.
++struct TrtPluginKernel {
++  TrtPluginKernel(const OrtApi&, const OrtKernelInfo*) {}
++  void Compute(OrtKernelContext*) {
++    throw Exception("TensorRT plugin node evaluated outside TensorRT");
++  }
++};
++
++struct TrtPluginOp : Ort::CustomOpBase<TrtPluginOp, TrtPluginKernel> {
++  explicit TrtPluginOp(std::string name) : name_(std::move(name)) {}
++  void* CreateKernel(const OrtApi& api, const OrtKernelInfo* info) const {
++    return new TrtPluginKernel(api, info);
++  }
++  const char* GetName() const { return name_.c_str(); }
++  const char* GetExecutionProviderType() const {
++    return "TensorrtExecutionProvider";
++  }
++  size_t GetInputTypeCount() const { return 1; }
++  ONNXTensorElementDataType GetInputType(size_t) const {
++    return ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
++  }
++  OrtCustomOpInputOutputCharacteristic GetInputCharacteristic(size_t) const {
++    return OrtCustomOpInputOutputCharacteristic::INPUT_OUTPUT_VARIADIC;
++  }
++  size_t GetOutputTypeCount() const { return 1; }
++  ONNXTensorElementDataType GetOutputType(size_t) const {
++    return ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
++  }
++  OrtCustomOpInputOutputCharacteristic GetOutputCharacteristic(size_t) const {
++    return OrtCustomOpInputOutputCharacteristic::INPUT_OUTPUT_VARIADIC;
++  }
++  bool GetVariadicInputHomogeneity() const { return false; }
++  bool GetVariadicOutputHomogeneity() const { return false; }
++
++ private:
++  std::string name_;
++};
++
+ class OnnxNetwork;
+ 
+ static constexpr int kNumOutputPolicy = 1858;
+@@ -190,6 +232,9 @@ class OnnxNetwork final : public Network {
+   }
+ 
+   Ort::Env onnx_env_;
++  // TensorRT plugin nodes (domain trt.plugins) registered as placeholder custom ops; must outlive the sessions.
++  std::vector<std::unique_ptr<TrtPluginOp>> trt_plugin_ops_;
++  std::unique_ptr<Ort::CustomOpDomain> trt_plugin_domain_;
+   // Prepare sessions for this many multiples of the batch size;
+   int steps_;
+   std::vector<Ort::Session> session_;
+@@ -209,6 +254,8 @@ class OnnxNetwork final : public Network {
+   // The lower limit for variable batch size.
+   int min_batch_size_;
+   int gpu_;
++  // Backend option trt_plugins: TensorRT plugin libraries (';'-separated) for the TensorRT EP.
++  std::string trt_plugins_;
+   static constexpr int max_batch_size_ = 1024;
+   // For conditional locking if running the DML/ROCM/TRT provider.
+   OnnxProvider provider_;
+@@ -627,6 +674,7 @@ void OnnxComputation<DataType>::ComputeBlocking() {
+ Ort::SessionOptions OnnxNetwork::GetOptions(int threads, int batch_size,
+                                             uint64_t hash, int optimize) {
+   Ort::SessionOptions options;
++  if (trt_plugin_domain_) options.Add(*trt_plugin_domain_);
+   options.SetIntraOpNumThreads(threads);
+   GraphOptimizationLevel level = GraphOptimizationLevel::ORT_DISABLE_ALL;
+   switch (optimize) {
+@@ -712,6 +760,8 @@ Ort::SessionOptions OnnxNetwork::GetOptions(int threads, int batch_size,
+       trt_options["trt_layer_norm_fp32_fallback"] = "1";
+       trt_options["trt_force_sequential_engine_build"] = "1";
+       trt_options["trt_context_memory_sharing_enable"] = "1";
++      // Custom TensorRT plugins (ONNX nodes in domain trt.plugins), e.g. the bt6 plugins for lc0 BT6 nets.
++      if (!trt_plugins_.empty()) trt_options["trt_extra_plugin_lib_paths"] = trt_plugins_;
+       // Looks like we need I/O binding to enable this.
+ #ifdef USE_ONNX_CUDART
+       trt_options["has_user_compute_stream"] = "1";
+@@ -805,6 +855,7 @@ OnnxNetwork::OnnxNetwork(const WeightsFile& file, const OptionsDict& opts,
+       provider_(provider) {
+   onnx_env_.DisableTelemetryEvents();
+   gpu_ = opts.GetOrDefault<int>("gpu", 0);
++  trt_plugins_ = opts.GetOrDefault<std::string>("trt_plugins", "");
+ 
+ #ifdef USE_ONNX_CUDART
+   if (provider_ == OnnxProvider::CUDA || provider_ == OnnxProvider::TRT) {
+@@ -931,6 +982,24 @@ OnnxNetwork::OnnxNetwork(const WeightsFile& file, const OptionsDict& opts,
+       break;
+   }
+ 
++  if (provider_ == OnnxProvider::TRT && !trt_plugins_.empty()) {
++    // Every op type of domain trt.plugins in the net becomes a placeholder custom op (see TrtPluginOp).
++    pblczero::ModelProto onnx;
++    onnx.ParseFromString(file.onnx_model().model());
++    std::set<std::string> ops;
++    for (const auto& node : onnx.graph().node()) {
++      if (node.domain() == "trt.plugins") ops.insert(std::string(node.op_type()));
++    }
++    trt_plugin_domain_ = std::make_unique<Ort::CustomOpDomain>("trt.plugins");
++    std::string names;
++    for (const auto& op : ops) {
++      trt_plugin_ops_.push_back(std::make_unique<TrtPluginOp>(op));
++      trt_plugin_domain_->Add(trt_plugin_ops_.back().get());
++      names += (names.empty() ? "" : ", ") + op;
++    }
++    CERR << "TensorRT plugin ops (" << ops.size() << "): " << names;
++  }
++
+   for (int step = 1; step <= steps_; step++)
+     session_.emplace_back(onnx_env_, file.onnx_model().model().data(),
+                           file.onnx_model().model().size(),

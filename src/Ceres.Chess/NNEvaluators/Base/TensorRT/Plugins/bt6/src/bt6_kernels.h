@@ -73,4 +73,15 @@ constexpr int kPlanesPrologueTab32 = kPrologueTab32 + 34 + 4096;
 int launch_prologue_planes(int* edges, __half* norm, __half* state, float* pol, const float* planes, const float* tab,
                            int batch, int sms, float eps, cudaStream_t stream, float* e0f = nullptr);
 
+// k3: BT6LnQuant (bt6_lnquant_kernels.cu): res_out = res + alpha (yn r + bias) (FP16),
+// codes = saturate(rint(LN(res_out) / scale)); tab FP32 [3 * 1024] = bias | gamma | beta; r may be null (row scale 1).
+int launch_ln_quant(__half* res_out, int8_t* codes, const __half* yn, const __half* r, const __half* res, const float* tab,
+                    float alpha, float eps, float scale, int rows, cudaStream_t stream);
+
+// k4: BT6I8GemmGlu (bt6_i8gemm_kernels.cu): out INT8 [M, N / 2] = GLU-int8 epilogue of a [M, K] x [N, K]^T int8 GEMM;
+// tab FP32 = scale [N] | bias [N] | r [N / 2]; tile -1 = env BT6_I8GLU_TILE or the default by M.
+int i8gemm_glu_tiles();
+int launch_i8gemm_glu(int8_t* out, const int8_t* a, const int8_t* w, const float* tab, int M, int N, int K, int tile,
+                      cudaStream_t stream);
+
 }  // namespace bt6

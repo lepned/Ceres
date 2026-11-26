@@ -185,7 +185,9 @@ __device__ __forceinline__ float hsum(__half2 v) {
 // (FP16 accumulation, 8 terms per half lane). k1 RDG_F32: FP32 FMAs (the weights converted at use; no extra registers).
 __device__ __forceinline__ void rdg_dot(const __half2* x0, const __half2* x1, const __half2* wr, const __half2* wd,
                                         const __half2* wg, float& r, float& d, float& g) {
-#if defined(RDG_SPLIT)  // k1: two HFMA2 chains per output (channels 0-7 | 8-15, 4 products per half lane), summed in FP32
+#if defined(DBG_NO_RDG)  // k5 pricing switch (results wrong): no state dots
+  r = d = g = 0.f;
+#elif defined(RDG_SPLIT)  // k1: two HFMA2 chains per output (channels 0-7 | 8-15, 4 products per half lane), summed in FP32
   __half2 r0 = __float2half2_rn(0.f), r1 = r0, d0 = r0, d1 = r0, g0 = r0, g1 = r0;
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
@@ -324,7 +326,13 @@ using EdgeT = unsigned long long;
 // fused into the same GEMM output: round 2's fused_coef)
 // kI8 (round 3): output 0 is INT8 codes round(x * inv_out_scale) clamped to +-127 (the W_h input of an INT8 graph,
 // whose DequantizeLinear then reads it directly) instead of FP16.
-template <int kStrideT, bool kI8>
+// k5 (K5_VARIANT, the 32-head build only): kNew selects the k5 fresh path (STATE_LDG, FRESH_SHARE, SKEW) at compile time;
+// kNew = false compiles k4's path (env BT6_EGT_K4=1 launches it).
+#ifdef K5_VARIANT
+template <int kStrideT, bool kI8, bool kSplit = false, bool kNew = true>
+#else
+template <int kStrideT, bool kI8, bool kSplit = false>
+#endif
 __global__ void __launch_bounds__(kThreads, 1) BT6_ATTN_KERNEL(
     void* __restrict__ out_ptr, void* __restrict__ hexp_ptr, const __half* __restrict__ qkv,
     const EdgeT* __restrict__ edges, const __half* __restrict__ norm, const __half* __restrict__ state,
@@ -333,8 +341,16 @@ __global__ void __launch_bounds__(kThreads, 1) BT6_ATTN_KERNEL(
     const float* __restrict__ read_t, const float* __restrict__ door_t, const float* __restrict__ gate_t,
     const float* __restrict__ gate_b_t, const float* __restrict__ prescale, const __half* __restrict__ bias,
     const float* __restrict__ qn_scale, const float* __restrict__ kn_scale, int halves, __half* __restrict__ hraw,
-    float raw_scale, float inv_out_scale) {
+    float raw_scale, float inv_out_scale
+#ifdef HP_SCHED
+    , int sched  // k5: > 0 = the remainder's half-positions cut into `sched` parts, one CTA each (kSplit builds only)
+#endif
+    ) {
   constexpr int kStride = kStrideT;
+#ifndef K5_VARIANT
+  constexpr bool kNew = true;  // (the k5 switches are not defined in this build)
+#endif
+  (void)kNew;
   (void)qn_scale;
   (void)kn_scale;
   static_assert(OUT_F16, "round 3: the output type is the template argument kI8");
@@ -367,9 +383,53 @@ __global__ void __launch_bounds__(kThreads, 1) BT6_ATTN_KERNEL(
   const int S = gridDim.x, full = halves / S, rest = halves - full * S;
   const int t0 = static_cast<int>((long long)blockIdx.x * rest * kGroups / S);
   const int t1 = static_cast<int>((long long)(blockIdx.x + 1) * rest * kGroups / S);
+#if defined(TAIL_SPLIT) && defined(HP_SCHED)
+  // k5 half-position-aligned remainder (sched = m > 0, kSplit builds): each of the `rest` half-positions left after the full
+  // rounds is cut into m parts of contiguous heads [kHeads j / m, kHeads (j + 1) / m), one CTA per part (CTA b:
+  // half-position b / m, part b % m), run kGroup heads at a time (the last unit of a part may have idle head slots), so a
+  // CTA loads ONE state for its remainder work (k4's contiguous slices straddle half-positions: a second / third state
+  // load, list build and cold start for the slowest CTAs). When m * rest > S (m divides kGroups, checked by the host) the
+  // parts past S are cut into 1-head pieces, one per CTA, as in k3. Per-head arithmetic unchanged.
+  const int bx = static_cast<int>(blockIdx.x);
+  const int hm = kSplit ? sched : 0;
+  const int runits = rest * kGroups, R2 = runits / S, E = runits - R2 * S;
+  const int ppu = hm || !kSplit || E == 0 ? 1 : E * kGroup <= S ? kGroup : (kGroup % 2 == 0 && E * 2 <= S) ? 2 : 1;
+  int hpn = 0, hpu0 = 0, hph = 0, hsz = 1, hE = 0;
+  if (hm) {
+    const int parts = hm * rest;
+    if (bx < parts) {
+      const int j = bx % hm;
+      hpu0 = kHeads * j / hm;                                           // first head of the part
+      hph = kHeads * (j + 1) / hm - hpu0;                               // its heads
+      hpn = (hph + kGroup - 1) / kGroup;
+    }
+    hsz = kGroups / hm;
+    hE = parts > S ? (parts - S) * hsz : 0;
+  }
+  const int nq = hm ? full * kGroups + hpn + (bx < hE * kGroup ? 1 : 0)
+                    : ppu == 1 ? full * kGroups + (t1 - t0) : full * kGroups + R2 + (bx < E * ppu ? 1 : 0);
+#elif defined(TAIL_SPLIT)
+  // k3 tail split: the remainder's units as R2 contiguous units per CTA, and the E units left over (the last, mostly empty
+  // round of k2's list) cut into ppu pieces of kGroup / ppu heads, one piece per CTA (ppu = kGroup when 4E <= S, 2 when
+  // 2E <= S; otherwise k2's contiguous slices). Each head's arithmetic is unchanged: only which CTA / slot computes it.
+  const int runits = rest * kGroups, R2 = runits / S, E = runits - R2 * S;
+  const int ppu = !kSplit || E == 0 ? 1 : E * kGroup <= S ? kGroup : (kGroup % 2 == 0 && E * 2 <= S) ? 2 : 1;
+  const int nq = ppu == 1 ? full * kGroups + (t1 - t0) : full * kGroups + R2 + (static_cast<int>(blockIdx.x) < E * ppu ? 1 : 0);
+#else
   const int nq = full * kGroups + (t1 - t0);
+#endif
   if (nq <= 0) return;
+#if defined(EGT_PHASE) && defined(BT6_ATTN_KERNEL_ONLY)  // k5 debug build: per-warp phase clocks (lane 0), summed over warps into g_egt_ph[warp][slot]
+  long long ph_acc[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  long long ph_prev = clock64();
+#define TICK(slot) do { if (lane == 0) { const long long _n = clock64(); ph_acc[slot] += _n - ph_prev; ph_prev = _n; } } while (0)
+#else
 #define TICK(slot) do { } while (0)
+#endif
+#if defined(EGT_TIMING) && defined(TAIL_SPLIT)
+  unsigned long long t_start, t_end; int nfresh = 0;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_start));
+#endif
 
   int current = -1;
   __half2 nrm[2][4];              // this lane's cells' S: rows g, g + 8 of the row tile; keys kh * 32 + 8n + 2t, + 1
@@ -379,40 +439,149 @@ __global__ void __launch_bounds__(kThreads, 1) BT6_ATTN_KERNEL(
   bool eover = false;             // the half-position's bits exceed kListCta: every lane walks its cells' masks (exact, slow)
   int etotal = 0;                 // entries in the half-position's list
   for (int q = 0; q < nq; ++q) {
+#ifdef TAIL_SPLIT
+    int u, hoff = 0;
+    bool idle = false;  // this head slot has no head in this unit (a split tail piece)
+    if (q < full * kGroups) {
+      u = ((q / kGroups) * S + blockIdx.x) * kGroups + q % kGroups;
+#ifdef HP_SCHED
+    } else if (hm) {
+      const int qq = q - full * kGroups;
+      if (qq < hpn) {  // this CTA's part of remainder half-position bx / hm: heads hpu0 + kGroup qq + [0, kGroup)
+        u = (full * S + bx / hm) * kGroups;
+#ifdef EGT_CONTROL_SPLIT_HEADS  // must-fail control: every unit of a part computes the part's first heads
+        hoff = hpu0;
+#else
+        hoff = hpu0 + kGroup * qq;
+#endif
+        idle = hs >= hph - kGroup * qq;
+      } else {  // a 1-head piece of the parts past S
+        const int e = bx / kGroup, lp = S + e / hsz;
+        u = (full * S + lp / hm) * kGroups + (lp % hm) * hsz + e % hsz;
+#ifdef EGT_CONTROL_SPLIT_HEADS
+        hoff = 0;
+#else
+        hoff = bx % kGroup;
+#endif
+        idle = hs >= 1;
+      }
+#endif
+    } else if (ppu == 1) {
+      u = full * S * kGroups + t0 + (q - full * kGroups);
+    } else if (q - full * kGroups < R2) {
+      u = full * S * kGroups + blockIdx.x * R2 + (q - full * kGroups);
+    } else {  // this CTA's piece of a leftover unit: heads (blockIdx % ppu) * kGroup / ppu + [0, kGroup / ppu)
+      u = full * S * kGroups + S * R2 + blockIdx.x / ppu;
+      const int nh = kGroup / ppu;
+#ifdef EGT_CONTROL_SPLIT_HEADS  // must-fail control: every piece computes the first heads of its unit (the others stay unwritten)
+      hoff = 0;
+#else
+      hoff = (blockIdx.x % ppu) * nh;
+#endif
+      idle = hs >= nh;
+    }
+#else
     const int u = q < full * kGroups ? ((q / kGroups) * S + blockIdx.x) * kGroups + q % kGroups
                                      : full * S * kGroups + t0 + (q - full * kGroups);
+#endif
     const int hp = u / kGroups, grp = u % kGroups, sample = hp >> 1, row0 = (hp & 1) * kRows;
     const bool fresh = hp != current;
+#if defined(EGT_TIMING) && defined(TAIL_SPLIT)
+    nfresh += fresh;
+#endif
     if (fresh) {
       __syncthreads();  // every warp is past its last read of the previous state
       const __half* src = state + ((size_t)sample * 64 + row0) * 64 * 16;
+#if defined(STATE_LDG)
+      if (kNew) {
+      // k5: the state copy as plain 16-byte loads + shared stores, STATE_LDG at a time per thread (cp.async measured ~15K
+      // cycles of every warp per fresh half-position: 8 instructions per thread throttled to ~4 bytes / cycle per SM)
+      {
+        static_assert(kRows * 64 * 2 % kThreads == 0 && (kRows * 64 * 2 / kThreads) % STATE_LDG == 0, "state copy batches");
+#pragma unroll
+        for (int j0 = 0; j0 < kRows * 64 * 2 / kThreads; j0 += STATE_LDG) {
+          uint4 v[STATE_LDG];
+#pragma unroll
+          for (int j = 0; j < STATE_LDG; ++j) {
+            const int i = tid + (j0 + j) * kThreads, chunk = i & 1, cell = (i >> 1) & 63, r = i >> 7;
+            v[j] = __ldg(reinterpret_cast<const uint4*>(src + ((size_t)r * 64 + cell) * 16 + chunk * 8));
+          }
+#pragma unroll
+          for (int j = 0; j < STATE_LDG; ++j) {
+            const int i = tid + (j0 + j) * kThreads, chunk = i & 1, cell = (i >> 1) & 63, r = i >> 7;
+            *reinterpret_cast<uint4*>(smem + chunk * kPlane + r * kSPitch + cell * 16) = v[j];
+          }
+        }
+      }
+      } else
+#endif
+      {
       for (int i = tid; i < kRows * 64 * 2; i += kThreads) {
         const int chunk = i & 1, cell = (i >> 1) & 63, r = i >> 7;
+#ifndef DBG_NO_STATE
         cp16(smem + chunk * kPlane + r * kSPitch + cell * 16, src + ((size_t)r * 64 + cell) * 16 + chunk * 8);
+#else
+        (void)chunk; (void)cell; (void)r; (void)src;
+#endif
       }
       cp_commit();
+      }
       current = hp;
     }
     TICK(0);
+#ifdef TAIL_SPLIT
+    if (idle) {
+      if (fresh) {
+        cp_wait_all();
+        __syncthreads();
+        (void)__syncthreads_or(0);
+        __syncthreads();
+      }
+      break;
+    }
+    const int h = grp * kGroup + hoff + hs;
+#else
     const int h = grp * kGroup + hs;
+#endif
+#ifdef DBG_HOT  // k5 pricing switch (results wrong): the per-unit global loads read one small region (L1 hits)
+#define HOTI(x, hot) (hot)
+    const __half* base = qkv;
+#else
+#define HOTI(x, hot) (x)
     const __half* base = qkv + (size_t)sample * 64 * kStride + h * kHeadStride;
+#endif
 
     // ---- loads for q.k and the tables, all issued ahead of the MMAs
     static_assert(kHd == 32 && kKs == 2 && kNd == 4, "ld128 is written for head_dim 32");
-    const __half* qrow = base + (size_t)(row0 + rt * 16 + g) * kStride;
-    uint4 qraw0 = row_load(qrow, t), qraw1 = row_load(qrow + 8 * kStride, t);
+    const __half* qrow = base + (size_t)HOTI(row0 + rt * 16 + g, g) * kStride;
+    uint4 qraw0 = row_load(qrow, t), qraw1 = row_load(qrow + HOTI(8, 0) * kStride, t);
     uint4 kraw[4];  // keys kh * 32 + 8n + g
 #pragma unroll
-    for (int n = 0; n < 4; ++n) kraw[n] = row_load(base + kKOff + (size_t)(kh * 32 + 8 * n + g) * kStride, t);
+    for (int n = 0; n < 4; ++n) kraw[n] = row_load(base + kKOff + (size_t)HOTI(kh * 32 + 8 * n + g, g) * kStride, t);
 
     uint32_t tqf[3][kKs][2], tkf[3][kKs][2];
+#if defined(EGT_TAB128) && defined(BT6_ATTN_KERNEL_ONLY)
+    // k5 probe: each table tile row (channel 8 nn + g, 32 dims = 64 bytes) as one 16-byte load per lane + the quad transpose
+    // (the K-fragment trick): words t, 4 + t, 8 + t, 12 + t = [ks 0][0], [0][1], [1][0], [1][1]. Same values as table_pair.
+    uint4 tqr[3], tkr[3];
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+      const int nn = kh ? (i < 2 ? 3 + i : 4) : i;
+      tqr[i] = row_load(reinterpret_cast<const __half*>(query_t) + ((size_t)h * kTab + 8 * nn + g) * kHd, t);
+    }
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+      const int nn = rt ? (i < 2 ? 3 + i : 4) : i;
+      tkr[i] = row_load(reinterpret_cast<const __half*>(key_t) + ((size_t)h * kTab + 8 * nn + g) * kHd, t);
+    }
+#else
 #pragma unroll
     for (int i = 0; i < 3; ++i) {
       const int nn = kh ? (i < 2 ? 3 + i : 4) : i;  // kh = 1 has two tiles; its third slot repeats tile 4 and is not stored
 #pragma unroll
       for (int ks = 0; ks < kKs; ++ks) {
-        tqf[i][ks][0] = table_pair(query_t, h, 8 * nn + g, 16 * ks + 2 * t);
-        tqf[i][ks][1] = table_pair(query_t, h, 8 * nn + g, 16 * ks + 2 * t + 8);
+        tqf[i][ks][0] = table_pair(query_t, HOTI(h, 0), HOTI(8 * nn + g, g), 16 * ks + 2 * t);
+        tqf[i][ks][1] = table_pair(query_t, HOTI(h, 0), HOTI(8 * nn + g, g), 16 * ks + 2 * t + 8);
       }
     }
 #pragma unroll
@@ -420,10 +589,11 @@ __global__ void __launch_bounds__(kThreads, 1) BT6_ATTN_KERNEL(
       const int nn = rt ? (i < 2 ? 3 + i : 4) : i;  // the row tile picks the column table's channel tiles: 0-2 or 3-4
 #pragma unroll
       for (int ks = 0; ks < kKs; ++ks) {
-        tkf[i][ks][0] = table_pair(key_t, h, 8 * nn + g, 16 * ks + 2 * t);
-        tkf[i][ks][1] = table_pair(key_t, h, 8 * nn + g, 16 * ks + 2 * t + 8);
+        tkf[i][ks][0] = table_pair(key_t, HOTI(h, 0), HOTI(8 * nn + g, g), 16 * ks + 2 * t);
+        tkf[i][ks][1] = table_pair(key_t, HOTI(h, 0), HOTI(8 * nn + g, g), 16 * ks + 2 * t + 8);
       }
     }
+#endif
 
     // Transpose once every load of this unit is in flight (QK-norm first: the rows are still lane-contiguous).
 #if QKNORM
@@ -440,6 +610,16 @@ __global__ void __launch_bounds__(kThreads, 1) BT6_ATTN_KERNEL(
       qa[0][0] = w0[0]; qa[0][2] = w0[1]; qa[1][0] = w0[2]; qa[1][2] = w0[3];
       qa[0][1] = w1[0]; qa[0][3] = w1[1]; qa[1][1] = w1[2]; qa[1][3] = w1[3];
     }
+#if defined(EGT_TAB128) && defined(BT6_ATTN_KERNEL_ONLY)
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+      uint32_t w[4];
+      quad_words(tqr[i], t, w);
+      tqf[i][0][0] = w[0]; tqf[i][0][1] = w[1]; tqf[i][1][0] = w[2]; tqf[i][1][1] = w[3];
+      quad_words(tkr[i], t, w);
+      tkf[i][0][0] = w[0]; tkf[i][0][1] = w[1]; tkf[i][1][0] = w[2]; tkf[i][1][1] = w[3];
+    }
+#endif
     uint32_t kb[4][kKs][2];
 #pragma unroll
     for (int n = 0; n < 4; ++n) {
@@ -483,6 +663,19 @@ __global__ void __launch_bounds__(kThreads, 1) BT6_ATTN_KERNEL(
       nz = 0;
       counts = 0;
       int count = 0;
+#ifdef FRESH_SHARE
+      // k5: only head slot 0 loads the half-position's edge bits and S (the other slots loaded the same 20 KB again:
+      // 4 x the global traffic of the fresh block); it leaves each owner lane's S, bit counts, mask and list offset in
+      // head region 0 (idle until the tables are written, after the fresh block's last barrier) for the other slots.
+      static_assert(128 * 48 <= kHeadBytes, "fresh scratch in a head region");
+#ifdef EGT_CONTROL_FRESH  // must-fail control: the other head slots read the neighbouring lane's record
+      uint4* scr = reinterpret_cast<uint4*>(smem + kState) + ((warp & 3) * 32 + (hs ? lane ^ 1 : lane)) * 3;
+#else
+      uint4* scr = reinterpret_cast<uint4*>(smem + kState) + ((warp & 3) * 32 + lane) * 3;
+#endif
+      int excl = 0;
+      if (!kNew || hs == 0) {
+#endif
 #pragma unroll
       for (int a = 0; a < 2; ++a) {
         const size_t row = (size_t)sample * 64 + row0 + rt * 16 + g + 8 * a;
@@ -507,11 +700,32 @@ __global__ void __launch_bounds__(kThreads, 1) BT6_ATTN_KERNEL(
         if (lane >= offset) inclusive += v;
       }
       if (hs == 0 && lane == 31) sWarpTot[warp] = inclusive;
+#ifdef FRESH_SHARE
+      excl = inclusive - count;
+      if (kNew) {
+        const uint32_t* nw = reinterpret_cast<const uint32_t*>(&nrm[0][0]);
+        scr[0] = make_uint4(nw[0], nw[1], nw[2], nw[3]);
+        scr[1] = make_uint4(nw[4], nw[5], nw[6], nw[7]);
+        scr[2] = make_uint4(static_cast<uint32_t>(counts), static_cast<uint32_t>(counts >> 32), nz, static_cast<uint32_t>(excl));
+      }
+      }
+#endif
       bool cell_over = false;
 #pragma unroll
       for (int k = 0; k < 16; ++k) cell_over |= ((counts >> (4 * k)) & 15u) == 15u;
       cp_wait_all();
       __syncthreads();  // the state is in; head slot 0's warp totals are visible
+#ifdef FRESH_SHARE
+      if (kNew && hs != 0) {  // read before the next CTA barrier: slot 0 writes its tables into this region only after the fresh block
+        const uint4 x0 = scr[0], x1 = scr[1], x2 = scr[2];
+        uint32_t* nw = reinterpret_cast<uint32_t*>(&nrm[0][0]);
+        nw[0] = x0.x; nw[1] = x0.y; nw[2] = x0.z; nw[3] = x0.w;
+        nw[4] = x1.x; nw[5] = x1.y; nw[6] = x1.z; nw[7] = x1.w;
+        counts = static_cast<unsigned long long>(x2.x) | (static_cast<unsigned long long>(x2.y) << 32);
+        nz = x2.z;
+        excl = static_cast<int>(x2.w);
+      }
+#endif
       int base_count = 0, total = 0;
 #pragma unroll
       for (int w = 0; w < 4; ++w) {
@@ -520,7 +734,11 @@ __global__ void __launch_bounds__(kThreads, 1) BT6_ATTN_KERNEL(
         total += v;
       }
       eover = __syncthreads_or(total > kListCta || cell_over) != 0;
+#ifdef FRESH_SHARE
+      estart = base_count + excl;
+#else
       estart = base_count + inclusive - count;
+#endif
       etotal = total;
       if (hs == 0 && !eover) {  // the owner's entries, in cell order, with the cell's S
         int at = estart;
@@ -555,20 +773,20 @@ __global__ void __launch_bounds__(kThreads, 1) BT6_ATTN_KERNEL(
 #else
       const long long wait = (hs & 1) ? SKEW : 0;
 #endif
-      if (wait) {
+      if (wait && kNew) {
         const long long start = clock64();
         while (clock64() - start < wait) {
         }
       }
 #endif
     }
-    TICK(0);
+    TICK(7);
     // the head's scalars, state weights and cbias: issued before the barrier so their latency hides under it
     const float qk_scale = __ldg(qk_scale_t + h), gate_b = __ldg(gate_b_t + h);
     __half2 wr[8], wd[8], wg[8];
 #ifdef PACKED  // read_t = 24 packed half2 per head: read, door, gate x 8 channel pairs
     {
-      const uint4* wv = reinterpret_cast<const uint4*>(read_t) + h * 6;
+      const uint4* wv = reinterpret_cast<const uint4*>(read_t) + HOTI(h, 0) * 6;
 #pragma unroll
       for (int i = 0; i < 2; ++i) {
         const uint4 x = __ldg(wv + i), y = __ldg(wv + 2 + i), z = __ldg(wv + 4 + i);
@@ -599,7 +817,7 @@ __global__ void __launch_bounds__(kThreads, 1) BT6_ATTN_KERNEL(
 #pragma unroll
       for (int n = 0; n < 4; ++n)
 #ifdef PACKED  // cbias as FP16 [heads][64][64]
-        cb[a][n] = __ldg(reinterpret_cast<const __half2*>(cbias) + (h * 4096 + (row0 + rt * 16 + g + 8 * a) * 64 + kh * 32 + 8 * n + 2 * t) / 2);
+        cb[a][n] = __ldg(reinterpret_cast<const __half2*>(cbias) + HOTI((h * 4096 + (row0 + rt * 16 + g + 8 * a) * 64 + kh * 32 + 8 * n + 2 * t) / 2, t));
 #else
         cb[a][n] = __float22half2_rn(
             __ldg(reinterpret_cast<const float2*>(cbh + (row0 + rt * 16 + g + 8 * a) * 64 + kh * 32 + 8 * n + 2 * t)));
@@ -679,12 +897,12 @@ __global__ void __launch_bounds__(kThreads, 1) BT6_ATTN_KERNEL(
     // ---- the logit assembly per cell: E entries, norm * cbias, read / door / gate from the shared state (HFMA2),
     // H = (F + read)(1 + door)
     // V for P.V, loaded now so its latency hides under the assembly (transposed at use)
-    const __half* vrow = base + kVOff + (size_t)(kh * 32 + g) * kStride;
+    const __half* vrow = base + kVOff + (size_t)HOTI(kh * 32 + g, g) * kStride;
     uint4 vload[2][2];  // rows kh * 32 + g + 16 kk + 8 j, transposed into fragment words just before P.V
 #pragma unroll
     for (int kk = 0; kk < 2; ++kk)
 #pragma unroll
-      for (int j = 0; j < 2; ++j) vload[kk][j] = row_load(vrow + (size_t)(16 * kk + 8 * j) * kStride, t);
+      for (int j = 0; j < 2; ++j) vload[kk][j] = row_load(vrow + (size_t)HOTI(16 * kk + 8 * j, 0) * kStride, t);
     const bool walk = eover;  // the half-position's bits did not fit the list: every lane reads its cells' masks
 #ifndef DBG_NO_E
     if (!walk) {  // this head's E values: 4 consecutive entries per head thread, then an FP32 prefix over the list
@@ -719,6 +937,7 @@ __global__ void __launch_bounds__(kThreads, 1) BT6_ATTN_KERNEL(
       named_bar(bar_head, 128);  // the prefix is visible
     }
 #endif
+    TICK(8);
     int cell_start = estart;  // running start of cell k's entries
     float hv[4][4];
     __half2 dg[4][4];  // (door, 2 sigmoid(gate)) per cell
@@ -898,7 +1117,7 @@ __global__ void __launch_bounds__(kThreads, 1) BT6_ATTN_KERNEL(
       for (int a = 0; a < 2; ++a) {
 #if OGATE
         gl[i][a] = __half22float2(__ldg(reinterpret_cast<const __half2*>(
-            base + 3 * kWidth + (size_t)(row0 + rt * 16 + g + 8 * a) * kStride + 8 * (nd0 + i) + 2 * t)));
+            base + 3 * kWidth + (size_t)HOTI(row0 + rt * 16 + g + 8 * a, g) * kStride + HOTI(8 * (nd0 + i), 0) + 2 * t)));
 #else
         gl[i][a] = make_float2(0.f, 0.f);
 #endif
@@ -992,6 +1211,19 @@ __global__ void __launch_bounds__(kThreads, 1) BT6_ATTN_KERNEL(
     }
     TICK(6);
   }
+#if defined(EGT_PHASE) && defined(BT6_ATTN_KERNEL_ONLY)
+  if (lane == 0) {
+#pragma unroll
+    for (int i = 0; i < 10; ++i) atomicAdd(&g_egt_ph[warp * 10 + i], static_cast<unsigned long long>(ph_acc[i]));
+    atomicAdd(&g_egt_ph[160 + warp], static_cast<unsigned long long>(nq));
+  }
+#endif
+#if defined(EGT_TIMING) && defined(TAIL_SPLIT)
+  if (tid == 0) {
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_end));
+    g_egt_t[3 * blockIdx.x] = t_start; g_egt_t[3 * blockIdx.x + 1] = t_end; g_egt_t[3 * blockIdx.x + 2] = nq | (nfresh << 16);
+  }
+#endif
 }
 
 #ifndef BT6_ATTN_KERNEL_ONLY

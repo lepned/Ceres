@@ -1,5 +1,5 @@
 """Give a BT6 ONNX (input planes fp32 [B,112,8,8]; outputs policy, wdl logits, mlh, err fp32) the I/O convention of
-Mycel's / Ceres' Lc0 net format (lc0 leela2onnx): FP16 input /input/planes, FP16 outputs /output/policy (1858
+Ceres' Lc0 net format (lc0 leela2onnx): FP16 input /input/planes, FP16 outputs /output/policy (1858
 logits), /output/wdl (softmax: W/D/L probabilities), /output/mlh. err is dropped as an output. Graph otherwise
 unchanged.   usage: to_lc0_io.py in.onnx out.onnx"""
 import sys

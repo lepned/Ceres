@@ -1,5 +1,5 @@
 """INT8 fake-quant emulator of Kovax's BT6 flagship on GPU (FP32 math + quantisation), for choosing the scheme
-before any TensorRT build. WSL: /home/lep/cerestrain-env/bin/python emu.py <cmd> ...
+before any TensorRT build. WSL: python3 emu.py <cmd> ...
 
   calib  --out calib.npz [--start 2048 --count 2048]     activation statistics per layer / site on real positions
   run    --scheme S [--calib calib.npz] [--out out.npz]   fake-quant forward on the 256 gate positions + gate
@@ -24,7 +24,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, "/mnt/c/Dev/Chess/kovax_bt6_trt")
-sys.path.insert(0, "/mnt/c/Users/lepne/source/repos/CeresTrain/src/CeresTrainPy")
+sys.path.insert(0, __import__("os").environ.get("CERESTRAIN_PY", "CeresTrain/src/CeresTrainPy"))
 from bt6_export_onnx import BT6Served, load_carrier, real_planes  # noqa: E402
 from metrics import LEGAL, gate  # noqa: E402
 

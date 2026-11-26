@@ -1,8 +1,8 @@
-# BT6 TensorRT plugins (round 4 + lc0 BT6)
+# BT6 TensorRT plugins
 
-TensorRT IPluginV3 plugins for nets with BT6 term layers and the move-token decoder (for example the 768x16 flat
-BT6 HL-Gauss net). One library holds all of them; every older name / version is kept, so plugin ONNX files from
-earlier rounds still build.
+TensorRT IPluginV3 plugins that make BT6-style nets fast in TensorRT: nets with BT6 term layers and the move-token
+decoder (our 768x16 flat BT6 HL-Gauss net), and lc0 BT6 nets (Kovax's 1024x24x32 BT6 flagship). One library holds
+all of them; every older plugin name / version is kept, so plugin ONNX files from earlier rounds still build.
 
 | Plugin | Version | What it replaces |
 |---|---|---|
@@ -19,29 +19,57 @@ earlier rounds still build.
 | `BT6TripletSite` | 1 | lc0 BT6 edge site with the triplet branch (contraction path / ag) |
 | `BT6SigGluQuant` | 1 | sigmoid GLU (sigmoid(gate) · (up + b)) and per-token INT8 of the FFN down input |
 | `BT6RowQuant` | 1 | per-token INT8 quantisation of a tensor (attention output before the out GEMM) |
+| `BT6LnQuant` | 1 | residual add + LayerNorm + static INT8 quantise (TensorRT's own fusion is as fast; not used by default) |
+| `BT6I8GemmGlu` | 1 | INT8 GEMM (CUTLASS) with the sigmoid-GLU epilogue writing INT8 codes (lc0ex's Q1 recipe) |
 
-lc0 BT6 nets (Kovax's BT6 flagship): ONNX chain, gates and results in `tools/kovax_bt6/README.md`.
+## Quick start: an lc0 BT6 net in Ceres
+
+1. **Ceres with plugin support** = this fork. Build the small native TensorRT wrapper from
+   `../../Native` (`TensorRTWrapper.cpp`; see `build_instructions_windows.txt` / `build_instructions_linux.txt`,
+   `make NVINFER_MAJOR=10|11` on Linux) against your TensorRT, and put it next to `Ceres.dll` in place of the
+   binary shipped in the repo (the shipped binaries predate the plugin call `TRT_LoadPluginLibrary`).
+2. **The plugin library**, built on your machine against the SAME TensorRT major version (see Build below).
+3. **A plugin ONNX of the net** (see `tools/kovax_bt6/README.md` for how they are made from the lc0ex carrier):
+   FP16 or INT8, input `/input/planes`, outputs `/output/policy`, `/output/wdl`, `/output/mlh`.
+4. Net and device spec:
+
+   ```
+   Network: ONNX_TRT:<path to the plugin .onnx>|PLUGIN=<path to bt6_trt_plugin.dll or libbt6_trt_plugin.so>
+   Device:  GPU:0#TensorRTNative
+   ```
+
+   The first start builds the TensorRT engines (one per batch size; a few minutes for a 1024x24 net), later starts
+   load them from the cache. The environment variable `CERES_TRT_PLUGINS` (path list) works instead of `|PLUGIN=`.
+
+lc0 (`onnx-trt`): see `tools/kovax_bt6/lc0_onnx_trt/` (a small lc0 patch, the ONNX Runtime variant of the library and
+two changes to the ONNX file).
 
 ## Build
 
-The library must be built against the same TensorRT major version as the runtime (TensorRT 10 or newer).
-Engine plans store only the plugin name and fields, so the library must be loaded before every build and every
-deserialization.
+The library must be built against the same TensorRT major version as the runtime (TensorRT 10 or newer). Engine
+plans store only the plugin name and fields, so the library must be loaded before every build and every
+deserialization. `BT6I8GemmGlu` needs the CUTLASS 4.x headers (https://github.com/NVIDIA/cutlass, tested with 4.8.1):
+point `CUTLASS_INCLUDE` at its `include` directory.
 
-- Windows: `build_win.bat [TensorRT root] [CUDA root]` -> `out\bt6_trt_plugin.dll`
-- Linux: `NVCC=... TRT_INCLUDE=... ./build_linux.sh` -> `out/libbt6_trt_plugin.so`
+- Windows: `set CUTLASS_INCLUDE=<cutlass>\include` then `build_win.bat [TensorRT root] [CUDA root]`
+  -> `out\bt6_trt_plugin.dll`
+- Linux: `NVCC=... TRT_INCLUDE=... CUTLASS_INCLUDE=<cutlass>/include ./build_linux.sh ["-gencode ..."]`
+  -> `out/libbt6_trt_plugin.so`
+- `BT6_ORT=1` builds the ONNX Runtime variant (`bt6_trt_plugin_ort`), which registers its plugins when the library
+  is loaded (ONNX Runtime's TensorRT provider loads plugin libraries as plain shared libraries).
 
-Default architectures: sm_80, sm_86, sm_89, sm_90, sm_120 plus compute_120 PTX. B200 / B300 (GB300) need
-sm_100 / sm_103 added (env `BT6_ARCHS` on Windows, the first argument on Linux).
+Default architectures: sm_80, sm_86, sm_89, sm_90, sm_120. B200 / GB300 / GB10 need sm_100 / sm_103 / sm_121 added
+(env `BT6_ARCHS` on Windows, the first argument on Linux).
 
-## Use
+What has actually been run (RTX 5090, sm_120): Windows with TensorRT 11.3 (Ceres, trtexec) and with TensorRT
+10.15 through ONNX Runtime (lc0 `onnx-trt`); Linux x86_64 (WSL, CUDA 13.0) with TensorRT 10.16, where the FP16 and
+INT8 nets give the same gate numbers as on Windows (`tools/kovax_bt6/linux_gate.py`). The code for the other
+architectures (sm_80 .. sm_90, sm_103, sm_121) compiles but has not been executed, and aarch64 has not been built.
 
-- Ceres: add `|PLUGIN=<path>[,<path>]` to the net spec, or set the environment variable `CERES_TRT_PLUGINS`.
-- Mycel: UCI option `TrtPlugins` (path list).
+Environment switches of the lc0 BT6 attention kernel: `BT6_EGT_K4=1` selects the previous kernel path and schedule
+(bit-identical outputs), `BT6_EGT_SCHED=0` only the previous schedule.
 
-The ONNX file must be the plugin ONNX (see below); a plain ONNX file runs without plugins.
-
-## Making the plugin ONNX (CeresTrain, `src/CeresTrainPy`)
+## Our own nets: making the plugin ONNX (CeresTrain, `src/CeresTrainPy`)
 
 One command per checkpoint:
 
@@ -54,8 +82,6 @@ FP16 chain: `dump_params` -> `terms_attention` -> `prologue_sites` -> `merge_gem
 INT8 chain: the plain INT8 QDQ ONNX (`qdq_export.py` percentile 99.9999 + shape allowlist, `qdq_to_fp16.py` with
 fp32 islands; `--qdq` reuses an existing one), then `dump_params` -> `terms_attention` -> `prologue_sites` ->
 `port_qdq` (exclude 1536x768) -> `merge_gemms` (coef) -> `glu_quant` -> `attn_int8_out` -> `decoder`.
-
-## Check
 
 `tools/gate.py` compares the plugin engine against PyTorch on real positions (W-L mean, top-1, policy KL).
 Limits: FP16 W-L mean <= 0.0003 and KL <= 3e-6; INT8 W-L mean <= 0.0025, top-1 >= 253/256, KL <= 3e-4.
@@ -70,3 +96,22 @@ random input sends the attention kernel down a slow fallback path.
 | b128 | 21.29 | 9.58 | 7.22 |
 
 Puzzles equal to the plain net within 2 (200M and 400M).
+
+## lc0 BT6 nets (Kovax's BT6 flagship)
+
+ONNX chain, INT8 recipes, gates and results: `tools/kovax_bt6/README.md`. Summary on one RTX 5090 (BT6 5.4M,
+Ceres search speed in evaluations per second from the start position, only the backend differs):
+
+| | TensorRT + plugins | lc0ex |
+|---|---|---|
+| INT8 | 10.7K | 10.6K |
+
+Puzzles are equal between the two backends within noise.
+
+## Origin of the kernels
+
+Several kernels are derived from lc0ex by Kovax (https://github.com/Kovax007/lczero-triton): the term-layer and lc0
+BT6 attention kernels (`bt6_attn_kernels.cu`, `bt6_egt_attn.cu`, from the lab's `terms_v9` / `egt_v9` head
+pipelines), the triplet edge site (`bt6_triplet_site.cu`, from `triplet_mma`), and the sigmoid-GLU epilogue of the
+INT8 GEMM (`bt6_i8gemm_kernels.cu`). The INT8 recipe "Q1" is lc0ex's. Each file's header says what was changed.
+`BT6I8GemmGlu` builds on CUTLASS (NVIDIA, BSD 3-Clause).

@@ -2,7 +2,7 @@
    ~/lc0ex/lczero-triton/.venv/bin/python run_lc0ex_int8.py N BATCH OUT.npz"""
 import sys
 sys.path.insert(0, "/mnt/c/Dev/Chess/lc0ex_work/bt6_torch")
-sys.path.insert(0, "/mnt/c/Users/lepne/source/repos/CeresTrain/.claude/worktrees/agent-a28190fa09ace81ed/src/CeresTrainPy")
+sys.path.insert(0, __import__("os").environ.get("CERESTRAIN_PY", "CeresTrain/src/CeresTrainPy"))
 from pathlib import Path
 import numpy as np
 from bt6_carrier import NUMPY_TO_ONNX, read_carrier

@@ -13,7 +13,7 @@ trap 'rm -f $LOCK' EXIT
 for spec in "$@"; do
   tag=${spec%%:*}; B=${spec##*:}
   for try in 1 2 3 4 5 6; do
-    busy=$(tasklist | grep -i -E "lc0.exe|mycel|ceres" | grep -v -i CrossDevice)
+    busy=$(tasklist | grep -i -E "lc0.exe|ceres" | grep -v -i CrossDevice)
     util=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits)
     [ -z "$busy" ] && [ "$util" -lt 10 ] && break
     echo "GPU busy ($util %) $busy, waiting"; sleep 30

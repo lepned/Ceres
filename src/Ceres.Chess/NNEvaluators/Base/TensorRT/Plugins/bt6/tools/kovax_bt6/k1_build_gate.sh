@@ -7,7 +7,7 @@ K=/c/Dev/Chess/kovax_bt6_trt
 mkdir -p $K/plugin/engines
 cd $K/plugin
 for B in $BATCHES; do
-  busy=$(tasklist | grep -i -E "lc0.exe|mycel|ceres" | grep -v -i CrossDevice)
+  busy=$(tasklist | grep -i -E "lc0.exe|ceres" | grep -v -i CrossDevice)
   if [ -n "$busy" ]; then echo "GPU BUSY: $busy"; exit 1; fi
   E=engines/${TAG}_b$B.engine
   if [ ! -f "$E" ] || [ -n "$REBUILD" ]; then
@@ -16,6 +16,6 @@ for B in $BATCHES; do
   fi
   trtexec --loadEngine=$E --dynamicPlugins=$DLL --loadInputs=planes:../planes_b$B.bin --exportOutput=engines/out_${TAG}_b$B.json \
     --iterations=1 --warmUp=0 --duration=0 > engines/${TAG}_b$B.run.log 2>&1 || { echo "RUN FAILED $TAG b$B"; tail -20 engines/${TAG}_b$B.run.log; exit 2; }
-  MSYS_NO_PATHCONV=1 wsl -e bash -c "cd /mnt/c/Dev/Chess/kovax_bt6_trt && /home/lep/cerestrain-env/bin/python trt_gate.py plugin/engines/out_${TAG}_b$B.json ${TAG}_b$B" | tee engines/${TAG}_b$B.gate.txt
+  MSYS_NO_PATHCONV=1 wsl -e bash -c "cd /mnt/c/Dev/Chess/kovax_bt6_trt && python3 trt_gate.py plugin/engines/out_${TAG}_b$B.json ${TAG}_b$B" | tee engines/${TAG}_b$B.gate.txt
   [ -z "$KEEP" ] && rm -f engines/out_${TAG}_b$B.json
 done
