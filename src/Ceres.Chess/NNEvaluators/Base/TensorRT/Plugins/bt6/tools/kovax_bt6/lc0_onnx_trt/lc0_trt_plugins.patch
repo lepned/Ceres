@@ -1,16 +1,21 @@
 diff --git a/src/neural/backends/onnx/network_onnx.cc b/src/neural/backends/onnx/network_onnx.cc
-index e6520b3..69cb6fa 100644
+index e6520b3..58d9577 100644
 --- a/src/neural/backends/onnx/network_onnx.cc
 +++ b/src/neural/backends/onnx/network_onnx.cc
-@@ -33,6 +33,7 @@
+@@ -32,9 +32,12 @@
+ #include <iomanip>
  #include <iterator>
  #include <list>
++#include <map>
  #include <memory>
 +#include <set>
  #include <sstream>
  #include <string>
++#include <tuple>
  #include <vector>
-@@ -49,6 +50,7 @@
+ 
+ #include "onnx_conf.h"
+@@ -49,6 +52,7 @@
  #include "neural/network.h"
  #include "neural/onnx/converter.h"
  #include "onnxruntime_cxx_api.h"
@@ -18,7 +23,7 @@ index e6520b3..69cb6fa 100644
  #include "utils/bf16_utils.h"
  #include "utils/bititer.h"
  #include "utils/commandline.h"
-@@ -62,6 +64,46 @@ namespace onnx {
+@@ -62,6 +66,46 @@ namespace onnx {
  
  enum class OnnxProvider { CPU, CUDA, DML, ROCM, TRT, MIGRAPHX, COREML };
  
@@ -65,7 +70,7 @@ index e6520b3..69cb6fa 100644
  class OnnxNetwork;
  
  static constexpr int kNumOutputPolicy = 1858;
-@@ -190,6 +232,9 @@ class OnnxNetwork final : public Network {
+@@ -190,6 +234,9 @@ class OnnxNetwork final : public Network {
    }
  
    Ort::Env onnx_env_;
@@ -75,7 +80,7 @@ index e6520b3..69cb6fa 100644
    // Prepare sessions for this many multiples of the batch size;
    int steps_;
    std::vector<Ort::Session> session_;
-@@ -209,6 +254,8 @@ class OnnxNetwork final : public Network {
+@@ -209,6 +256,8 @@ class OnnxNetwork final : public Network {
    // The lower limit for variable batch size.
    int min_batch_size_;
    int gpu_;
@@ -84,7 +89,121 @@ index e6520b3..69cb6fa 100644
    static constexpr int max_batch_size_ = 1024;
    // For conditional locking if running the DML/ROCM/TRT provider.
    OnnxProvider provider_;
-@@ -627,6 +674,7 @@ void OnnxComputation<DataType>::ComputeBlocking() {
+@@ -218,6 +267,19 @@ class OnnxNetwork final : public Network {
+   cudaStream_t compute_stream_ = nullptr;
+   cudaStream_t upload_stream_ = nullptr;
+   cudaStream_t download_stream_ = nullptr;
++  // Backend option cuda_graph=N (TensorRT only, 0 = off): the kernels Session::Run enqueues for one combination of
++  // (input / output buffers, offset, batch size) are captured as a CUDA graph on the N-th use of that combination and
++  // replayed with one cudaGraphLaunch from then on (TensorRT 10's enqueue costs ~0.8 ms of CPU time per batch for a
++  // net with many small layers, and the GPU waits for it). Guarded by lock_.
++  struct GraphEntry {
++    cudaGraphExec_t exec = nullptr;
++    int seen = 0;
++  };
++  std::map<std::tuple<void*, int, int, int>, GraphEntry> graphs_;
++  int cuda_graph_ = 0;
++  size_t graphs_captured_ = 0;
++  void CaptureGraph(GraphEntry* entry, int step, Ort::RunOptions& options,
++                    Ort::IoBinding& binding);
+ #endif
+ 
+  private:
+@@ -305,8 +367,51 @@ InputsOutputs::InputsOutputs(OnnxNetwork* network)
+   }
+ }
+ 
++#ifdef USE_ONNX_CUDART
++void OnnxNetwork::CaptureGraph(GraphEntry* entry, int step,
++                               Ort::RunOptions& options,
++                               Ort::IoBinding& binding) {
++  // The caller has just done a normal Run with the same buffers and shapes, so TensorRT has no shape dependent
++  // work left; this second Run only records its kernel launches (nothing executes while the stream captures).
++  // A graph of this net (214 kernels) takes about 1.4 MB of host memory.
++  static constexpr size_t kMaxGraphs = 256;
++  if (graphs_captured_ >= kMaxGraphs) return;
++  if (cudaStreamBeginCapture(compute_stream_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
++    cudaGetLastError();
++    cuda_graph_ = 0;
++    CERR << "CUDA graph: capture could not start, continuing without CUDA graphs.";
++    return;
++  }
++  std::string what;
++  try {
++    session_[step - 1].Run(options, binding);
++  } catch (const std::exception& e) {
++    what = e.what();
++    if (what.empty()) what = "Run failed";
++  }
++  cudaGraph_t graph = nullptr;
++  cudaError_t err = cudaStreamEndCapture(compute_stream_, &graph);
++  if (what.empty() && err == cudaSuccess && graph) {
++    err = cudaGraphInstantiate(&entry->exec, graph, 0);
++  }
++  if (graph) cudaGraphDestroy(graph);
++  if (!what.empty() || err != cudaSuccess || !entry->exec) {
++    cudaGetLastError();
++    entry->exec = nullptr;
++    cuda_graph_ = 0;
++    CERR << "CUDA graph: capture failed (" << (what.empty() ? cudaGetErrorString(err) : what)
++         << "), continuing without CUDA graphs.";
++    return;
++  }
++  graphs_captured_++;
++}
++#endif
++
+ OnnxNetwork::~OnnxNetwork() {
+ #ifdef USE_ONNX_CUDART
++  for (auto& [key, entry] : graphs_) {
++    if (entry.exec) cudaGraphExecDestroy(entry.exec);
++  }
+   if (provider_ == OnnxProvider::TRT || provider_ == OnnxProvider::CUDA) {
+     if (compute_stream_) ReportCUDAErrors(cudaStreamDestroy(compute_stream_));
+     if (upload_stream_) ReportCUDAErrors(cudaStreamDestroy(upload_stream_));
+@@ -495,7 +600,18 @@ void OnnxComputation<DataType>::ComputeBlocking() {
+       batch = std::min((int)input_size_ - (int)i, batch);
+     }
+ 
+-    auto binding = PrepareInputs(i, batch, step);
++    Ort::IoBinding binding{nullptr};
++#ifdef USE_ONNX_CUDART
++    OnnxNetwork::GraphEntry* graph_entry = nullptr;
++    if (network_->cuda_graph_ > 0) {
++      graph_entry = &network_->graphs_[{inputs_outputs_->input_tensor_data_device_,
++                                        static_cast<int>(i), batch, step}];
++    }
++    if (!graph_entry || !graph_entry->exec)
++#endif
++    {
++      binding = PrepareInputs(i, batch, step);
++    }
+ 
+     Ort::RunOptions options = {};
+ #ifdef USE_ONNX_CUDART
+@@ -560,7 +676,20 @@ void OnnxComputation<DataType>::ComputeBlocking() {
+     {
+       binding.SynchronizeInputs();
+     }
+-    network_->session_[step - 1].Run(options, binding);
++#ifdef USE_ONNX_CUDART
++    if (graph_entry && graph_entry->exec) {
++      ReportCUDAErrors(
++          cudaGraphLaunch(graph_entry->exec, network_->compute_stream_));
++    } else
++#endif
++    {
++      network_->session_[step - 1].Run(options, binding);
++#ifdef USE_ONNX_CUDART
++      if (graph_entry && ++graph_entry->seen == network_->cuda_graph_) {
++        network_->CaptureGraph(graph_entry, step, options, binding);
++      }
++#endif
++    }
+ #ifdef USE_ONNX_CUDART
+     if (network_->provider_ == OnnxProvider::TRT ||
+         network_->provider_ == OnnxProvider::CUDA) {
+@@ -627,6 +756,7 @@ void OnnxComputation<DataType>::ComputeBlocking() {
  Ort::SessionOptions OnnxNetwork::GetOptions(int threads, int batch_size,
                                              uint64_t hash, int optimize) {
    Ort::SessionOptions options;
@@ -92,7 +211,7 @@ index e6520b3..69cb6fa 100644
    options.SetIntraOpNumThreads(threads);
    GraphOptimizationLevel level = GraphOptimizationLevel::ORT_DISABLE_ALL;
    switch (optimize) {
-@@ -712,6 +760,8 @@ Ort::SessionOptions OnnxNetwork::GetOptions(int threads, int batch_size,
+@@ -712,6 +842,8 @@ Ort::SessionOptions OnnxNetwork::GetOptions(int threads, int batch_size,
        trt_options["trt_layer_norm_fp32_fallback"] = "1";
        trt_options["trt_force_sequential_engine_build"] = "1";
        trt_options["trt_context_memory_sharing_enable"] = "1";
@@ -101,15 +220,35 @@ index e6520b3..69cb6fa 100644
        // Looks like we need I/O binding to enable this.
  #ifdef USE_ONNX_CUDART
        trt_options["has_user_compute_stream"] = "1";
-@@ -805,6 +855,7 @@ OnnxNetwork::OnnxNetwork(const WeightsFile& file, const OptionsDict& opts,
+@@ -805,6 +937,12 @@ OnnxNetwork::OnnxNetwork(const WeightsFile& file, const OptionsDict& opts,
        provider_(provider) {
    onnx_env_.DisableTelemetryEvents();
    gpu_ = opts.GetOrDefault<int>("gpu", 0);
 +  trt_plugins_ = opts.GetOrDefault<std::string>("trt_plugins", "");
++#ifdef USE_ONNX_CUDART
++  if (provider_ == OnnxProvider::TRT) {
++    cuda_graph_ = opts.GetOrDefault<int>("cuda_graph", 0);
++  }
++#endif
  
  #ifdef USE_ONNX_CUDART
    if (provider_ == OnnxProvider::CUDA || provider_ == OnnxProvider::TRT) {
-@@ -931,6 +982,24 @@ OnnxNetwork::OnnxNetwork(const WeightsFile& file, const OptionsDict& opts,
+@@ -887,6 +1025,14 @@ OnnxNetwork::OnnxNetwork(const WeightsFile& file, const OptionsDict& opts,
+   if (batch_size_ * steps_ > max_batch_size_) {
+     batch_size_ = max_batch_size_ / steps_;
+   }
++#ifdef USE_ONNX_CUDART
++  if (cuda_graph_ > 0 && steps_ > 1) {
++    // Several sessions share one TensorRT context memory block, which may move when a larger session runs first
++    // time; a captured graph would keep the old address.
++    CERR << "cuda_graph is not supported with steps > 1, continuing without CUDA graphs.";
++    cuda_graph_ = 0;
++  }
++#endif
+ 
+   const auto& md = file.onnx_model();
+   if (!md.has_input_planes()) {
+@@ -931,6 +1077,24 @@ OnnxNetwork::OnnxNetwork(const WeightsFile& file, const OptionsDict& opts,
        break;
    }
  

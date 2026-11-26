@@ -57,6 +57,13 @@ Wrap with `lc0 onnx2leela --input-format=INPUT_CLASSICAL_112_PLANE --policy-form
 --value-format=VALUE_WDL --moves-left-format=MOVES_LEFT_V1 --onnx-input=/input/planes ...` and run with
 `--backend=onnx-trt --backend-opts="trt_plugins='<lib>',optimize=6"`.
 
+The patch also adds the optional backend option `cuda_graph=N` (default 0 = off): on the N-th use of a batch size lc0
+captures `Session::Run` as a CUDA graph and replays it afterwards (bit-identical outputs). TensorRT 10 spends about
+0.8 ms of CPU time per batch enqueueing this net's 214 kernels, which the replay removes. With `batch=128` (TensorRT
+profile optimised for 128 instead of 256, for minibatch size 128) the search goes from 10.5K to 10.9K evaluations per
+second on the 5.4M INT8 net. Run in analysis and on 4000 puzzles, not in tournament games; not supported with
+`steps` > 1.
+
 ## Results (RTX 5090, TensorRT 11.3 unless noted, 2026-11-25/26)
 
 Gate on 256 real positions vs PyTorch FP32, BT6 5.4M (W-L mean, top-1, KL mean):
