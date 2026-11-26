@@ -98,6 +98,9 @@ static int egt_auto_sched(int full, int rest, int slots) {
 }
 
 int prepare_egt_attention() {
+#ifdef BT6_WITH_T5
+  (void)egt_t5_usable();  // t5's shared-memory attributes, outside any graph capture (GB300 only; no-op elsewhere)
+#endif
   const cudaError_t r[8] = {
       cudaFuncSetAttribute(egt32_attention<kStride, false, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem),
       cudaFuncSetAttribute(egt32_attention<kStride, true, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem),
@@ -116,6 +119,11 @@ int launch_egt_attention(void* out, const __half* qkvg, const int* edges, const 
                          const __half* tab16, const float* tab32, int batch, int sms, cudaStream_t stream, __half* h_out,
                          float out_int8_scale) {
   if (batch <= 0) return 0;
+#ifdef BT6_WITH_T5
+  // GB300 (sm_103): the tcgen05 kernel (bt6_egt_t5.cu) for FP16 output; env BT6_EGT_T5=0 keeps v9
+  if (out_int8_scale <= 0.f && egt_t5_usable())
+    return launch_egt_t5(out, qkvg, edges, norm, state, tab16, tab32, batch, sms, stream, h_out);
+#endif
   const __half* q16 = tab16;
   const __half* k16 = q16 + kHeads * 40 * kHd;
   const __half* rdg = k16 + kHeads * 40 * kHd;

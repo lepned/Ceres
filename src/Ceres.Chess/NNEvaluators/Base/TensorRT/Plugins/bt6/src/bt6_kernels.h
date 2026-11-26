@@ -66,6 +66,12 @@ int prepare_egt_attention();
 int launch_egt_attention(void* out, const __half* qkvg, const int* edges, const __half* norm, const __half* state,
                          const __half* tab16, const float* tab32, int batch, int sms, cudaStream_t stream, __half* h_out,
                          float out_int8_scale);
+// t5 (bt6_egt_t5.cu, built with BT6_WITH_T5 for sm_103a): the tcgen05 form of BT6EgtAttention for the GB300, FP16 output
+// only; same arguments as launch_egt_attention. egt_t5_usable(): compute capability 10.3 and env BT6_EGT_T5 != 0.
+bool egt_t5_supported();  // compute capability 10.3 and the kernel attributes set (no env check)
+bool egt_t5_usable();
+int launch_egt_t5(void* out, const __half* qkvg, const int* edges, const __half* norm, const __half* state,
+                  const __half* tab16, const float* tab32, int batch, int sms, cudaStream_t stream, __half* h_out);
 // BT6PlanesPrologue (bt6_prologue_kernels.cu, kPlanes): planes FP32 [B, 112, 64] + tab FP32 [kPlanesPrologueTab32]
 // (the BT6Prologue blob | policy psc [34] | policy pcb [4096]) -> edges, S, e0 (as BT6Prologue) + pol FP32 [B, 64, 64]
 // (+ e0f FP32 [B, 16, 64, 64] channels-first when not null).
