@@ -1,8 +1,12 @@
 # lc0 BT6 nets (Kovax's BT6 flagship) in TensorRT with the bt6 plugins
 
 Scripts that turn an lc0ex carrier of an lc0 BT6 net (1024 wide, 24 layers, 32 heads, edge sites with triplet) into
-ONNX files TensorRT runs with this folder's plugin library. They are the working scripts of the port: dev-box paths
-are hard-coded in places (as in CeresTrain's make_plugin_onnx.py) and need adjusting. The PyTorch reference of the
+ONNX files TensorRT runs with this folder's plugin library. The scripts that make the ONNX files (`bt6_export_onnx.py`,
+`bt6_k1_onnx.py`, `cache_carrier.py`, `k2_int8_onnx.py`, `k4_onnx.py`, `to_lc0_io.py`) take their inputs from the
+environment and the command line: `BT6_CARRIER` (the net's lc0ex carrier, required), `CERESTRAIN_PY` (CeresTrain's
+`src/CeresTrainPy`) and optionally `BT6_POSITIONS` (an .npz with real positions; the export only traces the graph and
+uses the start position without it; the graph and weights come out the same either way). The gate and timing scripts are the working
+scripts of the port and still have dev-box paths hard-coded; they need files with real positions and reference outputs. The PyTorch reference of the
 net comes from CeresTrain `src/CeresTrainPy` (bt6_net.py, bt6_relations.py, bt6_carrier.py, bt6_planes.py,
 trt_gate_fix.py) on the Python path. Torch steps ran in WSL, graph steps and gates with the TensorRT Python package.
 

@@ -12,7 +12,7 @@
 """
 import sys
 import numpy as np, torch
-sys.path.insert(0, "/mnt/c/Dev/Chess/kovax_bt6_trt/n7M")
+sys.path.insert(0, __import__("os").path.join(__import__("os").path.dirname(__import__("os").path.abspath(__file__)), ".."))
 sys.path.insert(0, __import__("os").environ.get("CERESTRAIN_PY", "CeresTrain/src/CeresTrainPy"))
 from bt6_export_onnx import BT6Served, load_carrier
 from metrics import LEGAL, gate

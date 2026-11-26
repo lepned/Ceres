@@ -73,7 +73,7 @@ def parse_layers(s):
 
 def main():
   ap = argparse.ArgumentParser()
-  ap.add_argument("--src", default="/mnt/c/Dev/Chess/kovax_bt6_trt/plugin/k1_dyn_tri.onnx")
+  ap.add_argument("--src", required=True, help="the FP16 plugin ONNX (bt6_k1_onnx.py --dynamic --triplet-plugin)")
   ap.add_argument("--out", required=True)
   ap.add_argument("--sites", default=",".join(SITES))
   ap.add_argument("--layers", default="0-23")
@@ -87,7 +87,7 @@ def main():
   ap.add_argument("--attn-i8", action="store_true", help="lc attn_out: the attention plugin writes the INT8 codes")
   ap.add_argument("--emb", action="store_true", help="embedding GLU FFN INT8 too (per-token)")
   ap.add_argument("--d1", action="store_true", help="lc0ex D1 value layer (value/dense2 w_d1, b_d1)")
-  ap.add_argument("--carrier", default="/mnt/c/Dev/Chess/kovax_bt6_trt/int8/carrier_all.npz")
+  ap.add_argument("--carrier", required=True, help="carrier tensors as .npz (cache_carrier.py)")
   a = ap.parse_args()
   t0 = time.time()
   m = onnx.load(a.src)

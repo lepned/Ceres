@@ -37,8 +37,7 @@ import onnx
 import torch
 from onnx import helper, numpy_helper
 
-sys.path.insert(0, "/mnt/c/Dev/Chess/kovax_bt6_trt")
-sys.path.insert(0, "/mnt/c/Dev/Chess/kovax_bt6_trt/n7M")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, __import__("os").environ.get("CERESTRAIN_PY", "CeresTrain/src/CeresTrainPy"))
 from bt6_export_onnx import BT6Served, load_carrier, mish, real_planes  # noqa: E402
 from trt_gate_fix import apply_gate_fix  # noqa: E402
@@ -180,7 +179,6 @@ def rewrite(m, t, cfg, control="", e0f=False, tsite=False):
     if i in sites:
       k += 1
       if tsite:   # BT6TripletSite: (state of layer i, H{i}) -> state{k}, FP16 cell-major
-        sys.path.insert(0, "/mnt/c/Dev/Chess/trt_bt6_plugin/src_k1_triplet")
         from triplet_site_tables import triplet_site_table
         inits.append(numpy_helper.from_array(triplet_site_table(t, i).astype(np.float32), f"k1_tabsite_{i}"))
         nodes.append(helper.make_node("BT6TripletSite", [state, f"H{i}", f"k1_tabsite_{i}"], [f"state{k}"],

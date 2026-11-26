@@ -6,7 +6,7 @@ Per layer/site: top[K, C] (K largest |x| per channel over [START, START+COUNT)),
 (amax per 256 positions), n."""
 import sys, time
 import numpy as np, torch
-sys.path.insert(0, "/mnt/c/Dev/Chess/kovax_bt6_trt/n7M")
+sys.path.insert(0, __import__("os").path.join(__import__("os").path.dirname(__import__("os").path.abspath(__file__)), ".."))
 sys.path.insert(0, __import__("os").environ.get("CERESTRAIN_PY", "CeresTrain/src/CeresTrainPy"))
 from bt6_export_onnx import BT6Served, load_carrier, real_planes
 SUFFIX = {"mha/qkvg": "attn_in", "mha/out": "attn_out", "ffn/dense1": "ffn_in", "ffn/dense2": "ffn_mid"}

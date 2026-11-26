@@ -1,9 +1,11 @@
 """Add value_info (element type and shape) for every output of the trt.plugins nodes, taken from TensorRT's own parse of the
 graph with the plugin library loaded, so ONNX Runtime's type inference can resolve the placeholder custom ops.
-usage: add_plugin_types.py in.onnx out.onnx plugin.dll"""
+usage: add_plugin_types.py in.onnx out.onnx plugin.dll
+On Windows set TENSORRT_ROOT to the TensorRT folder (its bin and lib are added to the DLL search path)."""
 import sys, ctypes, os
-for _d in ("C:/Dev/TensorRT-11.3.0.99/bin", "C:/Dev/TensorRT-11.3.0.99/lib"):
-  if os.path.isdir(_d): os.add_dll_directory(_d)
+for _d in ("bin", "lib"):
+  _p = os.path.join(os.environ.get("TENSORRT_ROOT", ""), _d)
+  if os.environ.get("TENSORRT_ROOT") and os.path.isdir(_p) and hasattr(os, "add_dll_directory"): os.add_dll_directory(_p)
 import onnx, tensorrt as trt
 src, dst, dll = sys.argv[1:4]
 ctypes.CDLL(dll)

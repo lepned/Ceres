@@ -58,13 +58,26 @@ point `CUTLASS_INCLUDE` at its `include` directory.
 - `BT6_ORT=1` builds the ONNX Runtime variant (`bt6_trt_plugin_ort`), which registers its plugins when the library
   is loaded (ONNX Runtime's TensorRT provider loads plugin libraries as plain shared libraries).
 
-Default architectures: sm_80, sm_86, sm_89, sm_90, sm_120. B200 / GB300 / GB10 need sm_100 / sm_103 / sm_121 added
-(env `BT6_ARCHS` on Windows, the first argument on Linux).
+Architectures (env `BT6_ARCHS` on Windows, the first argument on Linux):
+- Windows default: sm_80, 86, 89, 90, 100, 103, 120, 121, plus PTX for compute_80, which the driver compiles for any
+  other architecture from sm_80 up.
+- Linux default: sm_80, 86, 89, 90, 120, plus the same PTX. B200 / GB300 / GB10 need sm_100 / sm_103 / sm_121 added;
+  with compute_103 in the list the GB300 attention kernel by dje-dev is built in as well (`GB300_T5.md`).
 
-What has actually been run (RTX 5090, sm_120): Windows with TensorRT 11.3 (Ceres, trtexec) and with TensorRT
-10.15 through ONNX Runtime (lc0 `onnx-trt`); Linux x86_64 (WSL, CUDA 13.0) with TensorRT 10.16, where the FP16 and
-INT8 nets give the same gate numbers as on Windows (`tools/kovax_bt6/linux_gate.py`). The code for the other
-architectures (sm_80 .. sm_90, sm_103, sm_121) compiles but has not been executed, and aarch64 has not been built.
+Toolchains the source has been built with: CUDA 12.6 (gcc 9.4, Ubuntu 20.04; sm_80 .. sm_90 only), 12.9 and 13.0;
+TensorRT 10.15 / 10.16 / 11.3 headers; CUTLASS 4.8.1. dje-dev has built with CUDA 12.6, TensorRT 10.9 headers and
+CUTLASS 4.4. sm_120 needs CUDA 12.8 or newer, the GB300 kernel 12.9 or newer.
+
+A library for distribution: the CUDA runtime is linked in statically, so the result needs a driver of that CUDA major
+version or newer, and it needs the glibc of the system it was built on or newer. Built in the container
+`nvidia/cuda:12.9.1-devel-ubuntu20.04` with `NVCC="nvcc -Xcompiler -static-libstdc++ -Xcompiler -static-libgcc"` the
+library needs only glibc 2.17 and no libstdc++ (a build on Ubuntu 24.04 with CUDA 13.0 needs glibc 2.38 and a CUDA 13
+driver).
+
+What has actually been run: sm_120 (RTX 5090) on Windows with TensorRT 11.3 (Ceres, trtexec) and with TensorRT 10.15
+(Ceres; lc0 `onnx-trt` through ONNX Runtime), and on Linux x86_64 under WSL 2 with TensorRT 10.16 (Ceres;
+`tools/kovax_bt6/linux_gate.py` gives the same gate numbers as on Windows); sm_103 (GB300, Linux, aarch64) by dje-dev
+with FP16. The code for the other architectures and the PTX path compile but have not been executed here.
 
 Environment switches of the lc0 BT6 attention kernel: `BT6_EGT_K4=1` selects the previous kernel path and schedule
 (bit-identical outputs), `BT6_EGT_SCHED=0` only the previous schedule.

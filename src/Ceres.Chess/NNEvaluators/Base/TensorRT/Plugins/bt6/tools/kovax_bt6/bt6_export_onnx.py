@@ -11,6 +11,13 @@ Output policy [B, 1858] logits, wdl [B, 3] logits, mlh [B, 1], err [B, 1] (sigmo
 
     python bt6_export_onnx.py check  [--count N]                 module (FP32) vs forward_served on real positions
     python bt6_export_onnx.py export --dtype fp32|fp16 --batch B --out X.onnx
+
+Environment:
+    BT6_CARRIER       the lc0ex carrier of the net (required)
+    CERESTRAIN_PY     CeresTrain's src/CeresTrainPy (bt6_net.py, bt6_carrier.py, bt6_relations.py, bt6_planes.py)
+    BT6_POSITIONS     optional .npz with real positions ("masks", "values" as in lc0ex's reference files). The export
+                      only traces the graph, so without it the start position is used; check / torchref need it.
+    BT6_GATE_OUTPUTS  optional .npz with "served_policy" for an extra comparison in check
 """
 from __future__ import annotations
 
@@ -29,9 +36,8 @@ from bt6_carrier import read_carrier  # noqa: E402
 from bt6_net import CODE_GROUPS, CODE_GROUP_BASES, BT6Config, policy_gather_index  # noqa: E402
 from bt6_relations import BT6Relations  # noqa: E402
 
-CARRIER = os.environ.get("BT6_CARRIER") or ("/mnt/c/lc0_bt6/net/bt6_flagship_ffnmuon_1024x24x32_5400000_swa_blend_grill_0.4315_optimistic_st_0.5685_"
-           "winner_q1i8_v2c62ccc4_d1e4b030c2_with_error_head_st_lc0ex_carrier.pb.gz")
-POSITIONS = "/mnt/c/Dev/Chess/lc0ex_work/bt6_torch/reference_7040.npz"
+CARRIER = os.environ.get("BT6_CARRIER")
+POSITIONS = os.environ.get("BT6_POSITIONS")
 
 
 def keep(name: str) -> bool:
@@ -39,6 +45,8 @@ def keep(name: str) -> bool:
 
 
 def load_carrier():
+  if not CARRIER or not os.path.isfile(CARRIER):
+    sys.exit(f"set BT6_CARRIER to the net's lc0ex carrier (*_lc0ex_carrier.pb.gz); got {CARRIER!r}")
   tensors, _ = read_carrier(CARRIER, keep=keep)
   return tensors, BT6Config.from_served(tensors)
 
@@ -217,8 +225,27 @@ class BT6Served(nn.Module):
     return policy.float(), wdl.float(), mlh.float(), err.float()
 
 
-def real_planes(start, count):
-  sys.path.insert(0, __import__("os").environ.get("CERESTRAIN_PY", "CeresTrain/src/CeresTrainPy"))
+def startpos_planes(count):
+  """The start position as lc0 classical planes [count, 112, 8, 8] (current board only, all castling rights, plane 111
+  ones): enough to trace the graph for an export when no file with real positions is given."""
+  p = np.zeros((112, 8, 8), np.float32)
+  back = (3, 1, 2, 4, 5, 2, 1, 3)   # R N B Q K B N R as plane offsets (P N B R Q K = 0..5)
+  for f in range(8):
+    p[0, 1, f] = 1
+    p[6, 6, f] = 1
+    p[back[f], 0, f] = 1
+    p[6 + back[f], 7, f] = 1
+  p[104:108] = 1
+  p[111] = 1
+  return np.repeat(p[None], count, 0)
+
+
+def real_planes(start, count, need_real=False):
+  if not POSITIONS or not os.path.isfile(POSITIONS):
+    if need_real:
+      sys.exit("set BT6_POSITIONS to an .npz with real positions (masks, values): this mode compares on real positions")
+    print("BT6_POSITIONS not set: tracing with the start position", flush=True)
+    return startpos_planes(count)
   from bt6_planes import expand_planes
   with np.load(POSITIONS) as a:
     return expand_planes(a["masks"][start:start + count], a["values"][start:start + count]).reshape(-1, 112, 8, 8)
@@ -241,18 +268,19 @@ def main():
 
   if args.mode == "check":
     from bt6_net import forward_served, served_to_torch
-    planes = torch.from_numpy(real_planes(0, args.count))
+    planes = torch.from_numpy(real_planes(0, args.count, need_real=True))
     t = served_to_torch(tensors)
     ref = forward_served(t, planes.reshape(-1, 112, 64), cfg)
     got = model(planes)
     for name, a, b in zip(("policy", "wdl", "mlh", "err"), got, (ref["policy"], ref["wdl"], ref["mlh"], ref["err"])):
       print(f"{name}: max abs diff {float((a - b).abs().max()):.3e}  ref max |x| {float(b.abs().max()):.3e}")
-    with np.load("/mnt/c/Dev/Chess/lc0ex_work/bt6_torch/gate_outputs_1024.npz") as z:
-      print("vs saved gate_outputs served_policy (first N):",
-            float(np.abs(z["served_policy"][:args.count] - got[0].numpy()).max()))
+    if os.environ.get("BT6_GATE_OUTPUTS"):
+      with np.load(os.environ["BT6_GATE_OUTPUTS"]) as z:
+        print("vs saved gate_outputs served_policy (first N):",
+              float(np.abs(z["served_policy"][:args.count] - got[0].numpy()).max()))
   elif args.mode == "torchref":
     # FP32 PyTorch reference outputs of this module on the first --count real positions
-    planes = torch.from_numpy(real_planes(0, args.count))
+    planes = torch.from_numpy(real_planes(0, args.count, need_real=True))
     outs = [model(planes[s:s + 64]) for s in range(0, args.count, 64)]
     np.savez(args.out, planes=planes.numpy(), **{n: torch.cat([o[k] for o in outs]).numpy()
                                                  for k, n in enumerate(("policy", "wdl", "mlh", "err"))})
