@@ -21,6 +21,9 @@
 #include <cutlass/epilogue/thread/linear_combination.h>
 #include <cutlass/layout/matrix.h>
 #include <cutlass/numeric_types.h>
+#ifdef BT6_WITH_SM90GLU
+#include "bt6_kernels.h"  // launch_i8gemm_glu_sm90 (bt6_i8gemm_sm90.cu)
+#endif
 
 namespace bt6i8 {
 
@@ -249,6 +252,14 @@ int launch_i8gemm_glu(int8_t* out, const int8_t* a, const int8_t* w, const float
       const char* e = std::getenv("BT6_I8GLU_TILE");
       env_tile = e && *e ? std::atoi(e) : -1;
     }
+#ifdef BT6_WITH_SM90GLU
+    // Hopper (compute capability 9.0): the TMA + wgmma kernel (bt6_i8gemm_sm90.cu), bit-identical codes; env BT6_I8GLU_SM90=0
+    // or an explicit tile (attribute or BT6_I8GLU_TILE) keeps this file's Sm80 kernel; on any launch error it is the fallback.
+    static const bool sm90_off = [] { const char* e = std::getenv("BT6_I8GLU_SM90"); return e && e[0] == '0'; }();
+    if (!sm90_off && env_tile < 0 && i8gemm_glu_sm90_supported() &&
+        launch_i8gemm_glu_sm90(out, a, w, tab, M, N, K, -1, stream) == 0)
+      return 0;
+#endif
     tile = env_tile >= 0 ? env_tile : bt6i8::default_tile(M);
   }
   bt6i8::Params p{out, a, w, tab, tab + N, tab + 2 * N, M, N, K};

@@ -89,5 +89,11 @@ int launch_ln_quant(__half* res_out, int8_t* codes, const __half* yn, const __ha
 int i8gemm_glu_tiles();
 int launch_i8gemm_glu(int8_t* out, const int8_t* a, const int8_t* w, const float* tab, int M, int N, int K, int tile,
                       cudaStream_t stream);
+// Hopper form of BT6I8GemmGlu (bt6_i8gemm_sm90.cu, built with BT6_WITH_SM90GLU for sm_90a): same arguments and codes;
+// cfg < 0 = env BT6_I8GLU_SM90_CFG or the default by M. launch_i8gemm_glu calls it on compute capability 9.0.
+bool i8gemm_glu_sm90_supported();
+int i8gemm_glu_sm90_cfgs();
+int launch_i8gemm_glu_sm90(int8_t* out, const int8_t* a, const int8_t* w, const float* tab, int M, int N, int K, int cfg,
+                           cudaStream_t stream);
 
 }  // namespace bt6

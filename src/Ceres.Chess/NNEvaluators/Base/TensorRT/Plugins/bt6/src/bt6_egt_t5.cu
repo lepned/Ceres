@@ -100,9 +100,6 @@ __device__ __forceinline__ uint32_t pack(float lo, float hi) {
   const __half2 h = __floats2half2_rn(lo, hi);
   return *reinterpret_cast<const uint32_t*>(&h);
 }
-__device__ __forceinline__ uint32_t pack_h(__half lo, __half hi) {
-  return static_cast<uint32_t>(__half_as_ushort(lo)) | (static_cast<uint32_t>(__half_as_ushort(hi)) << 16);
-}
 __device__ __forceinline__ float lo_f(uint32_t w) { return __low2float(*reinterpret_cast<const __half2*>(&w)); }
 __device__ __forceinline__ float hi_f(uint32_t w) { return __high2float(*reinterpret_cast<const __half2*>(&w)); }
 // the plugin's relation bits: INT32 pairs (bits 0-16, bits 17-33) per cell
